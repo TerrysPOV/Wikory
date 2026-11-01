@@ -1,0 +1,8 @@
+# Wikory project configuration. Committed and shared with the team.
+# Identity is this id, not a path or a remote (spec 4.1). Do not change it.
+project_id = "wkp_01M6CN4M817C1F5K06HK4G1MPQ"
+schema_version = 1
+
+[retrieval]
+# Token budget for the SessionStart briefing.
+budget_tokens = 1500
