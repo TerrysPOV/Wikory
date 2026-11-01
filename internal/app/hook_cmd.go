@@ -185,13 +185,10 @@ func sessionStartBriefing(ctx context.Context, env *Env, ev decode.Event, deadli
 		return ""
 	}
 	if err != nil {
+		// Registration and trust cannot be confirmed without the store, so this is status only:
+		// no repository file is read into the session (it may belong to a hostile checkout).
 		logHookError(env, "open")
-		_, root, derr := discover(ctx, env)
-		if derr != nil {
-			return degradedBriefing(nil, "the store could not be opened")
-		}
-		defer root.Close()
-		return degradedBriefing(root, "the store could not be opened")
+		return degradedBriefing(nil, "the store could not be opened")
 	}
 	defer p.Close()
 	if !servable(p) {

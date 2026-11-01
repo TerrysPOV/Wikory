@@ -6,3 +6,5 @@
 | A24-6 | the error log opened without `O_NONBLOCK` | RED as predicted (`the hook did not return within`) |
 | A24-7 | the error log accepted when it is not a regular file | RED as predicted (`the hook wrote its error log into a FIFO`) |
 | A24-8 | stdin read with no deadline | RED as predicted (`the hook did not return within`) |
+| A24-9 | open failure restores the root-reading degraded briefing (security fix: status only when the store cannot be opened) | RED as predicted (`an unconfirmed checkout had repository content injected: wikory: mode=degraded`) |
+| A24-10 | an unregistered checkout gets a degraded briefing that reads its `index.md` | RED as predicted (`an unregistered checkout had repository content injected`) |
