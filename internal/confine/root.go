@@ -21,11 +21,12 @@ const maxJudged = 1 << 26
 // final component with no-follow semantics, so a root whose final component is, or is
 // swapped to, a symlink is refused. Below the root nothing is ever resolved from a path
 // string: each component is opened relative to the handle of its parent with no-follow
-// semantics (unix: openat with O_NOFOLLOW, plus O_DIRECTORY for directories), so a symlink
-// at any depth, including one swapped in after any earlier check, is refused by the kernel
-// rather than followed. Identity comparisons supplement this; they never substitute for it.
-// Windows uses os.Root with reparse-point checks before and after each open; its residual
-// race is stated in root_windows.go.
+// semantics. On unix that is openat with O_NOFOLLOW (plus O_DIRECTORY for directories), so a
+// symlink at any depth, including one swapped in after any earlier check, is refused by the
+// kernel rather than followed. Windows has no such kernel refusal here: it uses os.Root with
+// reparse-point checks before and after each open, which can miss a swap that is made and
+// undone between them (the residual is stated in root_windows.go). Identity comparisons
+// supplement these; they never substitute for them.
 type Root struct {
 	dir string // resolved path, for display and relative-path computation only; never opened
 	h   *dirH
@@ -194,6 +195,14 @@ func (r *Root) ReplaceIfUnchanged(rel string, data []byte, perm fs.FileMode, wan
 		return err
 	}
 	defer dir.close()
+	// A directory (or FIFO, device) at the target cannot be hard-linked back once moved
+	// aside, so refuse it before touching it. Other refusals (a symlink, a hard link, a
+	// missing name) are judged after the move-aside, as before.
+	if f, perr := dir.openFile(name, os.O_RDONLY, 0); perr == nil {
+		f.Close()
+	} else if errors.Is(perr, ErrNotRegular) {
+		return fmt.Errorf("%w: %s", ErrNotRegular, rel)
+	}
 	tmp, err := writeTemp(dir, name, data, perm)
 	if err != nil {
 		return err
@@ -220,14 +229,19 @@ func (r *Root) ReplaceIfUnchanged(rel string, data []byte, perm fs.FileMode, wan
 		cur.Close()
 	}
 	if rerr != nil || !want(current) {
-		if lerr := dir.link(bak, name); lerr == nil {
+		lerr := dir.link(bak, name)
+		if lerr == nil {
 			dir.remove(bak)
 		}
 		dir.sync()
-		if errors.Is(rerr, ErrHardlink) {
-			return fmt.Errorf("%w: %w: %s", ErrChanged, ErrHardlink, rel)
+		stranded := ""
+		if lerr != nil { // a human recreated the name: both versions survive, so say where the original is
+			stranded = fmt.Sprintf("; the original is kept as %s (restore failed: %v)", bak, lerr)
 		}
-		return fmt.Errorf("%w: %s", ErrChanged, rel)
+		if errors.Is(rerr, ErrHardlink) {
+			return fmt.Errorf("%w: %w: %s%s", ErrChanged, ErrHardlink, rel, stranded)
+		}
+		return fmt.Errorf("%w: %s%s", ErrChanged, rel, stranded)
 	}
 	step("compared")
 	if testHookAfterCompare != nil {
@@ -310,12 +324,29 @@ func (r *Root) CreateExclusive(rel string, data []byte, perm fs.FileMode) error 
 }
 
 // AppendFile appends data to a regular file, creating it if needed, and fsyncs it.
+//
+// A file it creates gets exactly perm whatever the umask; a file that already exists keeps
+// its mode.
 func (r *Root) AppendFile(rel string, data []byte, perm fs.FileMode) error {
-	f, err := r.openFile(rel, os.O_WRONLY|os.O_APPEND|os.O_CREATE, perm)
+	f, err := r.openFile(rel, os.O_WRONLY|os.O_APPEND, 0)
+	created := false
+	if errors.Is(err, fs.ErrNotExist) {
+		f, err = r.openFile(rel, os.O_WRONLY|os.O_APPEND|os.O_CREATE|os.O_EXCL, perm)
+		created = err == nil
+		if errors.Is(err, fs.ErrExist) { // created by someone else between the two opens
+			f, err = r.openFile(rel, os.O_WRONLY|os.O_APPEND, 0)
+		}
+	}
 	if err != nil {
 		return err
 	}
-	_, werr := f.Write(data)
+	var werr error
+	if created {
+		werr = f.Chmod(perm.Perm()) // exact mode whatever the umask
+	}
+	if werr == nil {
+		_, werr = f.Write(data)
+	}
 	if werr == nil {
 		werr = f.Sync()
 	}
@@ -366,6 +397,27 @@ func (r *Root) ReadDir(rel string) ([]fs.DirEntry, error) {
 	}
 	defer dir.close()
 	return dir.readDir()
+}
+
+// Rename moves the file at rel to newName in the same directory, replacing any file already
+// there. newName is a single path component, so the move can never leave the directory.
+func (r *Root) Rename(rel, newName string) error {
+	dir, name, err := r.parent(rel)
+	if err != nil {
+		return err
+	}
+	defer dir.close()
+	parts, err := Split(newName)
+	if err != nil {
+		return err
+	}
+	if len(parts) != 1 {
+		return ErrEscape
+	}
+	if err := dir.rename(name, newName); err != nil {
+		return err
+	}
+	return dir.sync()
 }
 
 // Remove unlinks a file (a symlink itself is removed, never followed).

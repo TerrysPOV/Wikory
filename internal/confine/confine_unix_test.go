@@ -202,3 +202,28 @@ func TestSingleLinkFileStillWorks(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A file AppendFile creates has the requested mode, not whatever the umask leaves (G4 item 8).
+func TestAppendCreatesTheRequestedModeUnderARestrictiveUmask(t *testing.T) {
+	r, rootDir, _ := tree(t)
+	old := syscall.Umask(0o077)
+	t.Cleanup(func() { syscall.Umask(old) })
+	if err := r.AppendFile("a/new.log", []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(filepath.Join(rootDir, "a", "new.log"))
+	if err != nil || fi.Mode().Perm() != 0o644 {
+		t.Fatalf("mode=%v err=%v", fi.Mode().Perm(), err)
+	}
+	// An existing file keeps its mode: AppendFile never re-modes a file a human owns.
+	if err := os.Chmod(filepath.Join(rootDir, "a", "new.log"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.AppendFile("a/new.log", []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, _ = os.Stat(filepath.Join(rootDir, "a", "new.log"))
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("an existing file's mode was changed to %v", fi.Mode().Perm())
+	}
+}

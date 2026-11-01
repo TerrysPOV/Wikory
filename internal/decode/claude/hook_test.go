@@ -38,8 +38,7 @@ func TestDecodeRealFixtures(t *testing.T) {
 	if ss.Source != "startup" || ups.Prompt == "" || stop.StopHookActive || stop.LastAssistantMessage == "" {
 		t.Fatalf("ss=%+v ups=%+v stop=%+v", ss, ups, stop)
 	}
-	// V07: one turn's prompt_id is the same in UserPromptSubmit and Stop. If S5 refuted
-	// V07, delete this assertion and record why in the commit message.
+	// V07 (verified): one turn's prompt_id is the same in UserPromptSubmit and Stop.
 	if ups.PromptID == "" || ups.PromptID != stop.PromptID {
 		t.Fatalf("prompt_id ups=%q stop=%q", ups.PromptID, stop.PromptID)
 	}

@@ -1,6 +1,7 @@
-// Package confine gives every Wikory reader and writer an authorised root and refuses
-// anything that would leave it: escaping names, symlinks at any depth, and non-regular
-// files (spec 5.5 rule 7, 10.3).
+// Package confine gives the Wikory readers and writers that handle repository and store
+// files an authorised root, and refuses anything that would leave it: escaping names,
+// symlinks at any depth, and non-regular files (spec 5.5 rule 7, 10.3). A reader or writer
+// that opens paths without a Root is outside this guarantee.
 package confine
 
 import (
@@ -69,7 +70,8 @@ func tempName(target string) string   { return TempPrefix + target + "-" + rando
 func backupName(target string) string { return BackupPrefix + target + "-" + randomSuffix() }
 
 // BackupTarget returns the target name a backup entry belongs to, or false if entry is not
-// a backup made by this package.
+// shaped like a backup. The check is syntactic (prefix, target, a dash and 16 characters): a
+// file a human named to match is indistinguishable from a backup this package made.
 func BackupTarget(entry string) (string, bool) {
 	const suffix = 17 // "-" and 16 hex digits
 	if !strings.HasPrefix(entry, BackupPrefix) || len(entry) <= len(BackupPrefix)+suffix || entry[len(entry)-suffix] != '-' {

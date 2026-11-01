@@ -3,11 +3,13 @@
 package publish
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"path"
 	"strings"
@@ -24,12 +26,26 @@ const Absent = "absent"
 const maxFile = 4 << 20
 
 var (
-	ErrConflict      = errors.New("publish: a target changed since the job's base; nothing was overwritten")
+	// ErrConflict: a target no longer holds what the job expected. A conflict found while
+	// applying leaves any earlier operations of the job applied; a human's edit is never
+	// overwritten.
+	ErrConflict      = errors.New("publish: a target changed since the job's base; earlier operations of this job may already be applied; the job is in state conflict")
 	ErrStaleEpoch    = errors.New("publish: lease epoch is stale; another worker took over this job")
 	ErrFingerprint   = errors.New("publish: the checkout's tree changed while the job was open")
 	ErrWrongCheckout = errors.New("publish: the job belongs to another checkout")
 	ErrJobState      = errors.New("publish: the job is not open")
+	// ErrDuplicateTarget: two operations of one job name the same target, so the second
+	// could only ever conflict with the first.
+	ErrDuplicateTarget = errors.New("publish: two operations name the same target")
+	// ErrNotConfigured: the Publisher is missing a field it needs.
+	ErrNotConfigured = errors.New("publish: the Publisher is not fully configured")
 )
+
+// logScanChunk is how much of the log is read at a time when searching it for a job's line.
+const logScanChunk = 64 << 10
+
+// maxLogScan bounds how much of an oversize log is searched for a job's line.
+const maxLogScan = 64 << 20
 
 // Test hooks. No-ops in production.
 var (
@@ -96,8 +112,36 @@ func jobDir(id string) string { return "jobs/" + id }
 
 func (p *Publisher) lock() (func(), error) { return store.Lock(p.LockPath, 10*time.Second) }
 
+// check reports a Publisher that lacks a field it needs, so a zero value fails with a clear
+// error instead of a nil-function panic (or, for AbandonAfter 0, by abandoning live jobs).
+// It runs lazily at each entry point, so struct literals that set every field keep working.
+func (p *Publisher) check(forRecovery bool) error {
+	var missing []string
+	add := func(bad bool, name string) {
+		if bad {
+			missing = append(missing, name)
+		}
+	}
+	add(p.DB == nil, "DB")
+	add(p.Store == nil, "Store")
+	add(p.Repo == nil, "Repo")
+	add(p.CheckoutID == "", "CheckoutID")
+	add(p.LockPath == "", "LockPath")
+	add(p.LogPath == "", "LogPath")
+	add(p.Fingerprint == nil, "Fingerprint")
+	add(p.Now == nil, "Now")
+	add(forRecovery && p.AbandonAfter <= 0, "AbandonAfter (must be positive)")
+	if len(missing) > 0 {
+		return fmt.Errorf("%w: %s", ErrNotConfigured, strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 // Begin opens a job at epoch 1 and captures the tree fingerprint.
 func (p *Publisher) Begin(ctx context.Context, kind string) (Job, error) {
+	if err := p.check(false); err != nil {
+		return Job{}, err
+	}
 	fp, err := p.Fingerprint(ctx)
 	if err != nil {
 		return Job{}, err
@@ -111,6 +155,9 @@ func (p *Publisher) Begin(ctx context.Context, kind string) (Job, error) {
 // Takeover raises the job's lease epoch, fencing whoever held the old one. It runs under
 // the publishing lock, so it can never land between two steps of a publish in progress.
 func (p *Publisher) Takeover(ctx context.Context, jobID string) (Job, error) {
+	if err := p.check(false); err != nil {
+		return Job{}, err
+	}
 	unlock, err := p.lock()
 	if err != nil {
 		return Job{}, err
@@ -120,11 +167,15 @@ func (p *Publisher) Takeover(ctx context.Context, jobID string) (Job, error) {
 }
 
 func (p *Publisher) takeoverLocked(ctx context.Context, jobID string) (Job, error) {
-	res, err := p.DB.ExecContext(ctx, `UPDATE jobs SET epoch = epoch + 1, updated_at = ? WHERE job_id = ? AND state IN ('begun','applying')`, p.now(), jobID)
+	res, err := p.DB.ExecContext(ctx, `UPDATE jobs SET epoch = epoch + 1, updated_at = ? WHERE job_id = ? AND checkout_id = ? AND state IN ('begun','applying')`, p.now(), jobID, p.CheckoutID)
 	if err != nil {
 		return Job{}, err
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
+		var owner string
+		if qerr := p.DB.QueryRowContext(ctx, `SELECT checkout_id FROM jobs WHERE job_id = ?`, jobID).Scan(&owner); qerr == nil && owner != p.CheckoutID {
+			return Job{}, ErrWrongCheckout // never fence another checkout's job
+		}
 		return Job{}, ErrJobState
 	}
 	var j Job
@@ -133,8 +184,11 @@ func (p *Publisher) takeoverLocked(ctx context.Context, jobID string) (Job, erro
 	return j, err
 }
 
-// fence refuses to continue unless the job is still open at this epoch. Every mutating step
-// calls it, so a holder whose lease was taken over stops at its next step.
+// fence refuses to continue unless the job is still open at this epoch. apply calls it before
+// each operation and before the closing steps, so a holder whose lease was taken over stops
+// at its next one. The database writes in between (recordOps, markDone, the final state
+// update) carry the epoch in their SQL instead and report ErrStaleEpoch when it no longer
+// matches.
 func (p *Publisher) fence(ctx context.Context, jobID string, epoch int64) error {
 	var state string
 	var cur int64
@@ -173,6 +227,9 @@ func (p *Publisher) currentHash(target string) (string, error) {
 
 // Publish runs the protocol for one job.
 func (p *Publisher) Publish(ctx context.Context, j Job, ops []Op, logLine string) error {
+	if err := p.check(false); err != nil {
+		return err
+	}
 	unlock, err := p.lock()
 	if err != nil {
 		return err
@@ -214,6 +271,13 @@ func (p *Publisher) revalidate(ctx context.Context, j Job, ops []Op) error {
 	}
 	if checkout != p.CheckoutID || j.CheckoutID != p.CheckoutID {
 		return ErrWrongCheckout
+	}
+	seen := map[string]bool{}
+	for _, op := range ops {
+		if seen[op.Target] {
+			return fmt.Errorf("%w: %s", ErrDuplicateTarget, op.Target)
+		}
+		seen[op.Target] = true
 	}
 	fp, err := p.Fingerprint(ctx)
 	if err != nil {
@@ -395,8 +459,11 @@ func (p *Publisher) apply(ctx context.Context, m *manifest) error {
 // write applies one operation without clobbering: a new file is created exclusively, and an
 // existing one goes through confine's move-aside replace, which judges the moved-aside
 // content against the base hash and installs with a no-clobber link, so a human edit made
-// at any point is kept (spec 4.4). The publish lock excludes every other Wikory writer; the
-// stated residual is an editor writing through a descriptor already open on the original.
+// before the move-aside, or recreating the name afterwards, is detected and kept (spec 4.4).
+// The publish lock excludes every other Wikory writer. The residual: an editor that already
+// holds the original file open and writes through that descriptor after the compare writes
+// to the moved inode, which is then unlinked, and that edit is lost (see
+// confine.ReplaceIfUnchanged).
 func (p *Publisher) write(op *manifestOp, data []byte) error {
 	if op.Old == Absent {
 		return p.Repo.CreateExclusive(op.Target, data, fs.FileMode(op.Perm))
@@ -406,22 +473,89 @@ func (p *Publisher) write(op *manifestOp, data []byte) error {
 	})
 }
 
+// recordFailure marks the part of a conflict error that says the conflict itself could not
+// be recorded, so Recover can report it beside the conflict.
+type recordFailure struct{ err error }
+
+func (r recordFailure) Error() string { return r.err.Error() }
+func (r recordFailure) Unwrap() error { return r.err }
+
+// conflict records the conflict in the database (authoritative) and the manifest, and returns
+// ErrConflict. A failure to record either is returned with it, never discarded: the job could
+// otherwise read applying in one place and conflict in the other.
 func (p *Publisher) conflict(ctx context.Context, m *manifest, detail string) error {
+	err := fmt.Errorf("%w: %s", ErrConflict, detail)
 	m.State = "conflict"
-	_ = p.writeManifest(m)
-	_ = p.setJob(ctx, m.JobID, "conflict", detail)
-	return fmt.Errorf("%w: %s", ErrConflict, detail)
+	var failed []error
+	if serr := p.setJob(ctx, m.JobID, "conflict", detail); serr != nil {
+		failed = append(failed, fmt.Errorf("recording the conflict in the database: %w", serr))
+	}
+	if merr := p.writeManifest(m); merr != nil {
+		failed = append(failed, fmt.Errorf("recording the conflict in the manifest: %w", merr))
+	}
+	if len(failed) > 0 {
+		return errors.Join(err, recordFailure{errors.Join(failed...)})
+	}
+	return err
 }
 
-// appendLogOnce adds one log.md line for the job unless one is already there.
+// rotatedLogName is the name a full log is moved to, in its own directory: log.md becomes
+// log.1.md. One rotated log is kept; the next rotation replaces it.
+func rotatedLogName(logPath string) string {
+	base := path.Base(logPath)
+	ext := path.Ext(base)
+	return strings.TrimSuffix(base, ext) + ".1" + ext
+}
+
+// scanLog reports the log's size and whether it already holds token, reading it in chunks
+// (never the whole file) and at most maxLogScan bytes. A missing log is empty.
+func (p *Publisher) scanLog(token []byte) (size int64, found bool, err error) {
+	f, err := p.Repo.OpenRead(p.LogPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, false, err
+	}
+	buf := make([]byte, logScanChunk+len(token))
+	carry := 0 // the tail of the previous chunk, so a token straddling two chunks is still found
+	for read := int64(0); read < maxLogScan; {
+		n, rerr := f.Read(buf[carry : carry+logScanChunk])
+		if bytes.Contains(buf[:carry+n], token) {
+			return fi.Size(), true, nil
+		}
+		read += int64(n)
+		data := buf[:carry+n]
+		carry = min(len(token)-1, len(data))
+		copy(buf, data[len(data)-carry:])
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				break
+			}
+			return 0, false, rerr
+		}
+	}
+	return fi.Size(), false, nil
+}
+
+// appendLogOnce adds one log.md line for the job unless one is already there. A log that the
+// line would push past the cap is rotated to log.1.md first, so a full log never turns an
+// applied publish into a permanent error.
 func (p *Publisher) appendLogOnce(m *manifest) error {
-	data, err := p.Repo.ReadFile(p.LogPath, maxFile)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	size, found, err := p.scanLog([]byte("job=" + m.JobID))
+	if err != nil || found {
 		return err
 	}
-	if !strings.Contains(string(data), "job="+m.JobID) {
-		line := fmt.Sprintf("- %s job=%s %s\n", p.Now().UTC().Format(time.RFC3339), m.JobID, m.LogLine)
-		return p.Repo.AppendFile(p.LogPath, []byte(line), 0o644)
+	line := fmt.Sprintf("- %s job=%s %s\n", p.Now().UTC().Format(time.RFC3339), m.JobID, m.LogLine)
+	if size+int64(len(line)) > maxFile {
+		if err := p.Repo.Rename(p.LogPath, rotatedLogName(p.LogPath)); err != nil {
+			return err
+		}
 	}
-	return nil
+	return p.Repo.AppendFile(p.LogPath, []byte(line), 0o644)
 }

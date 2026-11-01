@@ -3,6 +3,7 @@ package publish
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -149,9 +150,18 @@ func TestEditBetweenStageAndApplyIsAConflict(t *testing.T) {
 	p := f.publisher("co-1")
 	j, _ := p.Begin(ctx, "test")
 	err := p.Publish(ctx, j, standardOps(), "x")
+	a, _ := f.readRepo(t, "project-memory/wiki/a.md")
 	b, _ := f.readRepo(t, "project-memory/wiki/b.md")
 	if !errors.Is(err, ErrConflict) || b != "EDITED DURING APPLY" || f.jobState(t, j.ID) != "conflict" {
 		t.Fatalf("err=%v b=%q state=%s", err, b, f.jobState(t, j.ID))
+	}
+	// Exactly which files changed: op 0 was applied before op 1 conflicted, op 1 kept the
+	// human's edit, and the log line was never written. The message must not claim otherwise.
+	if a != "A1" || f.logLines(t, j.ID) != 0 {
+		t.Fatalf("a=%q (want the applied A1) log=%d (want 0)", a, f.logLines(t, j.ID))
+	}
+	if !strings.Contains(err.Error(), "earlier operations of this job may already be applied") {
+		t.Fatalf("the conflict message does not warn that earlier operations may be applied: %v", err)
 	}
 }
 

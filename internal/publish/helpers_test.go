@@ -50,7 +50,7 @@ func (f *fixture) open(t *testing.T) {
 func (f *fixture) publisher(checkout string) *Publisher {
 	return &Publisher{DB: f.st.DB, Store: f.st.Root, Repo: f.repo, CheckoutID: checkout,
 		LockPath: filepath.Join(f.st.Dir, "locks", "publish.lock"), LogPath: "project-memory/log.md",
-		Fingerprint: func(context.Context) (string, error) { return f.fp, nil }, AbandonAfter: 0, Now: time.Now}
+		Fingerprint: func(context.Context) (string, error) { return f.fp, nil }, AbandonAfter: time.Nanosecond, Now: time.Now}
 }
 
 func (f *fixture) writeRepo(t *testing.T, rel, s string) {

@@ -2,6 +2,7 @@ package confine
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -334,5 +335,57 @@ func TestMkdirAllAppendReadDirRemove(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(rootDir, "x", "y", "log.md")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatal("remove did not remove")
+	}
+}
+
+// A directory at the target cannot be hard-linked back, so it must be refused before it is
+// ever moved aside (G4 item 6).
+func TestReplaceRefusesADirectoryTarget(t *testing.T) {
+	r, rootDir, _ := tree(t)
+	dir := filepath.Join(rootDir, "a", "sub")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dir, "keep.txt"), "KEEP")
+	err := r.ReplaceIfUnchanged("a/sub", []byte("NEW"), 0o644, func([]byte) bool { return true })
+	b, rerr := os.ReadFile(filepath.Join(dir, "keep.txt"))
+	if !errors.Is(err, ErrNotRegular) || rerr != nil || string(b) != "KEEP" || len(leftovers(t, filepath.Join(rootDir, "a"))) != 0 {
+		t.Fatalf("a directory target was not refused untouched: err=%v keep=%q %v leftovers=%v", err, b, rerr, leftovers(t, filepath.Join(rootDir, "a")))
+	}
+}
+
+// When the restore link fails because a human recreated the file, the error must say where
+// the backup is, or the original content is stranded with no pointer to it (G4 item 7).
+func TestReplaceRestoreFailureNamesTheBackup(t *testing.T) {
+	r, rootDir, _ := tree(t)
+	humanEditAt(t, &testHookAfterMoveAside, rootDir)
+	err := r.ReplaceIfUnchanged("a/f.txt", []byte("NEW"), 0o644, func([]byte) bool { return false })
+	var backup string
+	for _, n := range entries(t, filepath.Join(rootDir, "a")) {
+		if strings.HasPrefix(n, BackupPrefix) {
+			backup = n
+		}
+	}
+	if !errors.Is(err, ErrChanged) || backup == "" || !strings.Contains(fmt.Sprint(err), backup) {
+		t.Fatalf("the error does not name the stranded backup %q: %v", backup, err)
+	}
+}
+
+func TestRenameMovesAFileWithinItsDirectory(t *testing.T) {
+	r, rootDir, _ := tree(t)
+	write(t, filepath.Join(rootDir, "a", "old.txt"), "OLD")
+	write(t, filepath.Join(rootDir, "a", "new.txt"), "PREVIOUS")
+	if err := r.Rename("a/old.txt", "new.txt"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(rootDir, "a", "new.txt"))
+	_, serr := os.Stat(filepath.Join(rootDir, "a", "old.txt"))
+	if string(b) != "OLD" || !errors.Is(serr, fs.ErrNotExist) {
+		t.Fatalf("content=%q stat=%v", b, serr)
+	}
+	for _, bad := range []string{"../escape.txt", "x/y.txt", "", `..`} {
+		if err := r.Rename("a/new.txt", bad); !errors.Is(err, ErrEscape) {
+			t.Errorf("new name %q: want ErrEscape, got %v", bad, err)
+		}
 	}
 }

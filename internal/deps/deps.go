@@ -6,7 +6,7 @@ package deps
 
 import (
 	// modernc.org/sqlite: pure-Go SQLite with FTS5, so the binary stays static with no cgo
-	// on darwin, linux and windows (spec 3, 7.1). FTS5 availability is verified in Task S1.
+	// on darwin, linux and windows (spec 3, 7.1). FTS5 availability is verified in V01.
 	_ "modernc.org/sqlite"
 
 	// github.com/pelletier/go-toml/v2: parses the committed config.toml and the store
@@ -21,6 +21,6 @@ import (
 	_ "golang.org/x/sys/cpu"
 
 	// golang.org/x/text: Unicode NFC for the canonical claim text that th hashes (spec 5.3).
-	// Not in the original allow-list; see spec question Q4.
+	// Not in the original allow-list; see plan adjudication Q4.
 	_ "golang.org/x/text/unicode/norm"
 )

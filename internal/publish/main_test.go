@@ -47,7 +47,7 @@ func publishHelper() int {
 	}
 	p := &Publisher{DB: st.DB, Store: st.Root, Repo: repo, CheckoutID: "co-1",
 		LockPath: st.Dir + "/locks/publish.lock", LogPath: "project-memory/log.md",
-		Fingerprint: func(context.Context) (string, error) { return "tree-1", nil }, Now: time.Now}
+		Fingerprint: func(context.Context) (string, error) { return "tree-1", nil }, AbandonAfter: time.Nanosecond, Now: time.Now}
 	j, err := p.Begin(ctx, "test")
 	if err != nil {
 		fmt.Println("begin:", err)

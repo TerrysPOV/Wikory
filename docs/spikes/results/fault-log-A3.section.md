@@ -17,3 +17,8 @@
 | A3-17 | same fault, append through the hard link (also modified the outside file before the fix) | RED as predicted (`append through a hard link: want ErrHardlink`) |
 | A3-18 | same fault, replace of a hard-linked target | RED as predicted (`replace of a hard-linked file: want ErrHardlink`) |
 | A3-19 | `ReplaceIfUnchanged` does not propagate `ErrHardlink` from the moved-aside open (returns `ErrChanged` only) | RED as predicted (`replace of a hard-linked file: want ErrHardlink`) |
+| A3-20 | G4: a directory target is not refused before the move-aside (`ErrNotRegular` pre-check disabled), so the directory is renamed to a backup it cannot be linked back from | RED as predicted (`a directory target was not refused untouched`) |
+| A3-21 | G4: a failed restore link does not name the stranded backup in the error | RED as predicted (`does not name the stranded backup`) |
+| A3-22 | G4: `AppendFile` does not chmod a file it creates, so the umask decides the mode | RED as predicted (`mode=-rw-------`) |
+| A3-23 | G4: `AppendFile` chmods a file that already existed (`created` always true) | RED as predicted (`an existing file's mode was changed`) |
+| A3-24 | G4: `Rename` accepts a multi-component new name (length check disabled; first attempt without `&& false` left `parts` unused and was INCONCLUSIVE) | RED as predicted (`new name "x/y.txt": want ErrEscape`) |
