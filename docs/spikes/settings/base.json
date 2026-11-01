@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [ { "hooks": [
+      { "type": "command", "command": "@BIN@/spike-recorder", "args": ["record", "base"] },
+      { "type": "command", "command": "@BIN@/spike-recorder", "args": ["detach", "detach", "3"], "timeout": 1 }
+    ] } ],
+    "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "@BIN@/spike-recorder", "args": ["record", "base"] } ] } ],
+    "PreToolUse": [ { "matcher": "*", "hooks": [ { "type": "command", "command": "@BIN@/spike-recorder", "args": ["record", "base"] } ] } ],
+    "PostToolUse": [ { "matcher": "*", "hooks": [ { "type": "command", "command": "@BIN@/spike-recorder", "args": ["record", "base"] } ] } ],
+    "Stop": [ { "hooks": [ { "type": "command", "command": "@BIN@/spike-recorder", "args": ["record", "base"] } ] } ],
+    "SubagentStop": [ { "hooks": [ { "type": "command", "command": "@BIN@/spike-recorder", "args": ["record", "base"] } ] } ],
+    "PreCompact": [ { "hooks": [ { "type": "command", "command": "@BIN@/spike-recorder", "args": ["record", "base"] } ] } ],
+    "SessionEnd": [ { "hooks": [ { "type": "command", "command": "@BIN@/spike-recorder", "args": ["record", "base"] } ] } ]
+  }
+}

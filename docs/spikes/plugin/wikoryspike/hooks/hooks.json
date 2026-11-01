@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "SubagentStop": [
+      { "hooks": [ { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/spike-recorder", "args": ["record", "plugin"] } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/spike-recorder", "args": ["record", "plugin"] } ] }
+    ]
+  }
+}
