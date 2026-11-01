@@ -61,6 +61,17 @@ func runPage(ctx context.Context, env *Env, args []string) (Result, error) {
 	return Result{Text: text.String(), Notices: notices, Data: map[string]any{"pages": reports}}, nil
 }
 
+// renderChecked renders c and parses the line back, refusing a claim whose rendering the
+// parser would reject. Without this check such a line would be written into the page and the
+// claim would silently drop out of the index.
+func renderChecked(c claim.Claim) (string, error) {
+	line := c.Render()
+	if _, err := claim.ParseComment(line); err != nil {
+		return "", fmt.Errorf("the rendered claim does not parse back: %w", err)
+	}
+	return line, nil
+}
+
 func stampPage(ctx context.Context, p *project, pub *publish.Publisher, rel string) (stampReport, error) {
 	rep := stampReport{Path: rel, Findings: []string{}}
 	data, err := p.RepoRoot.ReadFile(rel, 1<<20)

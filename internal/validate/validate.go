@@ -215,7 +215,7 @@ func Derive(ctx context.Context, c claim.Claim, text string, env Env) (Display, 
 		d.Status, d.Edited = "unverified", true
 		d.Notes = append(d.Notes, "edited by a human since verification")
 	case c.Status == "verified" && onlySelf:
-		d.Status = "hypothesis"
+		d.Status = "unverified"
 		d.Notes = append(d.Notes, "agent summary is its only evidence")
 	case c.Status == "verified" && onlyExternal:
 		d.Status = "unverified"

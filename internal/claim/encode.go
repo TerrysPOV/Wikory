@@ -6,24 +6,27 @@ import (
 	"strings"
 )
 
-// encodeItem percent-encodes one list item so it survives the comment grammar. "%" is
-// handled in the same pass as every other byte, so encoding is reversible.
+// bareSafe is the part of the bare alphabet (bareRe) that encodeItem leaves as it is. The rest
+// of the bare alphabet is structural (";" separates items, "@" and "#" split an evidence or
+// dependency item, "%" starts an escape), so those are encoded too.
+func bareSafe(ch byte) bool {
+	return ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' ||
+		strings.IndexByte("._/~+:-", ch) >= 0
+}
+
+// encodeItem percent-encodes one list item so it survives the comment grammar: every byte
+// outside bareSafe becomes %XX, and a second "-" in a row is encoded so that a rendered body
+// never holds "--". "%" is handled in the same pass as every other byte, so encoding is
+// reversible, and a rendered item always stays inside the bare alphabet.
 func encodeItem(s string) string {
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
-		switch {
-		case ch == '%':
-			b.WriteString("%25")
-		case ch == ' ' || ch == ';' || ch == '=' || ch == '"' || ch == '>' || ch == '<' || ch == '@' || ch == '#':
-			fmt.Fprintf(&b, "%%%02X", ch)
-		case ch == '-' && i > 0 && s[i-1] == '-':
-			b.WriteString("%2D")
-		case ch < 0x20 || ch >= 0x7f:
-			fmt.Fprintf(&b, "%%%02X", ch)
-		default:
+		if bareSafe(ch) && !(ch == '-' && i > 0 && s[i-1] == '-') {
 			b.WriteByte(ch)
+			continue
 		}
+		fmt.Fprintf(&b, "%%%02X", ch)
 	}
 	return b.String()
 }

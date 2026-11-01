@@ -103,3 +103,77 @@ func TestCanonicalTextHash(t *testing.T) {
 		t.Errorf("th length %d", len(base))
 	}
 }
+
+// nastyItems are item contents that touch the grammar or the shell-ish punctuation around it.
+// Each must survive Render then ParseComment unchanged.
+var nastyItems = []string{
+	",", "(", ")", "&", "'", "$", "!", "*", "[", "]", "{", "}", "^", "`", "|", "?", "\\", "\t",
+	"<", ">", `"`, "=", ";", "@", "#", " ", "%", "~", "+", ":", "-", "--", "---", "é", "\u00a0",
+	"%2C", "%28", "%29", "%26", "%27", "%24", "%21", "%2A", "%5B", "%5D", "%25", "%2525", "%",
+}
+
+// pathSafe drops the items that are not legal inside a repository path on every platform
+// (separators, Windows-reserved characters), because paths are checked by confine.
+func pathSafe(s string) bool { return !strings.ContainsAny(s, "\\<>\"|?*:\t") && s != "\u00a0" }
+
+func TestRenderParseRoundTripNastyCharacters(t *testing.T) {
+	for _, s := range nastyItems {
+		c := Claim{ID: "01J8Q4ZK8N3X2T5V6W7Y8Z9A0B", Kind: "rationale", Status: "unverified", Scope: "repo",
+			Evidence: []Evidence{
+				{Kind: EvTurn, Ref: "t" + s + "u"},
+				{Kind: EvExternal, Ref: "https://example.invalid/a" + s + "b"},
+			},
+			Deps:        []string{"src/a.go#sym" + s + "x"},
+			AKA:         []string{"alias" + s + "x", s + "lead"},
+			Supersedes:  []string{"old" + s + "x"},
+			Contradicts: []string{"other" + s + "x"},
+		}
+		if pathSafe(s) {
+			c.Evidence = append(c.Evidence, Evidence{Kind: EvBlob, Path: "docs/a" + s + "b.md"})
+			c.Deps = append(c.Deps, "docs/d"+s+"e.go")
+		}
+		line := c.Render()
+		got, err := ParseComment(line)
+		if err != nil {
+			t.Errorf("%q: rendered line does not parse: %v\n%s", s, err, line)
+			continue
+		}
+		if !reflect.DeepEqual(got, c) {
+			t.Errorf("%q: round trip changed the claim\n got %+v\nwant %+v\nline %s", s, got, c, line)
+		}
+	}
+}
+
+// The review's case: a percent-encoded comma in a path parses, and rendering used to emit a
+// raw comma, which the parser rejects. Every percent form below must come back as itself.
+func TestParsedPercentFormsRenderBack(t *testing.T) {
+	for _, enc := range []string{"%2C", "%28", "%29", "%26", "%27", "%24", "%21", "%2A", "%5B", "%5D", "%7B", "%7D", "%5E", "%60", "%7C", "%3F", "%25", "%2525"} {
+		line := "<!-- claim kind=intent status=unverified ev=docs/a" + enc + "b.md dep=docs/a" + enc + "b.md#s" + enc + " sup=s" + enc + " -->"
+		c, err := ParseComment(line)
+		if err != nil {
+			t.Errorf("%s: hand-written line does not parse: %v", enc, err)
+			continue
+		}
+		again, err := ParseComment(c.Render())
+		if err != nil {
+			t.Errorf("%s: a valid claim rendered to a line the parser rejects: %v\n%s", enc, err, c.Render())
+			continue
+		}
+		if !reflect.DeepEqual(again, c) {
+			t.Errorf("%s: round trip changed the claim\n got %+v\nwant %+v", enc, again, c)
+		}
+	}
+}
+
+// Whatever the contents, a rendered value outside quotes uses only the bare alphabet.
+func TestRenderedValuesStayInsideTheBareAlphabet(t *testing.T) {
+	c := Claim{Kind: "intent", Status: "unverified", Supersedes: []string{"a,b(c)&d'e$f!g*h[i]j"}, Contradicts: []string{"x y\tz"}}
+	line := c.Render()
+	body := strings.TrimSuffix(strings.TrimPrefix(line, prefix), suffix)
+	for _, f := range strings.Fields(body) {
+		_, v, _ := strings.Cut(f, "=")
+		if !strings.HasPrefix(v, `"`) && !bareRe.MatchString(v) {
+			t.Errorf("value %q is outside the bare alphabet in %s", v, line)
+		}
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -73,11 +74,13 @@ func TestRule1AuthoringNoSelfEvidence(t *testing.T) {
 	}
 }
 
-func TestRule1DeriveSelfEvidenceIsHypothesis(t *testing.T) {
+// "hypothesis" is a claim kind, not a status. A verified claim whose only evidence is an agent
+// turn displays as unverified, and says why.
+func TestRule1DeriveSelfEvidenceIsUnverified(t *testing.T) {
 	c := stamped(claim.Claim{Kind: "current-impl", Status: "verified", Evidence: []claim.Evidence{{Kind: claim.EvTurn, Ref: "t1"}}})
-	d, _ := Derive(context.Background(), c, text, fakeEnv{})
-	if d.Status != "hypothesis" {
-		t.Fatalf("%+v", d)
+	d, err := Derive(context.Background(), c, text, fakeEnv{})
+	if err != nil || d.Status != "unverified" || !slices.Contains(d.Notes, "agent summary is its only evidence") {
+		t.Fatalf("%+v %v", d, err)
 	}
 }
 

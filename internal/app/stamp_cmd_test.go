@@ -1,11 +1,15 @@
 package app
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/TerrysPOV/Wikory/internal/claim"
 )
 
 func stampRepo(t *testing.T, page string) (string, *cli) {
@@ -89,5 +93,39 @@ func TestStampKeepsTrackedButDirtyEvidenceUnverified(t *testing.T) {
 	got := readFile(t, filepath.Join(dir, "project-memory", "wiki", "q.md"))
 	if code != ExitOK || !strings.Contains(got, "status=unverified") || strings.Contains(got, "ev=src/q.go@") || !strings.Contains(errOut, "uncommitted changes") {
 		t.Fatalf("code=%d page=%s stderr=%s", code, got, errOut)
+	}
+}
+
+// A percent-encoded comma in a path used to be rendered back as a raw comma, which the
+// parser rejects, so the stamped claim dropped out of the index.
+func TestStampKeepsPercentEncodedPunctuationParseable(t *testing.T) {
+	page := "# Q\n\n<!-- claim kind=intent status=unverified dep=src/a%2Cb.go#s%28x%29 sup=old%26new -->\nA claim about odd names.\n"
+	dir, c := stampRepo(t, page)
+	if _, e, code := c.run(dir, "page", "stamp", "project-memory/wiki/q.md"); code != ExitOK {
+		t.Fatal(e)
+	}
+	got := readFile(t, filepath.Join(dir, "project-memory", "wiki", "q.md"))
+	p := claim.ParsePage("project-memory/wiki/q.md", []byte(got))
+	if len(p.Blocks) != 1 || p.Blocks[0].Err != nil {
+		t.Fatalf("the stamped claim no longer parses: %+v\n%s", p.Blocks, got)
+	}
+	if want := []string{"src/a,b.go#s(x)"}; !reflect.DeepEqual(p.Blocks[0].Claim.Deps, want) {
+		t.Fatalf("deps %v, want %v\n%s", p.Blocks[0].Claim.Deps, want, got)
+	}
+}
+
+// renderChecked is the stamp command's last line of defence: a claim whose rendering the
+// parser would reject is refused instead of being written into the page.
+func TestRenderCheckedRefusesALineThatDoesNotReparse(t *testing.T) {
+	bad := claim.Claim{Kind: "intent", Status: "unverified", AKA: []string{""}}
+	if _, err := claim.ParseComment(bad.Render()); err == nil {
+		t.Fatal("test premise broken: the bad claim renders to a parseable line")
+	}
+	if line, err := renderChecked(bad); err == nil || line != "" || !errors.Is(err, claim.ErrMalformed) {
+		t.Fatalf("line=%q err=%v", line, err)
+	}
+	good := claim.Claim{Kind: "intent", Status: "unverified"}
+	if line, err := renderChecked(good); err != nil || line != good.Render() {
+		t.Fatalf("line=%q err=%v", line, err)
 	}
 }

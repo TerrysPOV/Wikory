@@ -45,8 +45,12 @@ func ParsePage(rel string, data []byte) Page {
 	start := p.parseFrontmatter(lines)
 	var body []string
 	heading := ""
+	clean, dropped := stripComments(lines, start)
 	for i := start; i < len(lines); i++ {
-		line := lines[i]
+		if dropped[i] {
+			continue
+		}
+		line := clean[i]
 		trimmed := strings.TrimSpace(line)
 		switch {
 		case isHeading(trimmed):
@@ -60,11 +64,15 @@ func ParsePage(rel string, data []byte) Page {
 			b.Claim, b.Err = ParseComment(trimmed)
 			var para []string
 			for i+1 < len(lines) {
-				next := strings.TrimSpace(lines[i+1])
+				if dropped[i+1] { // a comment inside the paragraph is removed; it does not end it
+					i++
+					continue
+				}
+				next := strings.TrimSpace(clean[i+1])
 				if next == "" || IsClaimComment(next) || isHeading(next) {
 					break
 				}
-				para = append(para, strings.TrimRight(lines[i+1], " \t"))
+				para = append(para, strings.TrimRight(clean[i+1], " \t"))
 				i++
 			}
 			b.Text = strings.Join(para, "\n")
@@ -76,8 +84,6 @@ func ParsePage(rel string, data []byte) Page {
 				p.Findings = append(p.Findings, Finding{b.Line, b.Err.Error()})
 			}
 			p.Blocks = append(p.Blocks, b)
-		case strings.HasPrefix(trimmed, "<!--"):
-			// Non-claim comments are not indexed and never rendered (spec 7.4).
 		default:
 			body = append(body, line)
 		}
@@ -90,6 +96,49 @@ func ParsePage(rel string, data []byte) Page {
 		p.Title = p.ID
 	}
 	return p
+}
+
+// stripComments removes HTML comments from lines[start:] with one scan that carries the
+// "inside a comment" state across lines (spec 7.4: comments are not indexed and never
+// rendered). It returns the cleaned lines and which lines vanish entirely. Lines keep their
+// positions so claim line numbers still point into the file.
+//
+//   - A claim comment line is kept as it is, unless it sits inside an open comment.
+//   - Text after a closing marker on the same line survives.
+//   - A comment that is never closed hides everything after its opener.
+func stripComments(lines []string, start int) (clean []string, dropped []bool) {
+	clean = append([]string(nil), lines...)
+	dropped = make([]bool, len(lines))
+	inComment := false
+	for i := start; i < len(lines); i++ {
+		if !inComment && IsClaimComment(lines[i]) {
+			continue
+		}
+		var out strings.Builder
+		rest, touched := lines[i], inComment
+		for {
+			if inComment {
+				j := strings.Index(rest, "-->")
+				if j < 0 {
+					break
+				}
+				rest, inComment = rest[j+len("-->"):], false
+				continue
+			}
+			j := strings.Index(rest, "<!--")
+			if j < 0 {
+				out.WriteString(rest)
+				break
+			}
+			out.WriteString(rest[:j])
+			rest, inComment, touched = rest[j+len("<!--"):], true, true
+		}
+		if touched {
+			clean[i] = out.String()
+			dropped[i] = strings.TrimSpace(clean[i]) == ""
+		}
+	}
+	return clean, dropped
 }
 
 func isHeading(s string) bool {
