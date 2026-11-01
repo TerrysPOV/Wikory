@@ -77,7 +77,8 @@ func timeoutBriefing(reason string) string {
 
 func runHook(ctx context.Context, env *Env, args []string) (res Result, err error) {
 	start := time.Now()
-	deadline := start.Add(hookBudget(env)) // the budget starts before stdin is read
+	budget := hookBudget(env)
+	deadline := start.Add(budget) // the budget starts before stdin is read
 	action := "none"
 	defer func() {
 		if r := recover(); r != nil {
@@ -101,7 +102,7 @@ func runHook(ctx context.Context, env *Env, args []string) (res Result, err erro
 		err error
 	}
 	// Computed before stdin is read, so the stalled-input path does no work either.
-	stdinFallback := timeoutBriefing("the hook input did not arrive within " + hookBudget(env).String())
+	stdinFallback := timeoutBriefing("the hook input did not arrive within " + budget.String())
 	got := make(chan decoded, 1)
 	go func() {
 		defer func() {

@@ -128,7 +128,7 @@ func runInit(ctx context.Context, env *Env, args []string) (Result, error) {
 		{wikiDir + "/README.md", []byte(wikiReadme)},
 	}
 	var ops []publish.Op
-	var written []string
+	written := []string{}
 	for _, w := range want {
 		existing, err := root.ReadFile(w.path, 1<<20)
 		switch {
@@ -154,9 +154,6 @@ func runInit(ctx context.Context, env *Env, args []string) (Result, error) {
 		if err := pub.Publish(ctx, job, ops, "init project="+cfg.ProjectID); err != nil {
 			return Result{}, err
 		}
-	}
-	if written == nil {
-		written = []string{}
 	}
 	text := fmt.Sprintf("Wikory initialised in %s\n  project id: %s\n  private store: %s\n  trusted: %v\n",
 		repo.Top, cfg.ProjectID, st.Dir, trusted)

@@ -22,13 +22,7 @@ func newStore(t *testing.T) *store.Store {
 
 func writePage(t *testing.T, repoDir, name, content string) {
 	t.Helper()
-	p := filepath.Join(repoDir, "project-memory", "wiki", filepath.FromSlash(name))
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeRaw(t, repoDir, "project-memory/wiki/"+name, content)
 }
 
 func openRoot(t *testing.T, dir string) *confine.Root {

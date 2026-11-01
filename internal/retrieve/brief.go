@@ -178,10 +178,7 @@ func Brief(in BriefInput) string {
 
 func oneLine(s string, n int) string {
 	s = strings.Join(strings.Fields(Sanitize(s)), " ")
-	if rs := []rune(s); len(rs) > n {
-		return string(rs[:n]) + "..."
-	}
-	return s
+	return truncateRunes(s, n)
 }
 
 // StatusOnly is the minimal briefing: one sanitised line, no I/O, no counts it did not

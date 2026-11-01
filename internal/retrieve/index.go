@@ -57,11 +57,6 @@ type RefreshStats struct {
 	Notices                                     []string
 }
 
-type found struct {
-	rel  string
-	data []byte
-}
-
 type walkState struct {
 	rels     []string
 	refused  int
@@ -185,7 +180,7 @@ func (ix *Indexer) Refresh(ctx context.Context) (RefreshStats, error) {
 		total += int64(len(data))
 		st.Pages++
 		if known[rel] != ids.SHA256Hex(data) {
-			n, err := ix.indexPage(ctx, tx, found{rel, data})
+			n, err := ix.indexPage(ctx, tx, rel, data)
 			if err != nil {
 				return st, err
 			}
@@ -226,18 +221,18 @@ func deletePage(ctx context.Context, tx *sql.Tx, checkout, rel string) error {
 	return nil
 }
 
-func (ix *Indexer) indexPage(ctx context.Context, tx *sql.Tx, f found) (int, error) {
-	if err := deletePage(ctx, tx, ix.CheckoutID, f.rel); err != nil {
+func (ix *Indexer) indexPage(ctx context.Context, tx *sql.Tx, rel string, data []byte) (int, error) {
+	if err := deletePage(ctx, tx, ix.CheckoutID, rel); err != nil {
 		return 0, err
 	}
-	p := claim.ParsePage(f.rel, f.data)
+	p := claim.ParsePage(rel, data)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO pages(checkout_id, relpath, content_hash, page_id, title, type) VALUES(?, ?, ?, ?, ?, ?)`,
-		ix.CheckoutID, f.rel, ids.SHA256Hex(f.data), p.ID, p.Title, p.Type); err != nil {
+		ix.CheckoutID, rel, ids.SHA256Hex(data), p.ID, p.Title, p.Type); err != nil {
 		return 0, err
 	}
-	pathWords := strings.TrimSuffix(path.Base(f.rel), ".md")
+	pathWords := strings.TrimSuffix(path.Base(rel), ".md")
 	if _, err := tx.ExecContext(ctx, `INSERT INTO fts(title, heading, claim, body, search_text, checkout_id, relpath, ordinal) VALUES(?, '', '', ?, ?, ?, ?, -1)`,
-		p.Title, p.Body, Expand(p.Title+" "+pathWords+" "+p.Body), ix.CheckoutID, f.rel); err != nil {
+		p.Title, p.Body, Expand(p.Title+" "+pathWords+" "+p.Body), ix.CheckoutID, rel); err != nil {
 		return 0, err
 	}
 	malformed := 0
@@ -247,12 +242,12 @@ func (ix *Indexer) indexPage(ctx context.Context, tx *sql.Tx, f found) (int, err
 			continue
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO claims(checkout_id, relpath, ordinal, claim_id, meta, text, heading, status, kind) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			ix.CheckoutID, f.rel, i, b.Claim.ID, b.MetaLine, b.Text, b.Heading, b.Claim.Status, b.Claim.Kind); err != nil {
+			ix.CheckoutID, rel, i, b.Claim.ID, b.MetaLine, b.Text, b.Heading, b.Claim.Status, b.Claim.Kind); err != nil {
 			return 0, err
 		}
 		extra := strings.Join(b.Claim.AKA, " ") + " " + strings.Join(b.Claim.Deps, " ")
 		if _, err := tx.ExecContext(ctx, `INSERT INTO fts(title, heading, claim, body, search_text, checkout_id, relpath, ordinal) VALUES(?, ?, ?, '', ?, ?, ?, ?)`,
-			p.Title, b.Heading, b.Text, Expand(p.Title+" "+b.Heading+" "+b.Text+" "+extra), ix.CheckoutID, f.rel, i); err != nil {
+			p.Title, b.Heading, b.Text, Expand(p.Title+" "+b.Heading+" "+b.Text+" "+extra), ix.CheckoutID, rel, i); err != nil {
 			return 0, err
 		}
 	}

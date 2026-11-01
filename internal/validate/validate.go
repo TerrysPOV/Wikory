@@ -102,21 +102,24 @@ func Authoring(ctx context.Context, c claim.Claim, text string, env Env, mint fu
 		return claim.Claim{}, nil, err
 	}
 	unresolved, resolvable := 0, 0
+	// unresolve drops the object id of blob evidence that cannot be confirmed, so none is written.
+	unresolve := func(i int) {
+		out.Evidence[i].OID, out.Evidence[i].Algo = "", ""
+		unresolved++
+	}
 	for i, e := range out.Evidence {
 		switch e.Kind {
 		case claim.EvBlob:
 			headOID, committed := head[e.Path]
 			if !committed {
-				out.Evidence[i].OID, out.Evidence[i].Algo = "", ""
-				unresolved++
+				unresolve(i)
 				note(2, "uncommitted-evidence", "evidence %s is not committed at HEAD; the claim stays unverified", e.Path)
 				continue
 			}
 			if work, present, err := env.WorkBlob(ctx, e.Path); err != nil {
 				return claim.Claim{}, nil, err
 			} else if !present || work != headOID {
-				out.Evidence[i].OID, out.Evidence[i].Algo = "", ""
-				unresolved++
+				unresolve(i)
 				note(2, "dirty-evidence", "evidence %s has uncommitted changes; the claim stays unverified until they are committed", e.Path)
 				continue
 			}
@@ -126,8 +129,7 @@ func Authoring(ctx context.Context, c claim.Claim, text string, env Env, mint fu
 					return claim.Claim{}, nil, fmt.Errorf("evidence %s@%s: %w", e.Path, e.OID, err)
 				}
 				if err != nil || full != headOID {
-					out.Evidence[i].OID, out.Evidence[i].Algo = "", ""
-					unresolved++
+					unresolve(i)
 					note(2, "stale-evidence", "evidence %s names blob %s, which is not the committed version", e.Path, e.OID)
 					continue
 				}

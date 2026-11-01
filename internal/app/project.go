@@ -136,56 +136,58 @@ func openProject(ctx context.Context, env *Env, createStore bool) (*project, err
 		return nil, err
 	}
 	p := &project{Repo: repo, RepoRoot: root}
-	data, err := root.ReadFile(configPath, 1<<16)
-	if errors.Is(err, fs.ErrNotExist) {
+	if err := p.load(ctx, env, createStore); err != nil {
 		p.Close()
-		return nil, errNotInitialised
+		return nil, err
+	}
+	return p, nil
+}
+
+// load fills in p from the committed config and the private store. A missing store is not an
+// error: p.Store stays nil and p is neither registered nor trusted.
+func (p *project) load(ctx context.Context, env *Env, createStore bool) error {
+	data, err := p.RepoRoot.ReadFile(configPath, 1<<16)
+	if errors.Is(err, fs.ErrNotExist) {
+		return errNotInitialised
 	}
 	if err != nil {
-		p.Close()
-		return nil, fmt.Errorf("reading %s: %w", configPath, err)
+		return fmt.Errorf("reading %s: %w", configPath, err)
 	}
 	if p.Config, err = parseConfig(data); err != nil {
-		p.Close()
-		return nil, err
+		return err
 	}
-	p.Identity = identityFor(ctx, repo, p.Config.ProjectID)
+	p.Identity = identityFor(ctx, p.Repo, p.Config.ProjectID)
 	dataDir, err := store.DataDir(env.Getenv)
 	if err != nil {
-		p.Close()
-		return nil, err
+		return err
 	}
 	p.Store, err = store.Resolve(ctx, dataDir, p.Identity, createStore)
 	if errors.Is(err, store.ErrNoStore) {
-		return p, nil
+		return nil
 	}
 	if err != nil {
-		p.Close()
-		return nil, err
+		return err
 	}
-	decision, _, err := p.Store.TrustDecision(ctx, repo.CommonDir)
+	decision, _, err := p.Store.TrustDecision(ctx, p.Repo.CommonDir)
 	if err != nil {
-		p.Close()
-		return nil, err
+		return err
 	}
 	p.Trusted = decision == store.TrustTrusted
 	co, ok, err := p.Store.LookupCheckout(ctx, p.Identity)
 	if err != nil {
-		p.Close()
-		return nil, err
+		return err
 	}
 	if !ok && p.Trusted {
-		if known, _ := p.Store.CommonDirRegistered(ctx, repo.CommonDir); known {
+		if known, _ := p.Store.CommonDirRegistered(ctx, p.Repo.CommonDir); known {
 			if co, err = p.Store.Register(ctx, p.Identity); err != nil {
-				p.Close()
-				return nil, err
+				return err
 			}
 			ok = true
 			p.Notices = append(p.Notices, "registered this worktree of an already trusted clone")
 		}
 	}
 	p.Checkout, p.Registered = co, ok
-	return p, nil
+	return nil
 }
 
 // publisher builds a publisher bound to this checkout. The fingerprint is the HEAD tree id.

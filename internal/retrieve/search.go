@@ -92,8 +92,8 @@ func Search(ctx context.Context, db *sql.DB, checkoutID string, repo *confine.Ro
 			}
 		}
 		h.Text = Sanitize(h.Text)
-		if h.PageOnly && len([]rune(h.Text)) > 200 {
-			h.Text = string([]rune(h.Text)[:200]) + "..."
+		if h.PageOnly {
+			h.Text = truncateRunes(h.Text, 200)
 		}
 		h.PageTitle, h.Heading = Sanitize(h.PageTitle), Sanitize(h.Heading)
 		h.RelPath, h.ClaimID = Sanitize(h.RelPath), Sanitize(h.ClaimID) // file names are page content too

@@ -56,9 +56,18 @@ func Sanitize(s string) string {
 	s = angles.Replace(s)
 	lines := strings.Split(s, "\n")
 	for i, l := range lines {
-		if rs := []rune(l); len(rs) > maxLine {
-			lines[i] = string(rs[:maxLine]) + "..."
-		}
+		lines[i] = truncateRunes(l, maxLine)
 	}
 	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+// truncateRunes cuts s to at most n runes and marks a cut with "...".
+func truncateRunes(s string, n int) string {
+	if len(s) <= n { // a string of n bytes or fewer has n runes or fewer
+		return s
+	}
+	if rs := []rune(s); len(rs) > n {
+		return string(rs[:n]) + "..."
+	}
+	return s
 }
