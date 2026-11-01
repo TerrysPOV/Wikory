@@ -91,7 +91,7 @@ func RunEnv(args []string, env *Env) int {
 		return ExitUsage
 	}
 	res, err := cmd.Run(context.Background(), env, args[1:])
-	if cmd.Raw && err == nil {
+	if cmd.Raw && err == nil && !env.JSON {
 		return ExitOK
 	}
 	return finish(env, cmd.Name, res, err)
