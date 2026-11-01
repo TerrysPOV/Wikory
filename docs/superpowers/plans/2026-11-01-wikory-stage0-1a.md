@@ -49,6 +49,8 @@ A check counts only after it has been seen to fail. For each injection step:
 
 `scripts/inject_selftest.sh` proves those verdicts on a fixture package. Every fault row in this plan was run against this plan's own code. Each row's command sits in a fenced `bash` block, so nothing in it needs Markdown escaping.
 
+Rows that exercise a spike package (build tag `spike`) put `GOFLAGS=-tags=spike` before `scripts/inject.sh`; without it the baseline finds no test and the row is INCONCLUSIVE.
+
 **Assertion shapes that cannot fail, and are banned in this plan:**
 
 | Shape | Why it cannot fail | What to do instead |
@@ -143,6 +145,7 @@ The dependencies below were re-derived from each task's real imports and the fil
 - **Isolation for Claude Code.** S4 first checks, with no model call (`claude auth status`, whose text is never printed), whether a scratch `CLAUDE_CONFIG_DIR` keeps authentication working. **No credential is ever copied** into it.
   - If it works, every launch uses the scratch config, and session logs stay in the scratch area.
   - If it does not, launches use the real config. Session logs for the scratch project then land in `~/.claude/projects/<slug of the scratch path>/`, and `spike_relocate_transcripts` moves exactly that directory into the scratch area after each launch. Settings files are never edited.
+  - **Outcome (S4, `isolation.section.md`):** a scratch `CLAUDE_CONFIG_DIR` does not authenticate, so every stage 0 launch used the real configuration with `spike_relocate_transcripts`.
 
   Every launch (`run-claude.sh`, `run-codex.sh`, `run-interactive.sh`, the A29 end-to-end script) is built the same way:
   - `env -i` with the variables from `spike_env` (so the parent session's variables, including its nested-session markers, do not leak in)
@@ -151,7 +154,7 @@ The dependencies below were re-derived from each task's real imports and the fil
   - `--strict-mcp-config` with an empty MCP config unless the spike needs plugin MCP
   - `--model haiku`
   - `--output-format json`, so token usage and reported cost land in `result.json`
-- **Budget and ledger.** The unit is one **CLI launch** of Claude Code (print or interactive) or Codex (`codex exec`). Stage 0 has at most 12, Claude Code and Codex together. `docs/spikes/lib.sh` counts them in one shared ledger, `$WIKORY_SPIKE_SCRATCH/wikory-spikes/ledger.tsv`. Every wrapper takes a slot before it launches, the thirteenth is refused, retries count, and nothing resets the ledger (S10 included). Calls a launch makes internally (subagents, Stop-hook continuations) are not counted, but each launch's reported usage (`num_turns`, `usage`, `total_cost_usd`) is logged to `ledger-usage.tsv`. `claude auth status`, `claude plugin validate` and `codex --help` are not launches.
+- **Budget and ledger.** The unit is one **CLI launch** of Claude Code (print or interactive) or Codex (`codex exec`). Stage 0 has at most 12, Claude Code and Codex together. `docs/spikes/lib.sh` counts them in one shared ledger, `$WIKORY_SPIKE_SCRATCH/wikory-spikes/ledger.tsv`. Every wrapper takes a slot before it launches, the thirteenth is refused, retries count, and nothing resets the ledger (S10 included). Calls a launch makes internally (subagents, Stop-hook continuations) are not counted, but each Claude Code print launch's reported usage (`num_turns`, `usage`, `total_cost_usd`, read from `result.json`) is logged to `ledger-usage.tsv`. A Codex launch (`run-codex.sh`) and an interactive launch (`run-interactive.sh`) log only their exit status: `codex exec` writes no machine-readable usage here, so Codex usage is not captured. S12 was dropped, so stage 0 made no Codex launch. `claude auth status`, `claude plugin validate` and `codex --help` are not launches.
 - **Cost per launch.** A Haiku `-p` launch with a one-line prompt carries the system prompt and tool definitions: roughly 15k to 30k input tokens (mostly cache reads after the first) and under 1k output tokens. Each spike records the measured usage, converted to GBP at a rate stated with its date. On a subscription plan this draws on plan quota rather than a per-token price, and the record says so. Order of magnitude: a few pence per launch at API list prices; check current pricing rather than trusting this figure.
 
 | Launch | Task | Product | Purpose |
@@ -295,8 +298,11 @@ fi
 jq -r 'select(.Action == "fail" and .Test != null) | .Test' "$work/fault.json" | sort -u > "$work/failed.txt"
 [ -s "$work/failed.txt" ] || inconclusive "the package failed outside any named test (TestMain, init or the binary)"
 jq -r --rawfile f "$work/failed.txt" '($f | split("\n")) as $names | select(.Action == "output" and .Test != null and (.Test as $t | $names | index($t))) | .Output' "$work/fault.json" > "$work/out.txt"
-if grep -q 'panic:' "$work/out.txt" && ! printf '%s' "$expect" | grep -q 'panic'; then
-  inconclusive "a test panicked instead of failing its assertion: $(grep -m1 'panic:' "$work/out.txt")"
+# A panic anywhere in the event stream (any test, package-level, or after a named failure) is never RED,
+# and an EXPECTED text that mentions a panic is not an exception.
+jq -r 'select(.Action == "output") | .Output' "$work/fault.json" > "$work/all-out.txt"
+if grep -q 'panic:' "$work/all-out.txt"; then
+  inconclusive "a panic occurred under the fault, so a failing assertion cannot be attributed: $(grep -m1 'panic:' "$work/all-out.txt")"
 fi
 if ! grep -qF -- "$expect" "$work/out.txt"; then
   inconclusive "the failure text did not contain the prediction '$expect'; first failure line: $(grep -m1 -E '_test\.go:[0-9]+:' "$work/out.txt" | sed 's/^ *//')"
@@ -358,6 +364,7 @@ expect() {
 expect 0 "real assertion fault is RED"        "$f" 'return a + b' 'return a - b'          "$p" '^TestAdd$' 'Add(2, 3) = -1, want 5'
 expect 2 "compile-error fault is INCONCLUSIVE" "$f" 'return a + b' 'return a +'            "$p" '^TestAdd$' 'Add(2, 3)'
 expect 2 "panicking fault is INCONCLUSIVE"     "$f" 'return a + b' 'return a + b + Div(1, a-a)' "$p" '^TestAdd$' 'Add(2, 3)'
+expect 2 "panic is INCONCLUSIVE even if the prediction mentions it" "$f" 'return a + b' 'return a + b + Div(1, a-a)' "$p" '^TestAdd$' 'panic'
 expect 2 "wrong prediction is INCONCLUSIVE"    "$f" 'return a + b' 'return a - b'          "$p" '^TestAdd$' 'something else entirely'
 expect 2 "no matching test is INCONCLUSIVE"    "$f" 'return a + b' 'return a - b'          "$p" '^TestNope$' 'Add(2, 3)'
 expect 1 "harmless change SURVIVES"            "$f" 'return a + b' 'return b + a'          "$p" '^TestAdd$' 'Add(2, 3)'
@@ -380,18 +387,25 @@ Expected: seven `ok` lines: the real fault is RED (exit 0); the compile-error fa
 # Scrub a captured payload or transcript before it is committed as a fixture.
 # Usage: scripts/scrub-fixture.sh IN OUT
 # On a residue it prints only the file, the line number and the rule name, never the line,
-# and deletes OUT. Exit 0 clean, 1 residue found, 2 usage.
+# and deletes OUT. Exit 0 clean, 1 residue found, 2 usage or any operational failure (missing or
+# unreadable input, failed transform, failed rule load, scanner error). It fails CLOSED: a success
+# message is printed only when every step succeeded and every rule ran.
 set -uo pipefail
 [ $# -eq 2 ] || { echo "usage: scrub-fixture.sh IN OUT" >&2; exit 2; }
 in=$1 out=$2
+[ -f "$in" ] && [ -r "$in" ] || { echo "scrub: input missing or unreadable" >&2; exit 2; }
 scratch=${WIKORY_SPIKE_SCRATCH:-/nonexistent-scratch}
 resolved_scratch=$(cd "$scratch" 2>/dev/null && pwd -P || echo /nonexistent-scratch)
-user=$(id -un)
-host=$(hostname -s)
+user=$(id -un) || { echo "scrub: cannot determine user" >&2; exit 2; }
+host=$(hostname -s) || { echo "scrub: cannot determine host" >&2; exit 2; }
+[ -n "$user" ] && [ -n "$host" ] && [ -n "${HOME:-}" ] || { echo "scrub: empty identity value" >&2; exit 2; }
 # Replacements first: paths and identities, then known noisy-but-harmless fields.
-sed -E -e "s#${resolved_scratch}#/SCRATCH#g" -e "s#${scratch}#/SCRATCH#g" \
+if ! sed -E -e "s#${resolved_scratch}#/SCRATCH#g" -e "s#${scratch}#/SCRATCH#g" \
     -e "s#${HOME}#/HOME#g" -e "s#${user}#user#g" -e "s#${host}#host#g" \
-    -e 's#"signature":"[^"]*"#"signature":"SCRUBBED"#g' "$in" > "$out"
+    -e 's#"signature":"[^"]*"#"signature":"SCRUBBED"#g' "$in" > "$out"; then
+  rm -f "$out"; echo "scrub: transform failed" >&2; exit 2
+fi
+[ -f "$out" ] || { echo "scrub: output not written" >&2; exit 2; }
 # Residue rules: name<TAB>extended regex.
 rules=$(cat <<'RULES'
 users-path	/Users/
@@ -410,15 +424,20 @@ long-base64	[A-Za-z0-9+/]{40,}={0,2}
 long-hex	[0-9a-fA-F]{40,}
 RULES
 )
-found=0
+found=0 ran=0 expected=$(printf '%s\n' "$rules" | grep -c .)
+[ "$expected" -ge 10 ] || { rm -f "$out"; echo "scrub: rule list failed to load" >&2; exit 2; }
 while IFS=$'\t' read -r name re; do
   [ -n "$name" ] || continue
-  hits=$(grep -nE -- "$re" "$out" 2>/dev/null | cut -d: -f1 | tr '\n' ' ')
+  matches=$(grep -nE -- "$re" "$out"); grc=$?
+  if [ "$grc" -gt 1 ]; then rm -f "$out"; echo "scrub: scanner error in rule $name" >&2; exit 2; fi
+  ran=$((ran + 1))
+  hits=$(printf '%s' "$matches" | cut -d: -f1 | tr '\n' ' ')
   if [ -n "$hits" ]; then
     printf 'scrub: %s: rule %s matched at line(s) %s\n' "$in" "$name" "$hits" >&2
     found=1
   fi
 done <<< "$rules"
+[ "$ran" -eq "$expected" ] || { rm -f "$out"; echo "scrub: only $ran of $expected rules ran" >&2; exit 2; }
 if [ "$found" -ne 0 ]; then
   rm -f "$out"
   echo "scrub: refused; extend the replacement rules for these shapes, never commit unscrubbed" >&2
@@ -460,6 +479,13 @@ check "hex run"      "oid ${h} end"                 "${h}"
 check "email"        "mail someone@example.com"     "someone@example.com"
 printf '{"cwd":"%s/x"}\n' "$HOME" > "$d/in"
 scripts/scrub-fixture.sh "$d/in" "$d/out" >/dev/null 2>&1 && grep -q '"/HOME/x"' "$d/out" && echo "ok    home path replaced" || { echo "FAIL  home path"; fail=1; }
+# Fail-closed checks: operational failures must never end in a success message or exit 0.
+for label in "missing input" "unwritable output"; do
+  rm -f "$d/out"
+  if [ "$label" = "missing input" ]; then scripts/scrub-fixture.sh "$d/nope" "$d/out" >"$d/log" 2>&1; rc=$?
+  else printf 'clean\n' > "$d/in"; scripts/scrub-fixture.sh "$d/in" "$d/no-such-dir/out" >"$d/log" 2>&1; rc=$?; fi
+  if [ "$rc" -eq 0 ] || grep -q 'scrub: ok' "$d/log"; then echo "FAIL  $label reported success (rc=$rc)"; fail=1; else echo "ok    $label fails closed (rc=$rc)"; fi
+done
 exit $fail
 ```
 
@@ -688,6 +714,8 @@ git commit -m "test(spike): verify FTS5 and bm25 in modernc sqlite"
 
 **Assumptions under test:** (a) `os.Root` refuses paths that escape the root; (b) `os.Root` *follows* symlinks that stay inside the root, so on its own it does not meet spec 5.5 rule 7 ("symlinks are refused"); (c) on unix, `openat` with `O_NOFOLLOW` on each component refuses a symlinked directory component; (d) `os.Root.Rename` and `os.Root.Link` exist from Go 1.25, which sets the go directive. **Refuted if** (a) fails: os.Root cannot be the Windows basis and 1a Windows confinement becomes a manual `GetFinalPathNameByHandle` check (record, adjudicate). If (b) is refuted (os.Root refuses in-root symlinks too), the unix implementation could be simplified, but A3 still uses per-component `openat` because it is race-resistant by construction. If (c) fails, A3's unix design is wrong and must stop. If (d) fails, the go directive moves to the first version that has both.
 
+**Outcome (S2, committed).** (a) held. (b) held for a **relative** in-root symlink (`inlink -> a.txt`); an **absolute** symlink is refused even when its target is inside the root (`abslink`, "path escapes from parent"), so the spike creates both. (c) held, with a platform difference: on macOS `openat` with `O_NOFOLLOW|O_DIRECTORY` on a symlinked directory returns `ENOTDIR`, not `ELOOP`, so A3 treats both as symlink refusal after an `fstatat` check. (d) held: 1.25 is the API floor; the go directive is 1.26.0 because the dependencies declare it (Global Constraints).
+
 - [ ] **Step 1: Write the unix spike**
 
 `internal/spikes/root_unix_spike_test.go`:
@@ -718,7 +746,8 @@ func spikeTree(t *testing.T) (root, outside string) {
 	}
 	must(t, os.WriteFile(filepath.Join(root, "a.txt"), []byte("INSIDE"), 0o644))
 	must(t, os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("OUTSIDE"), 0o644))
-	must(t, os.Symlink(filepath.Join(root, "a.txt"), filepath.Join(root, "inlink")))
+	must(t, os.Symlink("a.txt", filepath.Join(root, "inlink")))
+	must(t, os.Symlink(filepath.Join(root, "a.txt"), filepath.Join(root, "abslink")))
 	must(t, os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(root, "esc")))
 	must(t, os.Symlink(outside, filepath.Join(root, "escdir")))
 	return root, outside
@@ -756,7 +785,14 @@ func TestOSRootFollowsInRootSymlink(t *testing.T) {
 		return
 	}
 	f.Close()
-	t.Log("VERIFIED V02(b): os.Root follows in-root symlinks, so it alone does not satisfy rule 7")
+	t.Log("VERIFIED V02(b): os.Root follows a relative in-root symlink, so it alone does not satisfy rule 7")
+	// An absolute symlink whose target is inside the root is still refused by os.Root.
+	if f, err := r.Open("abslink"); err == nil {
+		f.Close()
+		t.Log("V02(b) note: os.Root also follows an absolute in-root symlink")
+	} else {
+		t.Logf("V02(b) note: os.Root refuses an absolute symlink even when its target is inside the root: %v", err)
+	}
 }
 
 func TestOpenatNoFollowRefusesSymlinkComponent(t *testing.T) {
@@ -1057,7 +1093,7 @@ git commit -m "test(spike): verify SQLite WAL with parallel writer processes"
 ### Task S4: Isolated spike harness for Claude Code (no model calls)
 
 **Files:**
-- Create: `internal/spikes/recorder/main.go`, `docs/spikes/lib.sh`, `docs/spikes/run-claude.sh`, `docs/spikes/run-codex.sh`, `docs/spikes/setup-scratch.sh`, `docs/spikes/plugin/wikoryspike/.claude-plugin/plugin.json`, `docs/spikes/plugin/wikoryspike/hooks/hooks.json`, `docs/spikes/plugin/wikoryspike/.mcp.json`, `docs/spikes/plugin/wikoryspike/agents/probe.md`, `docs/spikes/plugin/wikoryspike/agents/probe-bg.md`, `docs/spikes/plugin/wikoryspike/settings.json`, `docs/spikes/settings/base.json`
+- Create: `internal/spikes/recorder/main.go`, `internal/spikes/ledger_spike_test.go`, `docs/spikes/lib.sh`, `docs/spikes/run-claude.sh`, `docs/spikes/run-codex.sh`, `docs/spikes/setup-scratch.sh`, `docs/spikes/plugin/wikoryspike/.claude-plugin/plugin.json`, `docs/spikes/plugin/wikoryspike/hooks/hooks.json`, `docs/spikes/plugin/wikoryspike/.mcp.json`, `docs/spikes/plugin/wikoryspike/agents/probe.md`, `docs/spikes/plugin/wikoryspike/agents/probe-bg.md`, `docs/spikes/plugin/wikoryspike/settings.json`, `docs/spikes/settings/base.json`
 
 **Depends on:** S0.
 
@@ -1399,7 +1435,7 @@ cd "$SPIKE_S/proj"
 set +e
 env -i "${envs[@]}" SPIKE_OUT="$out" SPIKE_COPY_TRANSCRIPT=1 \
   claude -p "$prompt" --model haiku --setting-sources project --settings "$settings" \
-  "${mcp_args[@]}" --output-format json "$@" > "$out/result.json" 2> "$out/stderr.txt"
+  ${mcp_args[@]+"${mcp_args[@]}"} --output-format json "$@" > "$out/result.json" 2> "$out/stderr.txt"
 rc=$?
 set -e
 ledger_usage "$n" "$out/result.json"
@@ -1453,7 +1489,7 @@ ledger_usage() { # n result.json
 # is used and the scratch-path session logs land in ~/.claude/projects/<scratch slug>/, which
 # spike_relocate_transcripts moves out afterwards. Settings files are never edited.
 spike_env() {
-  printf '%s\n' "HOME=$HOME" "USER=$USER" "LOGNAME=$USER" "PATH=$SPIKE_S/bin:/opt/homebrew/bin:/usr/bin:/bin" \
+  printf '%s\n' "HOME=$HOME" "USER=$USER" "LOGNAME=$USER" "PATH=$SPIKE_S/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin" \
     "TERM=xterm-256color" "LANG=en_GB.UTF-8"
   if [ -e "$SPIKE_S/config-dir-ok" ]; then printf '%s\n' "CLAUDE_CONFIG_DIR=$SPIKE_S/claude-config"; fi
 }
@@ -1500,6 +1536,81 @@ echo "launch $n/$SPIKE_BUDGET label=$label exit=$rc"
 
 `chmod +x docs/spikes/*.sh`
 
+The ledger is a guard, so it gets a test and fault rows like any other (round 3, H). The test runs `ledger_take` from the committed `lib.sh` in a private scratch area: twelve takes succeed, the thirteenth exits 3, and twenty parallel takes record exactly twelve launches.
+
+`internal/spikes/ledger_spike_test.go`:
+
+```go
+//go:build spike && unix
+
+package spikes
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+)
+
+// take runs ledger_take from docs/spikes/lib.sh against a private scratch area.
+func take(t *testing.T, scratch string) (string, int) {
+	t.Helper()
+	lib, _ := filepath.Abs("../../docs/spikes/lib.sh")
+	c := exec.Command("bash", "-c", `. "$1"; ledger_take claude probe test`, "bash", lib)
+	c.Env = append(os.Environ(), "WIKORY_SPIKE_SCRATCH="+scratch)
+	out, _ := c.CombinedOutput()
+	return strings.TrimSpace(string(out)), c.ProcessState.ExitCode()
+}
+
+// The launch ledger is enforced: twelve takes succeed and the thirteenth is refused with
+// exit 3.
+func TestLedgerRefusesTheThirteenthLaunch(t *testing.T) {
+	scratch := t.TempDir()
+	for i := 1; i <= 12; i++ {
+		if out, code := take(t, scratch); code != 0 || out != strconv.Itoa(i) {
+			t.Fatalf("take %d: exit %d %q", i, code, out)
+		}
+	}
+	if out, code := take(t, scratch); code != 3 || !strings.Contains(out, "budget exhausted") {
+		t.Fatalf("the 13th launch was not refused: exit %d %q", code, out)
+	}
+}
+
+// Parallel takes never record more than twelve launches.
+func TestLedgerHoldsUnderParallelTakes(t *testing.T) {
+	scratch := t.TempDir()
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); take(t, scratch) }()
+	}
+	wg.Wait()
+	data, _ := os.ReadFile(filepath.Join(scratch, "wikory-spikes", "ledger.tsv"))
+	if n := strings.Count(string(data), "\tlaunched\n"); n != 12 {
+		t.Fatalf("parallel takes recorded %d launches, want 12", n)
+	}
+}
+```
+
+Run: `go test -tags spike -run TestLedger ./internal/spikes/`
+Expected: `ok`.
+
+| # | Fault | Predicted failure | Verdict when run |
+|---|---|---|---|
+| S4-1 | the ledger budget check removed | `TestLedgerRefusesTheThirteenthLaunch` (failure text: `the 13th launch was not refused: exit 0 "13"`) | RED |
+| S4-2 | the ledger lock removed | `TestLedgerHoldsUnderParallelTakes`: parallel takes race on the count (failure text: `parallel takes recorded`); RED in three of three runs here | RED |
+
+```bash
+# S4-1: the ledger budget check removed
+GOFLAGS=-tags=spike scripts/inject.sh docs/spikes/lib.sh '  if [ "$n" -gt "$SPIKE_BUDGET" ]; then' '  if false; then' ./internal/spikes/ '^TestLedgerRefusesTheThirteenthLaunch$' 'the 13th launch was not refused: exit 0 "13"'
+
+# S4-2: the ledger lock removed (parallel takes race on the count)
+GOFLAGS=-tags=spike scripts/inject.sh docs/spikes/lib.sh '  until mkdir "$lock" 2>/dev/null; do sleep 0.2; done' '  :' ./internal/spikes/ '^TestLedgerHoldsUnderParallelTakes$' 'parallel takes recorded'
+```
+
 - [ ] **Step 5: Build and lay out the scratch area (no model calls)**
 
 Run:
@@ -1516,7 +1627,7 @@ Expected: an `isolation:` line saying which configuration directory launches wil
 - [ ] **Step 6: Commit**
 
 ```bash
-git add internal/spikes/recorder docs/spikes
+git add internal/spikes/recorder internal/spikes/ledger_spike_test.go docs/spikes
 git commit -m "test(spike): add isolated Claude Code spike harness and probe plugin"
 ```
 
@@ -1968,6 +2079,8 @@ func TestDenyHookCorpus(t *testing.T) {
 		"cd /x && wikory trust",
 		"wikory.exe trust",
 		`"wikory" trust`,
+		"wik''ory trust",
+		"wikory \\\ntrust",
 	}
 	for _, c := range mustCatch {
 		if !denies(c) {
@@ -2636,7 +2749,7 @@ git commit -m "feat(ids): add ULID minting and boundary-safe digests"
 
 ---
 
-### Task A3: Confined, race-resistant file access over os.Root (spec 5.5 rule 7)
+### Task A3: Confined, race-resistant file access with kernel no-follow opens (spec 5.5 rule 7)
 
 **Files:**
 - Create: `internal/confine/confine.go`, `internal/confine/root.go`, `internal/confine/root_unix.go`, `internal/confine/root_windows.go`, `internal/confine/confine_test.go`, `internal/confine/helpers_unix_test.go`, `internal/confine/confine_unix_test.go`
@@ -2648,17 +2761,19 @@ git commit -m "feat(ids): add ULID minting and boundary-safe digests"
   - `confine.Open(dir string) (*Root, error)`; `(*Root).Path() string`; `(*Root).Close() error`
   - `(*Root).ReadFile(rel string, max int64) ([]byte, error)`; `(*Root).OpenRead(rel string) (*os.File, error)`
   - `(*Root).WriteFileAtomic(rel string, data []byte, perm fs.FileMode) error`
-  - `(*Root).WriteFileChecked(rel string, data []byte, perm fs.FileMode, check func(current []byte, exists bool) error) error` (compare-before-rename, used by publish)
+  - `(*Root).ReplaceIfUnchanged(rel string, data []byte, perm fs.FileMode, want func(current []byte) bool) error` (move-aside replace that never overwrites a human edit, used by publish; `ErrChanged`)
+  - `(*Root).RestoreBackups(rel string, done func(target string, current []byte) bool) ([]string, error)`; `confine.BackupTarget(entry string) (string, bool)`; `BackupPrefix = ".wikory-backup-"`
   - `(*Root).CreateExclusive(rel string, data []byte, perm fs.FileMode) error` (no-clobber; `ErrExist` when present)
   - `(*Root).AppendFile`, `(*Root).MkdirAll`, `(*Root).ReadDir` (`"."` is the root), `(*Root).Remove`
-  - `confine.Split(rel string) ([]string, error)`; errors `ErrEscape`, `ErrSymlink`, `ErrNotRegular`, `ErrNotDir`, `ErrTooLarge`, `ErrExist`; `TempPrefix = ".wikory-tmp-"`
-  - test hooks (package variables, nil in production): `testHookBeforeRootOpen`, `testHookAfterComponentCheck`, `testHookBeforeFinalOpen`, `testHookBeforeRename`
+  - `confine.Split(rel string) ([]string, error)`; errors `ErrEscape`, `ErrSymlink`, `ErrNotRegular`, `ErrNotDir`, `ErrTooLarge`, `ErrExist`, `ErrChanged`; `TempPrefix = ".wikory-tmp-"`
+  - test hooks (package variables, nil in production): `testHookBeforeRootOpen`, `testHookBeforeComponentOpen`, `testHookBeforeFinalOpen`, `testHookBeforeMoveAside`, `testHookAfterMoveAside`, `testHookAfterCompare`; `confine.SetStepHook` (A13) for crash tests
 
-**Design (adjudicated Q12: `os.Root` on both unix and Windows, no pre-check then re-resolve).** Every access goes through Go's `os.Root` (floor go 1.25, verified in S2), on every platform:
-- **Root acquisition.** `Open` checks the root with `Lstat` (a symlinked or non-directory final component is refused), opens it once with `os.OpenRoot`, and proves with `os.SameFile` that the directory opened is the one checked. The resolved path is kept for display and relative-path arithmetic only and is never used to open anything. Threat model, stated in the code: root paths come from Wikory itself (git top level, private store, approved transcript root); ancestors may be symlinks (`/var` on macOS); **replacement of a root by an attacker who can already write its parent directory is out of scope; a symlinked final component is not**. `TestRootHandleSurvivesReplacementAfterOpen` proves the guarantee claimed: once open, access stays with the directory that was opened.
-- **Below the root.** Each directory component is checked with `Lstat` (symlink or reparse point refused), opened relative to its parent's handle with `OpenRoot`, then verified with `os.SameFile` against what was checked. The final name is handled the same way with `OpenFile` and a post-open `fstat`. So no access is ever made through a symlink at any depth: a symlink present at the check is refused; one swapped in between the check and the open is detected by the identity check and refused before a byte is returned; an absolute or outward symlink is refused by `os.Root` itself. Nothing is re-resolved from a path string, and the held handles mean a component swapped after it was opened cannot redirect the next step.
-- **Writes.** A temp file is created `O_EXCL` beside the target through the same directory handle, written, chmodded to the exact mode, fsynced, and renamed relative to that handle; `WriteFileChecked` re-reads the target through the same handle immediately before the rename and lets the caller refuse (the residual window is an external writer acting between that last re-read and the rename itself). `CreateExclusive` links a complete temp file into place, so it never replaces an existing file.
-- **Platform files.** Unix: `O_NONBLOCK` on the final open (a FIFO swapped in cannot block; the `fstat` then refuses it) and a directory fsync after renames. Windows: reserved device names, alternate data streams and trailing dots or spaces are refused by name; directory fsync is not possible and NTFS journals the rename. Windows residuals are not waived: `os.SameFile` on an `Lstat` result and the junction behaviour of `os.Root` are verified in S2 (V03) and every portable test here runs in the Windows CI job (A28).
+**Design (round 3 revision of Q12; rule 7 stays frozen).** Identity checks alone do not meet rule 7: rename a directory `a` to `a-moved` and replace `a` with the relative symlink `a -> a-moved`, and an `Lstat`, `OpenRoot`, `SameFile` sequence passes, because the symlink leads to the very object that was checked. So the refusal must come from the kernel at the open itself.
+- **Root acquisition.** `Open` resolves the root's parent once with `filepath.EvalSymlinks`, a documented trusted step (macOS `/tmp` is a symlink to `/private/tmp`; root paths come from Wikory itself), then opens the final component with `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` and compares it with an `Lstat` taken before the open (a supplement that also refuses a root replaced by another plain directory). A root whose final component is, or is swapped to, a symlink is refused. Replacement of an ancestor by an attacker who can already write it is out of scope.
+- **Below the root (unix).** Every directory component is opened with `openat(parent, name, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)` relative to the held descriptor of its parent (`golang.org/x/sys/unix`), and the final name with `openat` and `O_NOFOLLOW|O_NONBLOCK`, followed by an `fstat` that refuses anything but a regular file. A symlink at any depth, including one swapped in at any moment, is refused by the kernel: Linux returns `ELOOP`; macOS returns `ENOTDIR` for `O_NOFOLLOW|O_DIRECTORY` on a symlink (S2), so both errnos are classified with `fstatat(AT_SYMLINK_NOFOLLOW)` and mapped to `ErrSymlink`. Each walk opens a fresh description of the root (`openat(fd, ".")`), so directory offsets are never shared. Nothing is ever re-resolved from a path string.
+- **Below the root (Windows).** `os.Root` stays: each component is opened relative to the root handle, and the name's reparse attribute is inspected with `Lstat` before and after the open, refusing symlinks and junctions (`os.Root` refuses absolute links, so every junction, on its own). The residual is stated in `root_windows.go` and in A4: a swap to a relative in-root symlink and back between the two checks is not detected (it needs Developer Mode or `SeCreateSymbolicLinkPrivilege`). Windows confinement is `pending-ci` and beta until a no-follow `NtCreateFile` open with `FILE_OPEN_REPARSE_POINT` relative to the parent handle lands in 1d.
+- **Writes.** A temp file is created `O_EXCL` beside the target through the same directory handle, written, chmodded to the exact mode, fsynced, and then renamed (`WriteFileAtomic`, for files only Wikory writes) or linked (`CreateExclusive`, no-clobber). `ReplaceIfUnchanged`, for pages a human may edit, never overwrites a human edit: the live target is renamed to a private backup name, the backup is judged, a refused backup goes back with a no-clobber link, and the staged file is installed with a no-clobber link; if the name exists again, a human saved it after the move, and both files are kept (`ErrChanged`). The stated residual is an editor writing through a descriptor it already held open on the original after the compare: that write lands on the moved inode, which is then unlinked. `RestoreBackups` puts back a backup whose target is missing (a kill after the move-aside).
+- **Platform files.** Unix: the descriptor-based directory handle and directory fsync after renames and links. Windows: reserved device names, alternate data streams and trailing dots or spaces are refused by name; directory fsync is not possible and NTFS journals the rename. Every portable test here runs in the Windows CI job (A28).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2872,24 +2987,111 @@ func TestWriteAtomicRefusesSymlinkTarget(t *testing.T) {
 	}
 }
 
-func TestWriteFileCheckedAbortsWhenTargetChanged(t *testing.T) {
-	r, rootDir, _ := tree(t)
-	testHookBeforeRename = func() {
-		testHookBeforeRename = nil
-		write(t, filepath.Join(rootDir, "a", "f.txt"), "HUMAN EDIT")
+// entries lists a directory's names.
+func entries(t *testing.T, dir string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Cleanup(func() { testHookBeforeRename = nil })
-	errChanged := errors.New("target changed")
-	err := r.WriteFileChecked("a/f.txt", []byte("NEW"), 0o644, func(cur []byte, exists bool) error {
-		if !exists || string(cur) != "INSIDE" {
-			return errChanged
+	var names []string
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+func leftovers(t *testing.T, dir string) []string {
+	var out []string
+	for _, n := range entries(t, dir) {
+		if strings.HasPrefix(n, BackupPrefix) || strings.HasPrefix(n, TempPrefix) {
+			out = append(out, n)
 		}
-		return nil
-	})
+	}
+	return out
+}
+
+func unchanged(cur []byte) bool { return string(cur) == "INSIDE" }
+
+func TestReplaceInstallsWhenUnchanged(t *testing.T) {
+	r, rootDir, _ := tree(t)
+	if err := r.ReplaceIfUnchanged("a/f.txt", []byte("NEW"), 0o644, unchanged); err != nil {
+		t.Fatal(err)
+	}
 	b, _ := os.ReadFile(filepath.Join(rootDir, "a", "f.txt"))
-	ents, _ := os.ReadDir(filepath.Join(rootDir, "a"))
-	if !errors.Is(err, errChanged) || string(b) != "HUMAN EDIT" || len(ents) != 2 {
-		t.Fatalf("err=%v content=%q entries=%d", err, b, len(ents))
+	if string(b) != "NEW" || len(leftovers(t, filepath.Join(rootDir, "a"))) != 0 {
+		t.Fatalf("content=%q leftovers=%v", b, leftovers(t, filepath.Join(rootDir, "a")))
+	}
+}
+
+// A human edit before the move-aside is judged and refused; the edit stays, nothing is left.
+func TestReplaceRefusesEditBeforeMoveAside(t *testing.T) {
+	r, rootDir, _ := tree(t)
+	testHookBeforeMoveAside = func() { write(t, filepath.Join(rootDir, "a", "f.txt"), "HUMAN EDIT") }
+	t.Cleanup(func() { testHookBeforeMoveAside = nil })
+	err := r.ReplaceIfUnchanged("a/f.txt", []byte("NEW"), 0o644, unchanged)
+	b, _ := os.ReadFile(filepath.Join(rootDir, "a", "f.txt"))
+	if !errors.Is(err, ErrChanged) || string(b) != "HUMAN EDIT" || len(leftovers(t, filepath.Join(rootDir, "a"))) != 0 {
+		t.Fatalf("err=%v content=%q leftovers=%v", err, b, leftovers(t, filepath.Join(rootDir, "a")))
+	}
+}
+
+// humanEditAt writes the target by path, as an editor saving the file would, at a hook.
+func humanEditAt(t *testing.T, hook *func(), rootDir string) {
+	*hook = func() { write(t, filepath.Join(rootDir, "a", "f.txt"), "HUMAN EDIT") }
+	t.Cleanup(func() { *hook = nil })
+}
+
+// keptBoth: the human file is at the target and the original survives as a backup.
+func keptBoth(t *testing.T, err error, rootDir string) {
+	t.Helper()
+	b, _ := os.ReadFile(filepath.Join(rootDir, "a", "f.txt"))
+	var backup string
+	for _, n := range entries(t, filepath.Join(rootDir, "a")) {
+		if strings.HasPrefix(n, BackupPrefix) {
+			c, _ := os.ReadFile(filepath.Join(rootDir, "a", n))
+			backup = string(c)
+		}
+		if strings.HasPrefix(n, TempPrefix) {
+			t.Fatalf("temp file left behind: %s", n)
+		}
+	}
+	if !errors.Is(err, ErrChanged) || string(b) != "HUMAN EDIT" || backup != "INSIDE" {
+		t.Fatalf("human edit not kept: err=%v content=%q backup=%q", err, b, backup)
+	}
+}
+
+func TestReplaceKeepsEditMadeAfterMoveAside(t *testing.T) {
+	r, rootDir, _ := tree(t)
+	humanEditAt(t, &testHookAfterMoveAside, rootDir)
+	keptBoth(t, r.ReplaceIfUnchanged("a/f.txt", []byte("NEW"), 0o644, unchanged), rootDir)
+}
+
+func TestReplaceKeepsEditMadeAfterCompare(t *testing.T) {
+	r, rootDir, _ := tree(t)
+	humanEditAt(t, &testHookAfterCompare, rootDir)
+	keptBoth(t, r.ReplaceIfUnchanged("a/f.txt", []byte("NEW"), 0o644, unchanged), rootDir)
+}
+
+func TestReplaceOfMissingTargetIsChanged(t *testing.T) {
+	r, rootDir, _ := tree(t)
+	err := r.ReplaceIfUnchanged("a/none.txt", []byte("NEW"), 0o644, unchanged)
+	if _, serr := os.Stat(filepath.Join(rootDir, "a", "none.txt")); !errors.Is(err, ErrChanged) || serr == nil {
+		t.Fatalf("err=%v stat=%v", err, serr)
+	}
+}
+
+// A crash after the move-aside leaves the target missing; recovery puts the backup back.
+func TestRestoreBackupsPutsBackAMissingTarget(t *testing.T) {
+	r, rootDir, _ := tree(t)
+	bak := backupName("f.txt")
+	if err := os.Rename(filepath.Join(rootDir, "a", "f.txt"), filepath.Join(rootDir, "a", bak)); err != nil {
+		t.Fatal(err)
+	}
+	kept, err := r.RestoreBackups("a", func(string, []byte) bool { return false })
+	b, _ := os.ReadFile(filepath.Join(rootDir, "a", "f.txt"))
+	if err != nil || len(kept) != 0 || string(b) != "INSIDE" || len(leftovers(t, filepath.Join(rootDir, "a"))) != 0 {
+		t.Fatalf("err=%v kept=%v content=%q", err, kept, b)
 	}
 }
 
@@ -2984,26 +3186,25 @@ func TestRefusesFIFOWithoutBlocking(t *testing.T) {
 	}
 }
 
-// A component replaced by an in-root relative symlink between its check and its open is
-// followed by os.Root; the SameFile verification must then refuse it.
+// A component replaced by an in-root relative symlink just before its open is refused.
 func TestComponentSwapBetweenCheckAndOpenIsRefused(t *testing.T) {
 	r, rootDir, _ := tree(t)
-	testHookAfterComponentCheck = func(name string) {
+	testHookBeforeComponentOpen = func(name string) {
 		if name != "a" {
 			return
 		}
-		testHookAfterComponentCheck = nil
+		testHookBeforeComponentOpen = nil
 		renameForSwap(t, filepath.Join(rootDir, "a"), filepath.Join(rootDir, "a-moved"))
 		makeDirLink(t, "b", filepath.Join(rootDir, "a")) // relative, inside the root
 	}
-	t.Cleanup(func() { testHookAfterComponentCheck = nil })
+	t.Cleanup(func() { testHookBeforeComponentOpen = nil })
 	b, err := r.ReadFile("a/f.txt", 1<<20)
 	if !errors.Is(err, ErrSymlink) || strings.Contains(string(b), "DECOY") {
 		t.Fatalf("a component swapped to a symlink was followed: %q %v", b, err)
 	}
 }
 
-// The final name replaced by an in-root relative symlink between its check and its open.
+// The final name replaced by an in-root relative symlink just before its open is refused.
 func TestFileSwapBetweenCheckAndOpenIsRefused(t *testing.T) {
 	r, rootDir, _ := tree(t)
 	testHookBeforeFinalOpen = func() {
@@ -3041,6 +3242,54 @@ func TestWriteModeIsExactWhateverTheUmask(t *testing.T) {
 		t.Fatalf("mode=%v err=%v", fi.Mode().Perm(), err)
 	}
 }
+
+// Same-object substitutions: the original is renamed away and the name replaced by a
+// relative symlink to the moved original. An identity check passes (it is the same
+// object), so only a kernel no-follow open refuses them (spec 5.5 rule 7).
+func TestFileSubstitutedBySymlinkToMovedOriginalIsRefused(t *testing.T) {
+	r, rootDir, _ := tree(t)
+	testHookBeforeFinalOpen = func() {
+		testHookBeforeFinalOpen = nil
+		renameForSwap(t, filepath.Join(rootDir, "a", "f.txt"), filepath.Join(rootDir, "a", "f-moved.txt"))
+		makeFileLink(t, "f-moved.txt", filepath.Join(rootDir, "a", "f.txt"))
+	}
+	t.Cleanup(func() { testHookBeforeFinalOpen = nil })
+	if b, err := r.ReadFile("a/f.txt", 1<<20); !errors.Is(err, ErrSymlink) {
+		t.Fatalf("a symlink to the moved original file was followed: %q %v", b, err)
+	}
+}
+
+func TestDirectorySubstitutedBySymlinkToMovedOriginalIsRefused(t *testing.T) {
+	r, rootDir, _ := tree(t)
+	testHookBeforeComponentOpen = func(name string) {
+		if name != "a" {
+			return
+		}
+		testHookBeforeComponentOpen = nil
+		renameForSwap(t, filepath.Join(rootDir, "a"), filepath.Join(rootDir, "a-moved"))
+		makeDirLink(t, "a-moved", filepath.Join(rootDir, "a"))
+	}
+	t.Cleanup(func() { testHookBeforeComponentOpen = nil })
+	if b, err := r.ReadFile("a/f.txt", 1<<20); !errors.Is(err, ErrSymlink) {
+		t.Fatalf("a symlink to the moved original directory was followed: %q %v", b, err)
+	}
+}
+
+func TestRootSubstitutedBySymlinkToMovedOriginalIsRefused(t *testing.T) {
+	_, rootDir, _ := tree(t)
+	testHookBeforeRootOpen = func() {
+		testHookBeforeRootOpen = nil
+		renameForSwap(t, rootDir, rootDir+"-moved")
+		makeDirLink(t, filepath.Base(rootDir)+"-moved", rootDir)
+	}
+	t.Cleanup(func() { testHookBeforeRootOpen = nil })
+	if r, err := Open(rootDir); !errors.Is(err, ErrSymlink) {
+		if r != nil {
+			r.Close()
+		}
+		t.Fatalf("a root replaced by a symlink to the moved original was opened: %v", err)
+	}
+}
 ```
 
 - [ ] **Step 2: Run them to see them fail**
@@ -3072,17 +3321,24 @@ var (
 	ErrNotDir     = errors.New("confine: not a directory")
 	ErrTooLarge   = errors.New("confine: file exceeds the size limit")
 	ErrExist      = errors.New("confine: file already exists")
+	ErrChanged    = errors.New("confine: target changed, nothing replaced")
 )
 
 // TempPrefix names the temporary files atomic writes create beside their targets.
 const TempPrefix = ".wikory-tmp-"
 
+// BackupPrefix names the private backup a checked replace moves the live target to.
+const BackupPrefix = ".wikory-backup-"
+
 // Test hooks. Nil in production.
 var (
 	testHookBeforeRootOpen      func()
-	testHookAfterComponentCheck func(name string)
+	testHookBeforeComponentOpen func(name string)
 	testHookBeforeFinalOpen     func()
-	testHookBeforeRename        func()
+	testHookBeforeMoveAside     func()
+	testHookAfterMoveAside      func()
+	testHookAfterCompare        func()
+	stepHook                    func(step string) // "moved", "compared", "installed"; crash tests only
 )
 
 // Split validates a root-relative slash path and returns its components. It refuses
@@ -3104,16 +3360,29 @@ func Split(rel string) ([]string, error) {
 	return parts, nil
 }
 
-func tempName(target string) string {
+func randomSuffix() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		panic("confine: " + err.Error())
 	}
-	return TempPrefix + target + "-" + hex.EncodeToString(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+func tempName(target string) string   { return TempPrefix + target + "-" + randomSuffix() }
+func backupName(target string) string { return BackupPrefix + target + "-" + randomSuffix() }
+
+// BackupTarget returns the target name a backup entry belongs to, or false if entry is not
+// a backup made by this package.
+func BackupTarget(entry string) (string, bool) {
+	const suffix = 17 // "-" and 16 hex digits
+	if !strings.HasPrefix(entry, BackupPrefix) || len(entry) <= len(BackupPrefix)+suffix || entry[len(entry)-suffix] != '-' {
+		return "", false
+	}
+	return entry[len(BackupPrefix) : len(entry)-suffix], true
 }
 ```
 
-- [ ] **Step 4: Write the os.Root implementation and the platform files**
+- [ ] **Step 4: Write the shared implementation and the platform directory handles**
 
 `internal/confine/root.go`:
 
@@ -3127,112 +3396,62 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
-// Root is an authorised directory, held open as an os.Root on every platform (floor
-// go 1.25, verified in S2).
+// Root is an authorised directory, held open as a directory handle.
 //
 // Threat model. Root paths come from Wikory itself (the git top level, the private store,
-// an approved transcript root). The final component of a root must not be a symlink and the
-// directory opened must be the one that was checked; ancestors may be symlinks (for example
-// /var on macOS). Replacement of a root by an attacker who can already write its parent
-// directory is out of scope. Below the root, every component is checked with Lstat, opened
-// relative to the handle of its parent, and then verified with os.SameFile against what was
-// checked, so a symlink at any depth is refused and a swap between check and open is
-// detected and refused, never followed. Nothing is re-resolved from a path string.
+// an approved transcript root). Open resolves the root's parent once with EvalSymlinks, a
+// documented trusted step (macOS /tmp is a symlink to /private/tmp), and then opens the
+// final component with no-follow semantics, so a root whose final component is, or is
+// swapped to, a symlink is refused. Below the root nothing is ever resolved from a path
+// string: each component is opened relative to the handle of its parent with no-follow
+// semantics (unix: openat with O_NOFOLLOW, plus O_DIRECTORY for directories), so a symlink
+// at any depth, including one swapped in after any earlier check, is refused by the kernel
+// rather than followed. Identity comparisons supplement this; they never substitute for it.
+// Windows uses os.Root with reparse-point checks before and after each open; its residual
+// race is stated in dir_windows.go.
 type Root struct {
 	dir string // resolved path, for display and relative-path computation only; never opened
-	r   *os.Root
+	h   *dirH
 }
 
-// Open opens dir once and verifies that the directory opened is the plain directory checked.
+// Open opens dir once, refusing a symlinked final component.
 func Open(dir string) (*Root, error) {
 	if !filepath.IsAbs(dir) {
 		return nil, fmt.Errorf("confine: root %q is not absolute", dir)
 	}
-	rootBefore, err := os.Lstat(dir)
+	parent, err := filepath.EvalSymlinks(filepath.Dir(dir)) // the one trusted resolution
 	if err != nil {
 		return nil, err
 	}
-	if rootBefore.Mode()&(fs.ModeSymlink|fs.ModeIrregular) != 0 || !rootBefore.IsDir() {
-		return nil, fmt.Errorf("%w: root %s", ErrSymlink, dir)
-	}
-	if testHookBeforeRootOpen != nil {
-		testHookBeforeRootOpen()
-	}
-	r, err := os.OpenRoot(dir)
+	resolved := filepath.Join(parent, filepath.Base(dir))
+	h, err := openRootDir(resolved)
 	if err != nil {
 		return nil, err
 	}
-	rootAfter, err := r.Stat(".")
-	if err != nil || !os.SameFile(rootBefore, rootAfter) {
-		r.Close()
-		return nil, fmt.Errorf("%w: root %s changed while it was opened", ErrSymlink, dir)
-	}
-	resolved, err := filepath.EvalSymlinks(dir)
-	if err != nil {
-		resolved = filepath.Clean(dir)
-	}
-	return &Root{dir: resolved, r: r}, nil
+	return &Root{dir: resolved, h: h}, nil
 }
 
 // Path is the resolved root directory, for display and relative paths only.
 func (r *Root) Path() string { return r.dir }
 
 // Close releases the root.
-func (r *Root) Close() error { return r.r.Close() }
+func (r *Root) Close() error { return r.h.close() }
 
-// openDir opens one existing directory component of parent: Lstat refuses a symlink or
-// reparse point, OpenRoot opens it relative to parent, SameFile proves it is what was checked.
-func openDir(parent *os.Root, name string) (*os.Root, error) {
-	before, err := parent.Lstat(name)
-	if err != nil {
-		return nil, mapErr(err)
-	}
-	if before.Mode()&(fs.ModeSymlink|fs.ModeIrregular) != 0 {
-		return nil, ErrSymlink
-	}
-	if !before.IsDir() {
-		return nil, ErrNotDir
-	}
-	if testHookAfterComponentCheck != nil {
-		testHookAfterComponentCheck(name)
-	}
-	sub, err := parent.OpenRoot(name)
-	if err != nil {
-		return nil, mapErr(err)
-	}
-	after, err := sub.Stat(".")
-	if err != nil || !os.SameFile(before, after) {
-		sub.Close()
-		return nil, ErrSymlink
-	}
-	return sub, nil
-}
-
-func mapErr(err error) error {
-	switch {
-	case err == nil:
-		return nil
-	case errors.Is(err, fs.ErrNotExist):
-		return fs.ErrNotExist
-	case strings.Contains(err.Error(), "path escapes"):
-		return ErrEscape
-	}
-	return err
-}
-
-// walk opens each directory component in turn and returns a handle on the last one; with
-// no components it returns a new handle on the root. The caller closes it.
-func (r *Root) walk(dirs []string) (*os.Root, error) {
-	cur, err := r.r.OpenRoot(".")
+// walk opens each directory component in turn, no-follow, and returns a new handle on the
+// last one; with no components it returns a new handle on the root. The caller closes it.
+func (r *Root) walk(dirs []string) (*dirH, error) {
+	cur, err := r.h.reopen()
 	if err != nil {
 		return nil, err
 	}
 	for _, c := range dirs {
-		next, err := openDir(cur, c)
-		cur.Close()
+		if testHookBeforeComponentOpen != nil {
+			testHookBeforeComponentOpen(c)
+		}
+		next, err := cur.openDir(c)
+		cur.close()
 		if err != nil {
 			return nil, err
 		}
@@ -3241,7 +3460,7 @@ func (r *Root) walk(dirs []string) (*os.Root, error) {
 	return cur, nil
 }
 
-func (r *Root) parent(rel string) (*os.Root, string, error) {
+func (r *Root) parent(rel string) (*dirH, string, error) {
 	parts, err := Split(rel)
 	if err != nil {
 		return nil, "", err
@@ -3253,44 +3472,16 @@ func (r *Root) parent(rel string) (*os.Root, string, error) {
 	return dir, parts[len(parts)-1], nil
 }
 
-// openIn opens name in dir and verifies after the open that it is a regular file and the
-// same file that was checked. A missing file is allowed only with O_CREATE.
-func openIn(dir *os.Root, name string, flags int, perm fs.FileMode) (*os.File, error) {
-	before, err := dir.Lstat(name)
-	exists := err == nil
-	switch {
-	case err != nil && !(errors.Is(err, fs.ErrNotExist) && flags&os.O_CREATE != 0):
-		return nil, mapErr(err)
-	case exists && before.Mode()&(fs.ModeSymlink|fs.ModeIrregular) != 0:
-		return nil, ErrSymlink
-	}
-	if testHookBeforeFinalOpen != nil {
-		testHookBeforeFinalOpen()
-	}
-	f, err := dir.OpenFile(name, flags|extraOpenFlags, perm)
-	if err != nil {
-		return nil, mapErr(err)
-	}
-	after, err := f.Stat()
-	if err != nil || !after.Mode().IsRegular() {
-		f.Close()
-		return nil, ErrNotRegular
-	}
-	now, err := dir.Lstat(name)
-	if err != nil || now.Mode()&fs.ModeSymlink != 0 || !os.SameFile(now, after) || (exists && !os.SameFile(before, after)) {
-		f.Close()
-		return nil, ErrSymlink // the name was swapped between the check and the open
-	}
-	return f, nil
-}
-
 func (r *Root) openFile(rel string, flags int, perm fs.FileMode) (*os.File, error) {
 	dir, name, err := r.parent(rel)
 	if err != nil {
 		return nil, err
 	}
-	defer dir.Close()
-	return openIn(dir, name, flags, perm)
+	defer dir.close()
+	if testHookBeforeFinalOpen != nil {
+		testHookBeforeFinalOpen()
+	}
+	return dir.openFile(name, flags, perm)
 }
 
 // OpenRead opens a regular file for reading.
@@ -3303,6 +3494,10 @@ func (r *Root) ReadFile(rel string, max int64) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
+	return readLimited(f, max)
+}
+
+func readLimited(f *os.File, max int64) ([]byte, error) {
 	data, err := io.ReadAll(io.LimitReader(f, max+1))
 	if err != nil {
 		return nil, err
@@ -3314,9 +3509,9 @@ func (r *Root) ReadFile(rel string, max int64) ([]byte, error) {
 }
 
 // writeTemp creates, fills, chmods and fsyncs a temp file beside name.
-func writeTemp(dir *os.Root, name string, data []byte, perm fs.FileMode) (string, error) {
+func writeTemp(dir *dirH, name string, data []byte, perm fs.FileMode) (string, error) {
 	tmp := tempName(name)
-	f, err := dir.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm.Perm())
+	f, err := dir.openFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm.Perm())
 	if err != nil {
 		return "", err
 	}
@@ -3331,71 +3526,146 @@ func writeTemp(dir *os.Root, name string, data []byte, perm fs.FileMode) (string
 		werr = cerr
 	}
 	if werr != nil {
-		dir.Remove(tmp)
+		dir.remove(tmp)
 		return "", werr
 	}
 	return tmp, nil
 }
 
-// currentRegular re-reads name in dir for a pre-rename check; absent is (nil, false, nil).
-func currentRegular(dir *os.Root, name string) ([]byte, bool, error) {
-	fi, err := dir.Lstat(name)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	if fi.Mode()&(fs.ModeSymlink|fs.ModeIrregular) != 0 {
-		return nil, true, ErrSymlink
-	}
-	if !fi.Mode().IsRegular() {
-		return nil, true, ErrNotRegular
-	}
-	f, err := openIn(dir, name, os.O_RDONLY, 0)
-	if err != nil {
-		return nil, true, err
-	}
-	defer f.Close()
-	data, err := io.ReadAll(f)
-	return data, true, err
-}
-
-// WriteFileAtomic replaces rel with data: temp file, fsync, rename, directory fsync.
+// WriteFileAtomic replaces rel with data: temp file, fsync, rename, directory fsync. It is
+// for files only Wikory writes (the private store); a file a human may edit goes through
+// ReplaceIfUnchanged.
 func (r *Root) WriteFileAtomic(rel string, data []byte, perm fs.FileMode) error {
-	return r.WriteFileChecked(rel, data, perm, nil)
-}
-
-// WriteFileChecked is WriteFileAtomic with a compare-before-rename: once the temp file is
-// complete, the target is re-read through the same directory handle and check decides
-// whether the rename may proceed; an error aborts and removes the temp file. The residual
-// window is an external writer acting between this last re-read and the rename itself.
-func (r *Root) WriteFileChecked(rel string, data []byte, perm fs.FileMode, check func(current []byte, exists bool) error) error {
 	dir, name, err := r.parent(rel)
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
+	defer dir.close()
+	if cur, err := dir.openFile(name, os.O_RDONLY, 0); err == nil {
+		cur.Close()
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err // a symlink or a non-regular file at the target is refused, never replaced
+	}
 	tmp, err := writeTemp(dir, name, data, perm)
 	if err != nil {
 		return err
 	}
-	if testHookBeforeRename != nil {
-		testHookBeforeRename()
+	if err := dir.rename(tmp, name); err != nil {
+		dir.remove(tmp)
+		return err
 	}
-	cur, exists, err := currentRegular(dir, name)
-	if err == nil && check != nil {
-		err = check(cur, exists)
-	}
+	return dir.sync()
+}
+
+// ReplaceIfUnchanged replaces rel with data only if its current content satisfies want,
+// without ever overwriting a human edit (spec 4.4). Under the caller's publish lock:
+//
+//  1. the staged content is written to a complete temp file;
+//  2. the live target is renamed to a private backup name, so no later write by a path
+//     reaches the content being judged;
+//  3. the backup is read (no-follow, regular only) and judged; if want refuses it, the
+//     backup is put back with a no-clobber hard link and ErrChanged is returned;
+//  4. the staged file is installed with a no-clobber hard link; if the name exists again,
+//     a human created it after step 2: the human file is kept, the backup is kept beside it,
+//     and ErrChanged is returned;
+//  5. the temp and backup names are removed and the directory is fsynced.
+//
+// Residual: an editor that already holds the original file open and writes through that
+// descriptor after step 3 writes to the moved inode, which is then unlinked; that edit is
+// lost. Recovery restores a backup whose target is missing (RestoreBackups).
+func (r *Root) ReplaceIfUnchanged(rel string, data []byte, perm fs.FileMode, want func(current []byte) bool) error {
+	dir, name, err := r.parent(rel)
 	if err != nil {
-		dir.Remove(tmp)
 		return err
 	}
-	if err := dir.Rename(tmp, name); err != nil {
-		dir.Remove(tmp)
+	defer dir.close()
+	tmp, err := writeTemp(dir, name, data, perm)
+	if err != nil {
 		return err
 	}
-	return syncDir(dir)
+	defer dir.remove(tmp)
+	if testHookBeforeMoveAside != nil {
+		testHookBeforeMoveAside()
+	}
+	bak := backupName(name)
+	if err := dir.rename(name, bak); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%w: %s is missing", ErrChanged, rel)
+		}
+		return err
+	}
+	step("moved")
+	if testHookAfterMoveAside != nil {
+		testHookAfterMoveAside()
+	}
+	cur, rerr := dir.openFile(bak, os.O_RDONLY, 0)
+	var current []byte
+	if rerr == nil {
+		current, rerr = readLimited(cur, 1<<26)
+		cur.Close()
+	}
+	if rerr != nil || !want(current) {
+		if lerr := dir.link(bak, name); lerr == nil {
+			dir.remove(bak)
+		}
+		dir.sync()
+		return fmt.Errorf("%w: %s", ErrChanged, rel)
+	}
+	step("compared")
+	if testHookAfterCompare != nil {
+		testHookAfterCompare()
+	}
+	if err := dir.link(tmp, name); err != nil {
+		dir.sync()
+		if errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("%w: %s was recreated during the replace; backup kept as %s", ErrChanged, rel, bak)
+		}
+		return err
+	}
+	step("installed")
+	dir.remove(bak)
+	return dir.sync()
+}
+
+// RestoreBackups puts back every backup in the directory of rel whose target name is
+// missing, and removes backups whose target content satisfies done. It returns the names
+// of backups it left in place. Recovery calls it under the publish lock.
+func (r *Root) RestoreBackups(rel string, done func(target string, current []byte) bool) ([]string, error) {
+	parts, err := Split(rel)
+	if err != nil {
+		return nil, err
+	}
+	dir, err := r.walk(parts)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.close()
+	ents, err := dir.readDir()
+	if err != nil {
+		return nil, err
+	}
+	var kept []string
+	for _, e := range ents {
+		target, ok := BackupTarget(e.Name())
+		if !ok {
+			continue
+		}
+		if lerr := dir.link(e.Name(), target); lerr == nil {
+			dir.remove(e.Name())
+			continue
+		}
+		f, err := dir.openFile(target, os.O_RDONLY, 0)
+		if err == nil {
+			cur, rerr := readLimited(f, 1<<26)
+			f.Close()
+			if rerr == nil && done(target, cur) {
+				dir.remove(e.Name())
+				continue
+			}
+		}
+		kept = append(kept, e.Name())
+	}
+	return kept, dir.sync()
 }
 
 // CreateExclusive writes rel only if it does not exist, via a hard link from a complete
@@ -3405,20 +3675,20 @@ func (r *Root) CreateExclusive(rel string, data []byte, perm fs.FileMode) error 
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
+	defer dir.close()
 	tmp, err := writeTemp(dir, name, data, perm)
 	if err != nil {
 		return err
 	}
-	lerr := dir.Link(tmp, name)
-	dir.Remove(tmp)
+	lerr := dir.link(tmp, name)
+	dir.remove(tmp)
 	if lerr != nil {
 		if errors.Is(lerr, fs.ErrExist) {
 			return ErrExist
 		}
-		return mapErr(lerr)
+		return lerr
 	}
-	return syncDir(dir)
+	return dir.sync()
 }
 
 // AppendFile appends data to a regular file, creating it if needed, and fsyncs it.
@@ -3443,28 +3713,23 @@ func (r *Root) MkdirAll(rel string, perm fs.FileMode) error {
 	if err != nil {
 		return err
 	}
-	cur, err := r.r.OpenRoot(".")
+	cur, err := r.h.reopen()
 	if err != nil {
 		return err
 	}
 	for _, c := range parts {
-		if err := cur.Mkdir(c, perm.Perm()); err == nil {
-			if err := cur.Chmod(c, perm.Perm()); err != nil {
-				cur.Close()
-				return err
-			}
-		} else if !errors.Is(err, fs.ErrExist) {
-			cur.Close()
-			return mapErr(err)
+		if err := cur.mkdir(c, perm.Perm()); err != nil && !errors.Is(err, fs.ErrExist) {
+			cur.close()
+			return err
 		}
-		next, err := openDir(cur, c)
-		cur.Close()
+		next, err := cur.openDir(c)
+		cur.close()
 		if err != nil {
 			return err
 		}
 		cur = next
 	}
-	return cur.Close()
+	return cur.close()
 }
 
 // ReadDir lists a directory under the root. "." is the root itself.
@@ -3481,13 +3746,8 @@ func (r *Root) ReadDir(rel string) ([]fs.DirEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer dir.Close()
-	f, err := dir.Open(".")
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return f.ReadDir(-1)
+	defer dir.close()
+	return dir.readDir()
 }
 
 // Remove unlinks a file (a symlink itself is removed, never followed).
@@ -3496,8 +3756,8 @@ func (r *Root) Remove(rel string) error {
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
-	return mapErr(dir.Remove(name))
+	defer dir.close()
+	return dir.remove(name)
 }
 ```
 
@@ -3509,25 +3769,171 @@ func (r *Root) Remove(rel string) error {
 package confine
 
 import (
+	"errors"
+	"io/fs"
 	"os"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
-// extraOpenFlags: O_NONBLOCK, so a FIFO swapped in after the check cannot block the open;
-// the post-open fstat then refuses it as non-regular.
-const extraOpenFlags = syscall.O_NONBLOCK
+// dirOpenFlags opens a directory component: O_NOFOLLOW makes the kernel refuse a symlink
+// at that name (ELOOP on Linux, ENOTDIR on macOS when combined with O_DIRECTORY).
+const dirOpenFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+
+// rootOpenFlags opens the root's final component, no-follow.
+const rootOpenFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+
+// fileOpenFlags: O_NOFOLLOW refuses a symlinked final name; O_NONBLOCK keeps a FIFO from
+// blocking the open, and the post-open fstat then refuses it as non-regular.
+const fileOpenFlags = unix.O_NOFOLLOW | unix.O_NONBLOCK | unix.O_CLOEXEC
 
 func checkPlatformName(string) error { return nil }
 
-// syncDir makes a rename durable.
-func syncDir(dir *os.Root) error {
-	d, err := dir.Open(".")
+// dirH is an open directory file descriptor.
+type dirH struct{ fd int }
+
+func openat(dirfd int, name string, flags int, perm uint32) (int, error) {
+	for {
+		fd, err := unix.Openat(dirfd, name, flags, perm)
+		if err != unix.EINTR {
+			return fd, err
+		}
+	}
+}
+
+func isLink(dirfd int, name string) (link, dir, ok bool) {
+	var st unix.Stat_t
+	if unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW) != nil {
+		return false, false, false
+	}
+	return st.Mode&unix.S_IFMT == unix.S_IFLNK, st.Mode&unix.S_IFMT == unix.S_IFDIR, true
+}
+
+// refusal maps an open error: ELOOP or ENOTDIR at a name that is a symlink is ErrSymlink
+// (both errnos occur, by platform); ENOTDIR at a plain non-directory is ErrNotDir.
+func refusal(dirfd int, name, op string, err error) error {
+	if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.EMLINK) {
+		link, _, ok := isLink(dirfd, name)
+		switch {
+		case ok && link, errors.Is(err, unix.ELOOP):
+			return ErrSymlink
+		case errors.Is(err, unix.ENOTDIR):
+			return ErrNotDir
+		}
+	}
+	return &fs.PathError{Op: op, Path: name, Err: err}
+}
+
+// openRootDir opens path's final component no-follow. The Lstat identity check is a
+// supplement: it also refuses a root replaced by another plain directory mid-open.
+func openRootDir(path string) (*dirH, error) {
+	var before unix.Stat_t
+	if err := unix.Lstat(path, &before); err != nil {
+		return nil, &fs.PathError{Op: "lstat", Path: path, Err: err}
+	}
+	if before.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return nil, ErrSymlink
+	}
+	if testHookBeforeRootOpen != nil {
+		testHookBeforeRootOpen()
+	}
+	fd, err := openat(unix.AT_FDCWD, path, rootOpenFlags, 0)
+	if err != nil {
+		return nil, refusal(unix.AT_FDCWD, path, "open", err)
+	}
+	var after unix.Stat_t
+	if err := unix.Fstat(fd, &after); err != nil || after.Dev != before.Dev || after.Ino != before.Ino {
+		unix.Close(fd)
+		return nil, ErrSymlink
+	}
+	return &dirH{fd: fd}, nil
+}
+
+// reopen opens a new, independent description of the same directory (its own offset).
+func (d *dirH) reopen() (*dirH, error) {
+	fd, err := openat(d.fd, ".", dirOpenFlags, 0)
+	if err != nil {
+		return nil, err
+	}
+	return &dirH{fd: fd}, nil
+}
+
+func (d *dirH) openDir(name string) (*dirH, error) {
+	fd, err := openat(d.fd, name, dirOpenFlags, 0)
+	if err != nil {
+		return nil, refusal(d.fd, name, "openat", err)
+	}
+	return &dirH{fd: fd}, nil
+}
+
+func (d *dirH) openFile(name string, flags int, perm fs.FileMode) (*os.File, error) {
+	fd, err := openat(d.fd, name, flags|fileOpenFlags, uint32(perm.Perm()))
+	if err != nil {
+		return nil, refusal(d.fd, name, "openat", err)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFREG {
+		unix.Close(fd)
+		return nil, ErrNotRegular
+	}
+	if err := unix.SetNonblock(fd, false); err != nil {
+		unix.Close(fd)
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), name), nil
+}
+
+func (d *dirH) mkdir(name string, perm fs.FileMode) error {
+	if err := unix.Mkdirat(d.fd, name, uint32(perm)); err != nil {
+		return &fs.PathError{Op: "mkdirat", Path: name, Err: err}
+	}
+	sub, err := d.openDir(name)
 	if err != nil {
 		return err
 	}
-	defer d.Close()
-	return d.Sync()
+	defer sub.close()
+	return unix.Fchmod(sub.fd, uint32(perm)) // exact mode whatever the umask
 }
+
+func (d *dirH) link(oldname, newname string) error {
+	if err := unix.Linkat(d.fd, oldname, d.fd, newname, 0); err != nil {
+		return &os.LinkError{Op: "linkat", Old: oldname, New: newname, Err: err}
+	}
+	return nil
+}
+
+func (d *dirH) rename(oldname, newname string) error {
+	if err := unix.Renameat(d.fd, oldname, d.fd, newname); err != nil {
+		return &os.LinkError{Op: "renameat", Old: oldname, New: newname, Err: err}
+	}
+	return nil
+}
+
+func (d *dirH) remove(name string) error {
+	err := unix.Unlinkat(d.fd, name, 0)
+	if errors.Is(err, unix.EISDIR) || errors.Is(err, unix.EPERM) {
+		err = unix.Unlinkat(d.fd, name, unix.AT_REMOVEDIR)
+	}
+	if err != nil {
+		return &fs.PathError{Op: "unlinkat", Path: name, Err: err}
+	}
+	return nil
+}
+
+func (d *dirH) readDir() ([]fs.DirEntry, error) {
+	n, err := d.reopen()
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(n.fd), ".")
+	defer f.Close()
+	return f.ReadDir(-1)
+}
+
+// sync makes renames and links in the directory durable.
+func (d *dirH) sync() error { return unix.Fsync(d.fd) }
+
+func (d *dirH) close() error { return unix.Close(d.fd) }
 ```
 
 `internal/confine/root_windows.go`:
@@ -3538,11 +3944,11 @@ func syncDir(dir *os.Root) error {
 package confine
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"strings"
 )
-
-const extraOpenFlags = 0
 
 var reserved = map[string]bool{"CON": true, "PRN": true, "AUX": true, "NUL": true,
 	"COM1": true, "COM2": true, "COM3": true, "COM4": true, "COM5": true, "COM6": true, "COM7": true, "COM8": true, "COM9": true,
@@ -3558,8 +3964,140 @@ func checkPlatformName(c string) error {
 	return nil
 }
 
-// syncDir: Windows cannot flush a directory handle; NTFS journals the rename itself.
-func syncDir(*os.Root) error { return nil }
+// dirH on Windows is an os.Root: each component is opened relative to its parent's handle,
+// and the reparse attribute of the name is inspected before and after the open, refusing
+// symlinks and junctions. os.Root refuses absolute links (every junction is absolute) on
+// its own.
+//
+// Residual (pending-ci, beta): os.Root follows a relative in-root symlink, so a swap from a
+// plain directory to such a symlink and back again between the before and after checks is
+// not detected; creating that symlink needs a privilege (Developer Mode or
+// SeCreateSymbolicLinkPrivilege). A true no-follow open needs NtCreateFile with
+// FILE_OPEN_REPARSE_POINT relative to the parent handle; that is deferred to 1d.
+type dirH struct{ r *os.Root }
+
+func plain(fi fs.FileInfo) bool { return fi.Mode()&(fs.ModeSymlink|fs.ModeIrregular) == 0 }
+
+func mapErr(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, fs.ErrExist):
+		return err
+	case strings.Contains(err.Error(), "path escapes"):
+		return ErrSymlink
+	}
+	return err
+}
+
+func openRootDir(path string) (*dirH, error) {
+	before, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !plain(before) || !before.IsDir() {
+		return nil, ErrSymlink
+	}
+	if testHookBeforeRootOpen != nil {
+		testHookBeforeRootOpen()
+	}
+	r, err := os.OpenRoot(path)
+	if err != nil {
+		return nil, err
+	}
+	after, err := r.Stat(".")
+	now, lerr := os.Lstat(path)
+	if err != nil || lerr != nil || !plain(now) || !os.SameFile(before, after) || !os.SameFile(now, after) {
+		r.Close()
+		return nil, ErrSymlink
+	}
+	return &dirH{r: r}, nil
+}
+
+func (d *dirH) reopen() (*dirH, error) {
+	r, err := d.r.OpenRoot(".")
+	if err != nil {
+		return nil, err
+	}
+	return &dirH{r: r}, nil
+}
+
+func (d *dirH) openDir(name string) (*dirH, error) {
+	before, err := d.r.Lstat(name)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	if !plain(before) {
+		return nil, ErrSymlink
+	}
+	if !before.IsDir() {
+		return nil, ErrNotDir
+	}
+	sub, err := d.r.OpenRoot(name)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	after, err := sub.Stat(".")
+	now, lerr := d.r.Lstat(name)
+	if err != nil || lerr != nil || !plain(now) || !os.SameFile(before, after) || !os.SameFile(now, after) {
+		sub.Close()
+		return nil, ErrSymlink
+	}
+	return &dirH{r: sub}, nil
+}
+
+func (d *dirH) openFile(name string, flags int, perm fs.FileMode) (*os.File, error) {
+	before, err := d.r.Lstat(name)
+	exists := err == nil
+	switch {
+	case err != nil && !(errors.Is(err, fs.ErrNotExist) && flags&os.O_CREATE != 0):
+		return nil, mapErr(err)
+	case exists && !plain(before):
+		return nil, ErrSymlink
+	}
+	f, err := d.r.OpenFile(name, flags, perm)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	after, err := f.Stat()
+	if err != nil || !after.Mode().IsRegular() {
+		f.Close()
+		return nil, ErrNotRegular
+	}
+	now, err := d.r.Lstat(name)
+	if err != nil || !plain(now) || !os.SameFile(now, after) || (exists && !os.SameFile(before, after)) {
+		f.Close()
+		return nil, ErrSymlink
+	}
+	return f, nil
+}
+
+func (d *dirH) mkdir(name string, perm fs.FileMode) error {
+	if err := d.r.Mkdir(name, perm); err != nil {
+		return mapErr(err)
+	}
+	return d.r.Chmod(name, perm)
+}
+
+func (d *dirH) link(oldname, newname string) error { return mapErr(d.r.Link(oldname, newname)) }
+
+func (d *dirH) rename(oldname, newname string) error { return mapErr(d.r.Rename(oldname, newname)) }
+
+func (d *dirH) remove(name string) error { return mapErr(d.r.Remove(name)) }
+
+func (d *dirH) readDir() ([]fs.DirEntry, error) {
+	f, err := d.r.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return f.ReadDir(-1)
+}
+
+// sync: Windows cannot flush a directory handle; NTFS journals the rename itself.
+func (d *dirH) sync() error { return nil }
+
+func (d *dirH) close() error { return d.r.Close() }
 ```
 
 - [ ] **Step 5: Run the tests to see them pass, and check every platform compiles**
@@ -3573,56 +4111,70 @@ Each row names the fault and the failure predicted **before** running it. Every 
 
 | # | Fault | Predicted failure | Verdict when run |
 |---|---|---|---|
-| A3-1 | directory component symlink not refused at the check | `TestRefusesSymlinkedDirectory`: the walk returns `ErrNotDir`, not `ErrSymlink` (failure text: `want ErrSymlink`) | RED |
-| A3-2 | final-name symlink not refused at the check | `TestRefusesSymlinkedFile`: os.Root refuses the escaping link with a different error (failure text: `want ErrSymlink and no bytes`) | RED |
-| A3-3 | final open re-resolved by path from the root instead of the held directory handle | `TestDirectorySwapAfterWalkCannotRedirect`: the swapped path no longer reaches the original file (failure text: `want the original directory`) | RED |
-| A3-4 | non-regular files accepted after the open | `TestRefusesFIFOWithoutBlocking`: no `ErrNotRegular` (failure text: `want ErrNotRegular`) | RED |
-| A3-5 | `..` accepted | *survives*: os.Root itself refuses `..` ("path escapes from parent"), so a `..` that passes `Split` is still refused; the name check is the first of two guards. Row A3-11 proves `Split` can fail on its own with a backslash name. | SURVIVED (predicted) |
-| A3-6 | target not re-checked before the rename | `TestWriteAtomicRefusesSymlinkTarget`: the symlink is replaced and no error is returned (failure text: `want ErrSymlink`) | RED |
-| A3-7 | mode left to the umask | `TestWriteModeIsExactWhateverTheUmask`: 0600 instead of 0640 (failure text: `mode=-rw------- err=<nil>`) | RED |
-| A3-8 | component swapped between its check and its open is followed | `TestComponentSwapBetweenCheckAndOpenIsRefused`: the decoy is read (failure text: `a component swapped to a symlink was followed: "DECOY" <nil>`) | RED |
-| A3-9 | final name swapped between its check and its open is followed | `TestFileSwapBetweenCheckAndOpenIsRefused`: the decoy is read (failure text: `a file swapped to a symlink was followed: "DECOY" <nil>`) | RED |
-| A3-10 | root replaced between its check and its open is accepted | `TestRootSwapDuringOpenIsRefused` (failure text: `a root replaced between check and open must be refused`) | RED |
-| A3-11 | backslash accepted in a name | `TestRefusesBackslashNames`: the file named with a backslash is read (failure text: `want ErrEscape`) | RED |
-| A3-12 | the compare-before-rename check ignored | `TestWriteFileCheckedAbortsWhenTargetChanged`: the human edit is overwritten (failure text: `err=<nil> content="NEW" entries=2`) | RED |
+| A3-1 | directory components opened without `O_NOFOLLOW` | `TestDirectorySubstitutedBySymlinkToMovedOriginalIsRefused`: the relative symlink to the moved original is followed (failure text: `a symlink to the moved original directory was followed`) | RED |
+| A3-2 | the final name opened without `O_NOFOLLOW` | `TestFileSubstitutedBySymlinkToMovedOriginalIsRefused` (failure text: `a symlink to the moved original file was followed`) | RED |
+| A3-3 | the root's final component opened without `O_NOFOLLOW` (the identity supplement alone passes: it is the same object) | `TestRootSubstitutedBySymlinkToMovedOriginalIsRefused` (failure text: `a root replaced by a symlink to the moved original was opened`) | RED |
+| A3-4 | `ENOTDIR` at a symlink not classified as a symlink | `TestRefusesSymlinkedDirectory` on macOS, where `O_NOFOLLOW` with `O_DIRECTORY` on a symlink gives `ENOTDIR` (failure text: `want ErrSymlink`). On Linux the kernel returns `ELOOP` and this row survives; the macOS run is the one recorded | RED (macOS; survives on Linux, see the prediction) |
+| A3-5 | final open re-resolved by path from the root instead of the held directory handle | `TestDirectorySwapAfterWalkCannotRedirect` (failure text: `the swap redirected the open outside the root`) | RED |
+| A3-6 | non-regular files accepted after the open | `TestRefusesFIFOWithoutBlocking` (failure text: `want ErrNotRegular`) | RED |
+| A3-7 | `..` accepted by `Split` | `TestRefusesEscapingNames`: `openat` on `..` leaves the root, so this guard is now the only one (failure text: `want ErrEscape`) | RED |
+| A3-8 | atomic write does not refuse a symlink at the target | `TestWriteAtomicRefusesSymlinkTarget` (failure text: `want ErrSymlink`) | RED |
+| A3-9 | mode left to the umask | `TestWriteModeIsExactWhateverTheUmask` (failure text: `mode=-rw------- err=<nil>`) | RED |
+| A3-10 | root identity supplement ignored (another plain directory swapped in mid-open) | `TestRootSwapDuringOpenIsRefused` (failure text: `a root replaced between check and open must be refused`) | RED |
+| A3-11 | backslash accepted in a name | `TestRefusesBackslashNames` (failure text: `want ErrEscape`) | RED |
+| A3-12 | staged file installed by rename (clobbering) instead of a no-clobber link | `TestReplaceKeepsEditMadeAfterMoveAside`: the human save made after the move-aside is overwritten (failure text: `human edit not kept`) | RED |
+| A3-13 | the same fault, with the human save made after the compare | `TestReplaceKeepsEditMadeAfterCompare` (failure text: `human edit not kept`) | RED |
+| A3-14 | the moved-aside content is not judged | `TestReplaceRefusesEditBeforeMoveAside` (failure text: `content="NEW"`) | RED |
+| A3-15 | recovery does not put back a backup whose target is missing | `TestRestoreBackupsPutsBackAMissingTarget` (failure text: `content=""`) | RED |
 
 ```bash
-# A3-1: directory component symlink not refused at the check
-scripts/inject.sh internal/confine/root.go '	if before.Mode()&(fs.ModeSymlink|fs.ModeIrregular) != 0 {' '	if false && before.Mode()&(fs.ModeSymlink|fs.ModeIrregular) != 0 {' ./internal/confine/ 'TestRefusesSymlinkedDirectory' 'want ErrSymlink'
+# A3-1: directory components opened without O_NOFOLLOW
+scripts/inject.sh internal/confine/root_unix.go 'const dirOpenFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC' 'const dirOpenFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC' ./internal/confine/ '^TestDirectorySubstitutedBySymlinkToMovedOriginalIsRefused$' 'a symlink to the moved original directory was followed'
 
-# A3-2: final-name symlink not refused at the check
-scripts/inject.sh internal/confine/root.go '	case exists && before.Mode()&(fs.ModeSymlink|fs.ModeIrregular) != 0:' '	case false && exists && before.Mode()&(fs.ModeSymlink|fs.ModeIrregular) != 0:' ./internal/confine/ 'TestRefusesSymlinkedFile' 'want ErrSymlink and no bytes'
+# A3-2: the final name opened without O_NOFOLLOW
+scripts/inject.sh internal/confine/root_unix.go 'const fileOpenFlags = unix.O_NOFOLLOW | unix.O_NONBLOCK | unix.O_CLOEXEC' 'const fileOpenFlags = unix.O_NONBLOCK | unix.O_CLOEXEC' ./internal/confine/ '^TestFileSubstitutedBySymlinkToMovedOriginalIsRefused$' 'a symlink to the moved original file was followed'
 
-# A3-3: final open re-resolved by path from the root instead of the held directory handle
-scripts/inject.sh internal/confine/root.go '	return openIn(dir, name, flags, perm)' '	_ = name
-	return openIn(r.r, rel, flags, perm)' ./internal/confine/ 'TestDirectorySwapAfterWalkCannotRedirect' 'want the original directory'
+# A3-3: the root's final component opened without O_NOFOLLOW (the identity check alone passes: same object)
+scripts/inject.sh internal/confine/root_unix.go 'const rootOpenFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC' 'const rootOpenFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC' ./internal/confine/ '^TestRootSubstitutedBySymlinkToMovedOriginalIsRefused$' 'a root replaced by a symlink to the moved original was opened'
 
-# A3-4: non-regular files accepted after the open
-scripts/inject.sh internal/confine/root.go '	if err != nil || !after.Mode().IsRegular() {' '	if err != nil {' ./internal/confine/ 'TestRefusesFIFOWithoutBlocking' 'want ErrNotRegular'
+# A3-4: ENOTDIR at a symlink not classified as a symlink (macOS returns ENOTDIR for O_NOFOLLOW|O_DIRECTORY)
+scripts/inject.sh internal/confine/root_unix.go '		case ok && link, errors.Is(err, unix.ELOOP):' '		case ok && link && false, errors.Is(err, unix.ELOOP):' ./internal/confine/ '^TestRefusesSymlinkedDirectory$' 'want ErrSymlink'
 
-# A3-5: `..` accepted
-scripts/inject.sh internal/confine/confine.go 'if p == "" || p == "." || p == ".." {' 'if p == "" || p == "." {' ./internal/confine/ 'TestRefusesEscapingNames' 'survives'
+# A3-5: final open re-resolved by path from the root instead of the held directory handle
+scripts/inject.sh internal/confine/root.go '	return dir.openFile(name, flags, perm)' '	_ = name
+	return r.h.openFile(rel, flags, perm)' ./internal/confine/ '^TestDirectorySwapAfterWalkCannotRedirect$' 'the swap redirected the open outside the root'
 
-# A3-6: target not re-checked before the rename
-scripts/inject.sh internal/confine/root.go '	cur, exists, err := currentRegular(dir, name)' '	cur, exists, err := []byte(nil), false, error(nil)' ./internal/confine/ 'TestWriteAtomicRefusesSymlinkTarget' 'want ErrSymlink'
+# A3-6: non-regular files accepted after the open
+scripts/inject.sh internal/confine/root_unix.go '	if err := unix.Fstat(fd, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFREG {' '	if err := unix.Fstat(fd, &st); err != nil {' ./internal/confine/ '^TestRefusesFIFOWithoutBlocking$' 'want ErrNotRegular'
 
-# A3-7: mode left to the umask
-scripts/inject.sh internal/confine/root.go '		werr = f.Chmod(perm.Perm()) // exact mode whatever the umask' '		werr = nil' ./internal/confine/ 'TestWriteModeIsExactWhateverTheUmask' 'mode=-rw------- err=<nil>'
+# A3-7: `..` accepted by Split (openat would then leave the root)
+scripts/inject.sh internal/confine/confine.go 'if p == "" || p == "." || p == ".." {' 'if p == "" || p == "." {' ./internal/confine/ '^TestRefusesEscapingNames$' 'want ErrEscape'
 
-# A3-8: component swapped between its check and its open is followed
-scripts/inject.sh internal/confine/root.go '	if err != nil || !os.SameFile(before, after) {' '	if err != nil || false && !os.SameFile(before, after) {' ./internal/confine/ 'TestComponentSwapBetweenCheckAndOpenIsRefused' 'a component swapped to a symlink was followed: "DECOY" <nil>'
+# A3-8: atomic write does not refuse a symlink at the target
+scripts/inject.sh internal/confine/root.go '	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err // a symlink' '	} else if false {
+		return err // a symlink' ./internal/confine/ '^TestWriteAtomicRefusesSymlinkTarget$' 'want ErrSymlink'
 
-# A3-9: final name swapped between its check and its open is followed
-scripts/inject.sh internal/confine/root.go '	if err != nil || now.Mode()&fs.ModeSymlink != 0 || !os.SameFile(now, after) || (exists && !os.SameFile(before, after)) {' '	if err != nil || false && (now.Mode()&fs.ModeSymlink != 0 || !os.SameFile(now, after) || (exists && !os.SameFile(before, after))) {' ./internal/confine/ 'TestFileSwapBetweenCheckAndOpenIsRefused' 'a file swapped to a symlink was followed: "DECOY" <nil>'
+# A3-9: mode left to the umask
+scripts/inject.sh internal/confine/root.go '		werr = f.Chmod(perm.Perm()) // exact mode whatever the umask' '		werr = nil' ./internal/confine/ '^TestWriteModeIsExactWhateverTheUmask$' 'mode=-rw------- err=<nil>'
 
-# A3-10: root replaced between its check and its open is accepted
-scripts/inject.sh internal/confine/root.go '	if err != nil || !os.SameFile(rootBefore, rootAfter) {' '	if err != nil || false && !os.SameFile(rootBefore, rootAfter) {' ./internal/confine/ 'TestRootSwapDuringOpenIsRefused' 'a root replaced between check and open must be refused'
+# A3-10: root identity supplement ignored (a plain directory swapped in mid-open)
+scripts/inject.sh internal/confine/root_unix.go '	if err := unix.Fstat(fd, &after); err != nil || after.Dev != before.Dev || after.Ino != before.Ino {' '	if err := unix.Fstat(fd, &after); err != nil {' ./internal/confine/ '^TestRootSwapDuringOpenIsRefused$' 'a root replaced between check and open must be refused'
 
 # A3-11: backslash accepted in a name
-scripts/inject.sh internal/confine/confine.go 'strings.Contains(rel, `\`) ||' 'false ||' ./internal/confine/ 'TestRefusesBackslashNames' 'want ErrEscape'
+scripts/inject.sh internal/confine/confine.go 'strings.Contains(rel, `\`) ||' 'false ||' ./internal/confine/ '^TestRefusesBackslashNames$' 'want ErrEscape'
 
-# A3-12: the compare-before-rename check ignored
-scripts/inject.sh internal/confine/root.go '	if err == nil && check != nil {' '	if false && check != nil {' ./internal/confine/ 'TestWriteFileCheckedAbortsWhenTargetChanged' 'err=<nil> content="NEW" entries=2'
+# A3-12: staged file installed by rename (clobbering) after the move-aside
+scripts/inject.sh internal/confine/root.go '	if err := dir.link(tmp, name); err != nil {' '	if err := dir.rename(tmp, name); err != nil {' ./internal/confine/ '^TestReplaceKeepsEditMadeAfterMoveAside$' 'human edit not kept'
+
+# A3-13: same fault, edit made after the compare
+scripts/inject.sh internal/confine/root.go '	if err := dir.link(tmp, name); err != nil {' '	if err := dir.rename(tmp, name); err != nil {' ./internal/confine/ '^TestReplaceKeepsEditMadeAfterCompare$' 'human edit not kept'
+
+# A3-14: the moved-aside content is not judged
+scripts/inject.sh internal/confine/root.go '	if rerr != nil || !want(current) {' '	if false && (rerr != nil || !want(current)) {' ./internal/confine/ '^TestReplaceRefusesEditBeforeMoveAside$' 'content="NEW"'
+
+# A3-15: recovery does not put a backup back when its target is missing
+scripts/inject.sh internal/confine/root.go '		if lerr := dir.link(e.Name(), target); lerr == nil {' '		if lerr := error(fs.ErrExist); lerr == nil {' ./internal/confine/ '^TestRestoreBackupsPutsBackAMissingTarget$' 'content=""'
 ```
 
 Expected: `RED as predicted` (exit 0) for every row except those marked *survives* (`SURVIVED`, exit 1). Append each verdict to `docs/spikes/results/fault-log-A3.section.md`.
@@ -3632,7 +4184,7 @@ Expected: `RED as predicted` (exit 0) for every row except those marked *survive
 
 ```bash
 git add internal/confine/confine.go internal/confine/root.go internal/confine/root_unix.go internal/confine/root_windows.go internal/confine/confine_test.go internal/confine/helpers_unix_test.go internal/confine/confine_unix_test.go
-git commit -m "feat(confine): add os.Root confinement with identity-checked opens on every platform"
+git commit -m "feat(confine): add no-follow confinement and the move-aside replace"
 ```
 
 ---
@@ -3644,7 +4196,7 @@ git commit -m "feat(confine): add os.Root confinement with identity-checked open
 
 **Depends on:** A3, S2 (V03).
 
-The implementation is A3's, shared by every platform. This task adds the Windows-only tests: junctions inside the root, Windows special names, and the helpers that make A3's portable tests run on Windows (junctions instead of directory symlinks; Windows refuses to rename a directory while a handle on it is open, which the swap tests treat as the guarantee holding). They compile locally with `GOOS=windows go vet` and run in the A28 Windows job. If S2 or the first CI run shows an `os.Root` or `os.SameFile` residual on Windows, it is recorded in `docs/spikes/results/V03.md` as a verified result with its CI evidence, and a test for it is added here; it is not waived.
+The implementation is A3's, shared by every platform. This task adds the Windows-only tests: junctions inside the root, Windows special names, and the helpers that make A3's portable tests run on Windows (junctions instead of directory symlinks; Windows refuses to rename a directory while a handle on it is open, which the swap tests treat as the guarantee holding). They compile locally with `GOOS=windows go vet` and run in the A28 Windows job. If S2 or the first CI run shows an `os.Root` or `os.SameFile` residual on Windows, it is recorded in `docs/spikes/results/V03.md` as a verified result with its CI evidence, and a test for it is added here; it is not waived. The residual already known is stated in `root_windows.go` (A3): `os.Root` follows a relative in-root symlink, so a swap to one and back between the before and after checks is not detected. Windows confinement is `pending-ci` and beta until the 1d `NtCreateFile` no-follow open.
 
 - [ ] **Step 1: Write the Windows-only tests**
 
@@ -5052,14 +5604,15 @@ git commit -m "feat(store): add multi-origin registry, SQLite schema and checkou
 **Depends on:** S0.
 
 **Interfaces:**
-- Produces: `gitx.ErrNotRepo`, `gitx.ErrAmbiguous`, `gitx.ErrUnknownObject`; `type Repo struct { Top, CommonDir, GitDir string; neutralise []string }`; `ObjectFormat(ctx) (string, error)`; `ResolveObject(ctx, id, kind string) (string, error)`; `gitx.Discover(ctx, dir string) (*Repo, error)`; methods `HeadBlobs(ctx, paths []string) (map[string]string, error)`, `HashBlob(ctx, path string, content []byte) (string, error)`, `CommitExists(ctx, sha string) (bool, error)`, `HeadCommit(ctx) (string, error)` (`""` before the first commit), `HeadTree(ctx) (string, error)`, `Branch(ctx) string`, `OriginURL(ctx) string`, `Dirty(ctx, pathspec string) ([]string, error)`.
+- Produces: `gitx.ErrNotRepo`, `gitx.ErrAmbiguous`, `gitx.ErrUnknownObject`; `type Repo struct { Top, CommonDir, GitDir string; neutralise [][2]string }`; `ObjectFormat(ctx) (string, error)`; `ResolveObject(ctx, id, kind string) (string, error)`; `gitx.Discover(ctx, dir string) (*Repo, error)`; methods `HeadBlobs(ctx, paths []string) (map[string]string, error)`, `HashBlob(ctx, path string, content []byte) (string, error)`, `CommitExists(ctx, sha string) (bool, error)`, `HeadCommit(ctx) (string, error)` (`""` before the first commit), `HeadTree(ctx) (string, error)`, `Branch(ctx) string`, `OriginURL(ctx) string`, `Dirty(ctx, pathspec string) ([]string, error)`.
 
 Every invocation runs with hostile-configuration defences, always (adjudicated Q11):
 - `-c` overrides: `core.fsmonitor=false`, `core.untrackedCache=false`, `core.hooksPath` and `core.attributesFile` set to the null device, and `diff.external=`;
 - `--no-optional-locks` and `--literal-pathspecs`;
-- `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1` and `GIT_ATTR_NOSYSTEM=1`.
+- `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1` and `GIT_ATTR_NOSYSTEM=1`;
+- `GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n` carrying `status.submoduleSummary=false`, `submodule.recurse=false`, `diff.ignoreSubmodules=all` and every driver override. The caller's own `GIT_CONFIG_*` entries are dropped first. Overrides never travel as `-c key=value`, because a subsection name may contain `=` and git splits a `-c` argument at the first one.
 
-`Discover` reads the repository's config (reading runs nothing) and overrides every filter and diff driver it names to empty: `clean`, `smudge`, `process`, `textconv`, `command`, and `required=false`. So no command that a cloned or archived repository defines can run. Blobs are hashed with `hash-object --no-filters`. `safe.directory` is never widened. Comparing like with like through the repository's clean filter is **deferred to the engine specification (spec 14.6)**: until then a source with an eol or clean-filter conversion may read as STALE, which is the conservative direction. Object ids are resolved to full ids of the repository's algorithm (`ObjectFormat`), and an ambiguous short id is an error (`ErrAmbiguous`), never a guess (adjudicated Q16).
+`Discover` reads the repository's config (reading runs nothing) and overrides every filter and diff driver it names to empty: `clean`, `smudge`, `process`, `textconv`, `command`, and `required=false`. So no command that a cloned or archived repository defines can run. The read fails closed: exit status 1 with an empty stderr is git's "no matching keys" (pattern `^(filter|diff)\..+\.`); any other failure is an error, and `Discover` returns it and no `Repo`. `Dirty` passes `--ignore-submodules=all`, so a submodule's own config and attributes are never consulted. Note for later callers: the `diff.external=` override makes a plain `git diff` fail, so a future diff caller needs `--no-ext-diff`; `GIT_EXTERNAL_DIFF` is not stripped. Blobs are hashed with `hash-object --no-filters`. `safe.directory` is never widened. Comparing like with like through the repository's clean filter is **deferred to the engine specification (spec 14.6)**: until then a source with an eol or clean-filter conversion may read as STALE, which is the conservative direction. Object ids are resolved to full ids of the repository's algorithm (`ObjectFormat`), and an ambiguous short id is an error (`ErrAmbiguous`), never a guess (adjudicated Q16).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5282,11 +5835,70 @@ func TestDriversAreNeutralised(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := strings.Join(r.neutralise, " ")
-	for _, want := range []string{"filter.evil.clean=", "filter.evil.smudge=", "filter.evil.process=", "filter.evil.required=false", "diff.evil.textconv=", "diff.evil.command="} {
-		if !strings.Contains(got, "-c "+want) {
-			t.Errorf("missing override %q in %q", want, got)
+	got := map[string]string{}
+	for _, o := range r.neutralise {
+		got[o[0]] = o[1]
+	}
+	want := map[string]string{"filter.evil.clean": "", "filter.evil.smudge": "", "filter.evil.process": "", "filter.evil.required": "false",
+		"diff.evil.textconv": "", "diff.evil.command": ""}
+	for k, v := range want {
+		if gv, ok := got[k]; !ok || gv != v {
+			t.Errorf("missing override %q=%q in %v", k, v, r.neutralise)
 		}
+	}
+}
+
+// The config read that builds the override list must fail closed: a Repo returned without
+// its overrides would run whatever the repository names. Exit status 1 with an empty stderr
+// is git's "no matching keys" and means an empty list; every other failure is an error,
+// including exit 1 with warnings (an unreadable config file reads as "no keys").
+func TestDriverDiscoveryFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	t.Run("no keys is an empty list", func(t *testing.T) {
+		got, err := driverOverrides(ctx, newRepo(t))
+		if err != nil || len(got) != 0 {
+			t.Fatalf("want an empty list and no error, got %v %v", got, err)
+		}
+	})
+	t.Run("corrupt config", func(t *testing.T) {
+		dir := newRepo(t)
+		f, err := os.OpenFile(filepath.Join(dir, ".git", "config"), os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = f.WriteString("[broken\n")
+		_ = f.Close()
+		if got, err := driverOverrides(ctx, dir); err == nil {
+			t.Fatalf("a corrupt config returned no error: %v", got)
+		}
+	})
+	t.Run("config is a directory", func(t *testing.T) {
+		dir := newRepo(t)
+		cfg := filepath.Join(dir, ".git", "config")
+		if err := os.Remove(cfg); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(cfg, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := driverOverrides(ctx, dir); err == nil {
+			t.Fatalf("an unreadable config returned no error: %v", got)
+		}
+	})
+}
+
+// git refuses a corrupt config before the override read is reached, so this end-to-end check
+// passes with or without the fail-closed read; TestDriverDiscoveryFailsClosed is the guard.
+func TestDiscoverRefusesCorruptConfig(t *testing.T) {
+	dir := newRepo(t)
+	f, err := os.OpenFile(filepath.Join(dir, ".git", "config"), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.WriteString("[broken\n")
+	_ = f.Close()
+	if r, err := Discover(context.Background(), dir); err == nil || r != nil {
+		t.Fatalf("a corrupt config must give an error and no Repo, got %+v %v", r, err)
 	}
 }
 ```
@@ -5332,9 +5944,12 @@ package gitx
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // A repository's own config can name a clean filter that runs a command; git status and
@@ -5365,6 +5980,97 @@ func TestRepositoryCleanFilterIsNeverRun(t *testing.T) {
 		t.Fatal("the repository's clean filter command ran")
 	}
 }
+
+// touchAfterCommit rewrites path with same-size, different content and a modification time
+// two hours ahead, so git cannot tell from stat data alone that it is unchanged and must
+// run the file through its clean filter to compare. Without this a filter might never run
+// and a "the marker is absent" assertion would pass for the wrong reason.
+func touchAfterCommit(t *testing.T, path string, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(2 * time.Hour)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A subsection name may contain '=': passed as `-c key=` git splits at the first '=', the
+// real key is not overridden and the repository's command runs. Overrides must travel with
+// the key and value separate.
+func TestHostileConfigKeyNamesAreNeutralised(t *testing.T) {
+	ctx := context.Background()
+	dir := newRepo(t)
+	names := []string{"a=b", "x=y=z", "trail="}
+	var attrs strings.Builder
+	for i, n := range names {
+		f := fmt.Sprintf("f%d.txt", i)
+		fmt.Fprintf(&attrs, "%s filter=%s diff=%s\n", f, n, n)
+		if err := os.WriteFile(filepath.Join(dir, f), []byte("alpha\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".gitattributes"), []byte(attrs.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, dir, "add", ".")
+	gitT(t, dir, "commit", "-qm", "files")
+	var markers []string
+	for i, n := range names {
+		fm := filepath.Join(dir, fmt.Sprintf("PWNED-FILTER-%d", i))
+		tm := filepath.Join(dir, fmt.Sprintf("PWNED-TEXTCONV-%d", i))
+		markers = append(markers, fm, tm)
+		gitT(t, dir, "config", "filter."+n+".clean", "sh -c 'touch "+fm+"; cat'")
+		gitT(t, dir, "config", "diff."+n+".textconv", "touch "+tm+"; cat")
+		touchAfterCommit(t, filepath.Join(dir, fmt.Sprintf("f%d.txt", i)), "alphb\n")
+	}
+	r, err := Discover(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Dirty(ctx, "."); err != nil {
+		t.Fatal(err)
+	}
+	// git refuses to run a textconv command that has been emptied, so this diff may fail;
+	// what matters is that no marker appears.
+	_, _ = r.git(ctx, nil, "diff", "--no-ext-diff", "--textconv", "HEAD", "--")
+	for _, m := range markers {
+		if _, err := os.Stat(m); err == nil {
+			t.Errorf("a driver named with '=' ran: %s exists", filepath.Base(m))
+		}
+	}
+}
+
+// A submodule has its own config and attributes, which the superproject's neutralisation
+// list has never seen. status must not descend into it, even when the repository says the
+// submodule must always be checked (submodule.<name>.ignore=none).
+func TestSubmoduleConfigIsNeverRun(t *testing.T) {
+	ctx := context.Background()
+	src := newRepo(t)
+	if err := os.WriteFile(filepath.Join(src, ".gitattributes"), []byte("*.txt filter=evil\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, src, "add", ".gitattributes")
+	gitT(t, src, "commit", "-qm", "attributes")
+	dir := newRepo(t)
+	gitT(t, dir, "-c", "protocol.file.allow=always", "submodule", "add", "-q", src, "sub")
+	gitT(t, dir, "commit", "-qm", "add submodule")
+	gitT(t, dir, "config", "submodule.sub.ignore", "none")
+	marker := filepath.Join(dir, "PWNED-SUBMODULE")
+	gitT(t, filepath.Join(dir, "sub"), "config", "filter.evil.clean", "sh -c 'touch "+marker+"; cat'")
+	touchAfterCommit(t, filepath.Join(dir, "sub", "a.txt"), "alphb\n")
+	r, err := Discover(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Dirty(ctx, "."); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("a filter defined in a submodule's own config ran")
+	}
+}
 ```
 
 - [ ] **Step 2: Run them to see them fail**
@@ -5390,6 +6096,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -5406,9 +6113,12 @@ type Repo struct {
 	Top       string
 	CommonDir string
 	GitDir    string
-	// neutralise overrides every filter and diff driver the repository's own config names,
-	// so no clean, smudge, process, textconv or external diff command it defines can run.
-	neutralise []string
+	// neutralise holds key/value config overrides, one per filter and diff driver setting
+	// the repository's own config names, so no clean, smudge, process, textconv or command
+	// it defines can run. They reach git through GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n, never
+	// as `-c key=value`: a subsection name may contain '=', and git would split a `-c`
+	// argument at the first one.
+	neutralise [][2]string
 }
 
 // safety applies to every invocation, whatever the repository's configuration says. Wikory
@@ -5416,6 +6126,31 @@ type Repo struct {
 // filters is deferred to the engine specification (spec 14.6): blobs are hashed raw.
 var safety = []string{"-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "core.hooksPath=" + os.DevNull,
 	"-c", "core.attributesFile=" + os.DevNull, "-c", "diff.external=", "--no-optional-locks", "--literal-pathspecs"}
+
+// baseConfig is applied to every invocation, after any environment config is cleared. It
+// keeps git from walking into submodules, which have config and attributes of their own that
+// no list built from this repository's config can cover.
+var baseConfig = [][2]string{{"status.submoduleSummary", "false"}, {"submodule.recurse", "false"}, {"diff.ignoreSubmodules", "all"}}
+
+// gitEnv is the environment for one git invocation. The caller's GIT_CONFIG_COUNT and its
+// KEY and VALUE entries are dropped and replaced by baseConfig followed by extra, each key
+// and value in its own variable.
+func gitEnv(extra [][2]string) []string {
+	all := append(append([][2]string{}, baseConfig...), extra...)
+	env := make([]string, 0, len(os.Environ())+2*len(all)+5)
+	for _, kv := range os.Environ() {
+		up := strings.ToUpper(kv)
+		if strings.HasPrefix(up, "GIT_CONFIG_COUNT=") || strings.HasPrefix(up, "GIT_CONFIG_KEY_") || strings.HasPrefix(up, "GIT_CONFIG_VALUE_") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	env = append(env, "GIT_CONFIG_COUNT="+strconv.Itoa(len(all)))
+	for i, o := range all {
+		env = append(env, "GIT_CONFIG_KEY_"+strconv.Itoa(i)+"="+o[0], "GIT_CONFIG_VALUE_"+strconv.Itoa(i)+"="+o[1])
+	}
+	return append(env, "GIT_TERMINAL_PROMPT=0", "LC_ALL=C", "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1")
+}
 
 var driverRe = regexp.MustCompile(`^(filter|diff)\.(.+)\.(clean|smudge|process|required|textconv|command)$`)
 
@@ -5426,13 +6161,15 @@ type Error struct {
 	Err    error
 }
 
-func (e *Error) Error() string { return fmt.Sprintf("git %s: %v: %s", strings.Join(e.Args, " "), e.Err, e.Stderr) }
+func (e *Error) Error() string {
+	return fmt.Sprintf("git %s: %v: %s", strings.Join(e.Args, " "), e.Err, e.Stderr)
+}
 func (e *Error) Unwrap() error { return e.Err }
 
-func run(ctx context.Context, dir string, extra []string, stdin []byte, args ...string) ([]byte, error) {
-	full := append(append(append([]string{"-C", dir}, safety...), extra...), args...)
+func run(ctx context.Context, dir string, extra [][2]string, stdin []byte, args ...string) ([]byte, error) {
+	full := append(append([]string{"-C", dir}, safety...), args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "LC_ALL=C", "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1")
+	cmd.Env = gitEnv(extra)
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
@@ -5468,11 +6205,33 @@ func Discover(ctx context.Context, dir string) (*Repo, error) {
 			return nil, err
 		}
 	}
-	// Reading config runs nothing. Every named filter and diff driver is overridden to empty.
-	names, _ := run(ctx, r.Top, nil, nil, "config", "--null", "--name-only", "--get-regexp", `^(filter|diff)\.`)
+	// Reading config runs nothing. Every named filter and diff driver is overridden to empty,
+	// and a failure to read it means no Repo at all.
+	if r.neutralise, err = driverOverrides(ctx, r.Top); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// driverOverrides lists the overrides that empty every filter and diff driver setting the
+// repository's config names. It fails closed: exit status 1 with an empty stderr is git's
+// "no matching keys" and gives an empty list (the pattern needs a subsection, so the
+// command-line keys set here, such as diff.external, never match); any other failure, including exit status 1
+// with warnings (a config path git cannot read), is an error.
+func driverOverrides(ctx context.Context, top string) ([][2]string, error) {
+	names, err := run(ctx, top, nil, nil, "config", "--null", "--name-only", "--get-regexp", `^(filter|diff)\..+\.`)
+	if err != nil {
+		var ge *Error
+		var ee *exec.ExitError
+		if !(errors.As(err, &ge) && errors.As(err, &ee) && ee.ExitCode() == 1 && ge.Stderr == "") {
+			return nil, fmt.Errorf("gitx: reading repository config: %w", err)
+		}
+		return nil, nil
+	}
+	var out [][2]string
 	seen := map[string]bool{}
 	for _, n := range bytes.Split(names, []byte{0}) {
-		m := driverRe.FindStringSubmatch(strings.TrimSpace(string(n)))
+		m := driverRe.FindStringSubmatch(string(n))
 		if m == nil {
 			continue
 		}
@@ -5480,15 +6239,15 @@ func Discover(ctx context.Context, dir string) (*Repo, error) {
 			m[1] + "." + m[2] + ".textconv", m[1] + "." + m[2] + ".command"} {
 			if !seen[key] {
 				seen[key] = true
-				r.neutralise = append(r.neutralise, "-c", key+"=")
+				out = append(out, [2]string{key, ""})
 			}
 		}
 		if req := m[1] + "." + m[2] + ".required"; !seen[req] {
 			seen[req] = true
-			r.neutralise = append(r.neutralise, "-c", req+"=false")
+			out = append(out, [2]string{req, "false"})
 		}
 	}
-	return &r, nil
+	return out, nil
 }
 
 // ObjectFormat is the repository's hash algorithm: "sha1" or "sha256".
@@ -5611,7 +6370,7 @@ func (r *Repo) OriginURL(ctx context.Context) string {
 
 // Dirty lists changed and untracked paths under pathspec, repository-relative.
 func (r *Repo) Dirty(ctx context.Context, pathspec string) ([]string, error) {
-	out, err := r.git(ctx, nil, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", pathspec)
+	out, err := r.git(ctx, nil, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all", "--", pathspec)
 	if err != nil {
 		return nil, err
 	}
@@ -5647,8 +6406,13 @@ Each row names the fault and the failure predicted **before** running it. Every 
 | A8-1 | fsmonitor override removed | `TestRepositoryFsmonitorIsNeverRun`: `PWNED` exists (failure text: `the repository`) | RED |
 | A8-2 | literal pathspecs removed | `TestLiteralPathspecs`: `*.txt` matches `a.txt (failure text: `a glob matched as a pathspec: [notes.md] <nil>`) | RED |
 | A8-3 | sha validation removed | `TestCommitsHeadAndBranch`: an option-shaped sha is passed to git and no error is returned (failure text: `an option-shaped sha must be refused, not passed to git`) | RED |
-| A8-4 | a repository's filter drivers not neutralised | `TestRepositoryCleanFilterIsNeverRun`: the filter's marker file appears (failure text: `missing override "filter.evil.clean=" in "-c filter.evil.required=fals`) | RED |
+| A8-4 | filter and diff drivers not neutralised (override pairs never appended) | `TestDriversAreNeutralised` (failure text: `missing override "filter.evil.clean"=""`) | RED |
 | A8-5 | an ambiguous short id is not reported as ambiguous | `TestAmbiguousShortIDIsAnError` (failure text: `an ambiguous prefix must be an error`) | RED |
+| A8-6 | override key cut at its first `=` (what `-c key=value` did) | `TestHostileConfigKeyNamesAreNeutralised` (failure text: `a driver named with '=' ran`) | RED |
+| A8-7 | every failure of the driver-config read ignored | `TestDriverDiscoveryFailsClosed` (failure text: `a corrupt config returned no error`) | RED |
+| A8-8 | exit status 1 accepted whatever stderr says | `TestDriverDiscoveryFailsClosed` (failure text: `an unreadable config returned no error`) | RED |
+| A8-9 | exit status 1 no longer recognised as "no matching keys" | `TestDriverDiscoveryFailsClosed` (failure text: `want an empty list and no error`) | RED |
+| A8-10 | `--ignore-submodules=all` removed from status | `TestSubmoduleConfigIsNeverRun` (failure text: `a filter defined in a submodule`) | RED |
 
 ```bash
 # A8-1: fsmonitor override removed
@@ -5660,11 +6424,26 @@ scripts/inject.sh internal/gitx/gitx.go '"--no-optional-locks", "--literal-paths
 # A8-3: sha validation removed
 scripts/inject.sh internal/gitx/gitx.go '	if !shaRe.MatchString(sha) || len(sha) < 7 {' '	if false && (!shaRe.MatchString(sha) || len(sha) < 7) {' ./internal/gitx/ 'TestCommitsHeadAndBranch' 'an option-shaped sha must be refused, not passed to git'
 
-# A8-4: a repository's filter drivers not neutralised
-scripts/inject.sh internal/gitx/gitx.go '				r.neutralise = append(r.neutralise, "-c", key+"=")' '				_ = key' ./internal/gitx/ 'TestDriversAreNeutralised' 'missing override "filter.evil.clean=" in "-c filter.evil.required=fals'
+# A8-4: filter and diff drivers not neutralised (override pairs never appended)
+scripts/inject.sh internal/gitx/gitx.go '				out = append(out, [2]string{key, ""})' '				_ = key' ./internal/gitx/ '^TestDriversAreNeutralised$' 'missing override "filter.evil.clean"=""'
 
 # A8-5: an ambiguous short id is not reported as ambiguous
 scripts/inject.sh internal/gitx/gitx.go '		if errors.As(err, &ge) && strings.Contains(ge.Stderr, "ambiguous") {' '		if false && errors.As(err, &ge) && strings.Contains(ge.Stderr, "ambiguous") {' ./internal/gitx/ 'TestAmbiguousShortIDIsAnError' 'an ambiguous prefix must be an error'
+
+# A8-6: override key cut at its first `=` (what `-c key=value` did)
+scripts/inject.sh internal/gitx/gitx.go '"GIT_CONFIG_KEY_"+strconv.Itoa(i)+"="+o[0],' '"GIT_CONFIG_KEY_"+strconv.Itoa(i)+"="+strings.SplitN(o[0], "=", 2)[0],' ./internal/gitx/ '^TestHostileConfigKeyNamesAreNeutralised$' "a driver named with '=' ran"
+
+# A8-7: every failure of the driver-config read ignored
+scripts/inject.sh internal/gitx/gitx.go '			return nil, fmt.Errorf("gitx: reading repository config: %w", err)' '			return nil, nil' ./internal/gitx/ '^TestDriverDiscoveryFailsClosed$' 'a corrupt config returned no error'
+
+# A8-8: exit status 1 accepted whatever stderr says
+scripts/inject.sh internal/gitx/gitx.go 'ee.ExitCode() == 1 && ge.Stderr == "")' 'ee.ExitCode() == 1)' ./internal/gitx/ '^TestDriverDiscoveryFailsClosed$' 'an unreadable config returned no error'
+
+# A8-9: exit status 1 no longer recognised as "no matching keys"
+scripts/inject.sh internal/gitx/gitx.go 'ee.ExitCode() == 1 && ge.Stderr == "")' 'ee.ExitCode() == 99 && ge.Stderr == "")' ./internal/gitx/ '^TestDriverDiscoveryFailsClosed$' 'want an empty list and no error'
+
+# A8-10: `--ignore-submodules=all` removed from status
+scripts/inject.sh internal/gitx/gitx.go '"--untracked-files=all", "--ignore-submodules=all", "--", pathspec)' '"--untracked-files=all", "--", pathspec)' ./internal/gitx/ '^TestSubmoduleConfigIsNeverRun$' 'a filter defined in a submodule'
 ```
 
 Expected: `RED as predicted` (exit 0) for every row except those marked *survives* (`SURVIVED`, exit 1). Append each verdict to `docs/spikes/results/fault-log-A8.section.md`.
@@ -7405,7 +8184,7 @@ git commit -m "feat(validate): add claim rules 1, 2, 3, 5, 6 and 7 with fault-in
 Protocol, mapped to spec 6:
 1. **Fencing and revalidation, under the publishing lock.** The job's lease epoch must equal the database epoch, the job must belong to this checkout, the tree fingerprint must be unchanged, and each target's current hash must equal the op's base hash. Any mismatch refuses the publish and records why; nothing is overwritten. `Takeover` raises the epoch **under the same lock**, so it can never land between two steps of a publish in progress. Every later step re-checks the epoch (`fence`), and every database update is predicated on it, so a holder whose lease was taken over is stopped at its next step.
 2. **Stage and record.** Every new page version is staged under `jobs/<id>/stage/<n>` in the private store. A manifest lists each operation with its old hash, new hash and state, plus the tree fingerprint. In one transaction the job is marked `applying` and each operation is recorded in `job_ops` as `pending`.
-3. **Apply.** Each operation is applied with no-clobber writes, then marked done in the manifest **and** in `job_ops` (adjudicated Q13). A new file is created exclusively. An existing one is replaced only if, re-read through the same directory handle immediately before the rename, it still has the base hash (`WriteFileChecked`). The residual window is an external writer acting between that last re-read and the rename itself; the publish lock excludes every other Wikory writer.
+3. **Apply.** Each operation is applied with no-clobber writes, then marked done in the manifest **and** in `job_ops` (adjudicated Q13). A new file is created exclusively. An existing one goes through `confine.ReplaceIfUnchanged` under the publish lock (round 3, B): the live page is renamed to a private backup name, the backup is hashed (a mismatch puts it back with a no-clobber link and is a conflict), and the staged content is installed with a no-clobber link (if the name exists again, a human saved it meanwhile: the human file and the backup are both kept, and the job is a conflict); the directory is then fsynced. A human edit at any point is kept. The residual is an editor writing, after the compare, through a descriptor it already held open on the original: that write lands on the moved inode and is lost. Recovery puts back a backup whose page is missing (a kill after the move-aside) and removes one whose page already holds the new content.
 4. **Log.** One `log.md` line keyed by the job id is appended, only if no line for that job exists.
 5. **Commit.** The database marks the job done, predicated on the epoch.
 
@@ -7684,8 +8463,8 @@ func TestTakeoverWaitsForThePublishingLock(t *testing.T) {
 	}
 }
 
-// A human edit between the stage and the apply of an op: the re-hash just before the rename
-// must catch it, the file keeps the edit, and the job is a conflict.
+// A human edit between the stage and the apply of an op: the move-aside compare must catch
+// it, the file keeps the edit, and the job is a conflict.
 func TestEditBetweenStageAndApplyIsAConflict(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
@@ -8017,7 +8796,6 @@ func (p *Publisher) markDone(ctx context.Context, m *manifest, i int) error {
 	return nil
 }
 
-var errChangedBeforeRename = errors.New("the target changed between its hash check and the rename")
 
 // apply runs steps 3 to 5 from whatever state the manifest records. Recovery calls it too.
 // Operations already marked done are re-verified on disk, never trusted.
@@ -8058,7 +8836,7 @@ func (p *Publisher) apply(ctx context.Context, m *manifest) error {
 			}
 			testHookBeforeApply(i)
 			if err := p.write(op, data); err != nil {
-				if errors.Is(err, errChangedBeforeRename) || errors.Is(err, confine.ErrExist) {
+				if errors.Is(err, confine.ErrChanged) || errors.Is(err, confine.ErrExist) {
 					return p.conflict(ctx, m, op.Target+": "+err.Error())
 				}
 				return err
@@ -8104,18 +8882,16 @@ func (p *Publisher) apply(ctx context.Context, m *manifest) error {
 }
 
 // write applies one operation without clobbering: a new file is created exclusively, and an
-// existing one is replaced only if, re-read immediately before the rename, it still has the
-// base hash. The residual window is an external writer acting between that re-read and the
-// rename itself; the publish lock excludes every other Wikory writer.
+// existing one goes through confine's move-aside replace, which judges the moved-aside
+// content against the base hash and installs with a no-clobber link, so a human edit made
+// at any point is kept (spec 4.4). The publish lock excludes every other Wikory writer; the
+// stated residual is an editor writing through a descriptor already open on the original.
 func (p *Publisher) write(op *manifestOp, data []byte) error {
 	if op.Old == Absent {
 		return p.Repo.CreateExclusive(op.Target, data, fs.FileMode(op.Perm))
 	}
-	return p.Repo.WriteFileChecked(op.Target, data, fs.FileMode(op.Perm), func(current []byte, exists bool) error {
-		if !exists || HashContent(current) != op.Old {
-			return errChangedBeforeRename
-		}
-		return nil
+	return p.Repo.ReplaceIfUnchanged(op.Target, data, fs.FileMode(op.Perm), func(current []byte) bool {
+		return HashContent(current) == op.Old
 	})
 }
 
@@ -8238,7 +9014,9 @@ func (p *Publisher) Recover(ctx context.Context) (Report, error) {
 		if err := p.recordOps(ctx, &m); err != nil {
 			return rep, err
 		}
-		p.removeTemps(&m)
+		if err := p.cleanTargets(&m); err != nil {
+			return rep, err
+		}
 		if err := p.apply(ctx, &m); err != nil {
 			if errors.Is(err, ErrConflict) {
 				rep.Conflicts = append(rep.Conflicts, m.JobID)
@@ -8274,11 +9052,23 @@ func (p *Publisher) Recover(ctx context.Context) (Report, error) {
 	return rep, nil
 }
 
-// removeTemps deletes temp files an interrupted atomic write left beside the targets.
-func (p *Publisher) removeTemps(m *manifest) {
+// cleanTargets undoes what an interrupted write left beside the targets: a backup whose
+// target is missing (a kill after the move-aside) is put back, a backup whose target already
+// holds the new content is removed, and temp files are deleted. Any other backup is kept
+// beside a human file and reported by the conflict that apply then raises.
+func (p *Publisher) cleanTargets(m *manifest) error {
 	dirs := map[string]bool{}
+	newHash := map[string]string{}
 	for _, op := range m.Ops {
 		dirs[path.Dir(op.Target)] = true
+		newHash[op.Target] = op.New
+	}
+	for d := range dirs {
+		if _, err := p.Repo.RestoreBackups(d, func(target string, cur []byte) bool {
+			return HashContent(cur) == newHash[path.Join(d, target)]
+		}); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
 	}
 	for d := range dirs {
 		ents, err := p.Repo.ReadDir(d)
@@ -8291,6 +9081,7 @@ func (p *Publisher) removeTemps(m *manifest) {
 			}
 		}
 	}
+	return nil
 }
 ```
 
@@ -8369,7 +9160,7 @@ A helper process (this test binary, re-executed) begins a job and publishes the 
 | Kill step | Expected end state after recovery |
 |---|---|
 | `locked`, `staged` | nothing applied: `a.md` absent, `b.md` = `B0`, no log line, job `abandoned` |
-| `manifest`, `applied-0`, `marked-0`, `dbmarked-0`, `rename-pending` (inside op 1's checked write, after its temp file and before its rename), `applied-1`, `marked-1`, `dbmarked-1`, `appended`, `logged`, `committed` | everything applied: `a.md` = `A1`, `b.md` = `B1`, exactly one log line, job `done`, no temp files left |
+| `manifest`, `applied-0`, `marked-0`, `dbmarked-0`, `moved-1`, `compared-1`, `installed-1` (inside op 1's replace: after the move-aside, after the compare, after the install), `applied-1`, `marked-1`, `dbmarked-1`, `appended`, `logged`, `committed` | everything applied: `a.md` = `A1`, `b.md` = `B1`, exactly one log line, job `done`, no temp files left |
 
 Beyond the kill matrix, this task tests:
 - a human edit to an **already applied** page after a kill (recovery must report a conflict);
@@ -8386,10 +9177,16 @@ Beyond the kill matrix, this task tests:
 ```go
 package confine
 
-// SetBeforeRenameHook installs a hook that runs inside WriteFileAtomic after the temp file
-// is complete and before the rename. It exists for crash tests in other packages. Never
+// SetStepHook installs a hook that ReplaceIfUnchanged calls after each of its steps
+// ("moved", "compared", "installed"). It exists for crash tests in other packages. Never
 // call it outside tests.
-func SetBeforeRenameHook(f func()) { testHookBeforeRename = f }
+func SetStepHook(f func(step string)) { stepHook = f }
+
+func step(s string) {
+	if stepHook != nil {
+		stepHook(s)
+	}
+}
 ```
 
 - [ ] **Step 2: Write the failing tests**
@@ -8434,6 +9231,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -8455,8 +9253,12 @@ func publishHelper() int {
 		if step == at {
 			killSelf()
 		}
-		if at == "rename-pending" && step == "dbmarked-0" {
-			confine.SetBeforeRenameHook(killSelf) // the next checked write is op 1's, in the repository
+		if strings.HasSuffix(at, "-1") && step == "dbmarked-0" { // the next replace is op 1's
+			confine.SetStepHook(func(s string) {
+				if s+"-1" == at {
+					killSelf()
+				}
+			})
 		}
 	}
 	ctx := context.Background()
@@ -8500,7 +9302,7 @@ import (
 	"testing"
 )
 
-var appliedSteps = []string{"manifest", "applied-0", "marked-0", "dbmarked-0", "rename-pending", "applied-1", "marked-1", "dbmarked-1", "appended", "logged", "committed"}
+var appliedSteps = []string{"manifest", "applied-0", "marked-0", "dbmarked-0", "moved-1", "compared-1", "installed-1", "applied-1", "marked-1", "dbmarked-1", "appended", "logged", "committed"}
 var notAppliedSteps = []string{"locked", "staged"}
 
 // runKilled runs the helper to the named step and returns the fixture and the job id.
@@ -8526,8 +9328,8 @@ func noTemps(t *testing.T, f *fixture) {
 	t.Helper()
 	ents, _ := os.ReadDir(filepath.Join(f.repoDir, "project-memory", "wiki"))
 	for _, e := range ents {
-		if strings.HasPrefix(e.Name(), ".wikory-tmp-") {
-			t.Fatalf("temp file left behind: %s", e.Name())
+		if strings.HasPrefix(e.Name(), ".wikory-tmp-") || strings.HasPrefix(e.Name(), ".wikory-backup-") {
+			t.Fatalf("temp or backup file left behind: %s", e.Name())
 		}
 	}
 }
@@ -8645,12 +9447,37 @@ func TestRecoveryFencesTheOldHolder(t *testing.T) {
 		t.Fatalf("recovery did not take the lease over: epoch %d -> %d", epoch, after)
 	}
 }
+
+// Kill after op 1's live page was moved aside, then a human saves the page (the name is
+// free, so the save creates it): recovery keeps the human file, keeps the backup beside it,
+// and reports the conflict; neither version is lost.
+func TestHumanSaveAfterAKilledMoveAsideKeepsBothVersions(t *testing.T) {
+	ctx := context.Background()
+	f, id := runKilled(t, "moved-1")
+	f.writeRepo(t, "project-memory/wiki/b.md", "HUMAN EDIT")
+	rep, err := f.publisher("co-1").Recover(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := f.readRepo(t, "project-memory/wiki/b.md")
+	backup := ""
+	ents, _ := os.ReadDir(filepath.Join(f.repoDir, "project-memory", "wiki"))
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), ".wikory-backup-b.md-") {
+			data, _ := os.ReadFile(filepath.Join(f.repoDir, "project-memory", "wiki", e.Name()))
+			backup = string(data)
+		}
+	}
+	if len(rep.Conflicts) != 1 || b != "HUMAN EDIT" || backup != "B0" || f.jobState(t, id) != "conflict" {
+		t.Fatalf("rep=%+v b=%q backup=%q state=%s", rep, b, backup, f.jobState(t, id))
+	}
+}
 ```
 
 - [ ] **Step 3: Run them to see them fail, then pass**
 
 Run: `go test -run 'TestKill|TestHumanEdit|TestRecoveryNever' -v ./internal/publish/`
-Expected before Step 1's file exists: FAIL to compile, `undefined: confine.SetBeforeRenameHook`. After it exists: every subtest `PASS`. If any `applied` step fails, that is a real recovery bug: fix `apply` or `Recover`, not the test.
+Expected before Step 1's file exists: FAIL to compile, `undefined: confine.SetStepHook`. After it exists: every subtest `PASS`. If any `applied` step fails, that is a real recovery bug: fix `apply` or `Recover`, not the test.
 
 - [ ] **Step 4: Fault injection**
 
@@ -8661,12 +9488,14 @@ Each row names the fault and the failure predicted **before** running it. Every 
 | A13-1 | recovery overwrites unexpected content | *survives*: the re-hash immediately before the rename (row A13-8) still refuses the overwrite: two independent guards. | SURVIVED (predicted) |
 | A13-2 | log append not idempotent | `TestKillAtEachStepThenRecover/appended`: two log lines (failure text: `a="A1" b="B1" log=2 state=done`) | RED |
 | A13-3 | recovery ignores checkout binding | `TestRecoveryNeverAppliesAnotherCheckoutsJob (failure text: `another checkout`) | RED |
-| A13-4 | temps not removed | `TestKillAtEachStepThenRecover/rename-pending`: temp file left (failure text: `temp file left behind`) | RED |
+| A13-4 | temps not removed | `TestKillAtEachStepThenRecover/compared-1`: the temp file of op 1 is left (failure text: `temp or backup file left behind: .wikory-tmp-b.md-`) | RED |
 | A13-5 | jobs without a manifest never abandoned | `TestKillAtEachStepThenRecover/staged` (failure text: `aExists=false b="B0" log=0 state=begun rep={Completed:[] Conflicts:[]`) | RED |
 | A13-6 | an already-marked operation is trusted, not re-verified | `TestHumanEditOfAnAlreadyAppliedPageIsAConflict`: recovery completes silently (failure text: `an edit to an applied page was not reported: rep={Completed:[job_01M6B`) | RED |
 | A13-7 | recovery ignores a branch switch | `TestRecoveryRefusesAfterABranchSwitch`: the job is applied across the switch (failure text: `recovery applied a job across a branch switch: rep={Completed:[job_01M`) | RED |
 | A13-8 | recovery does not take the lease over | `TestRecoveryFencesTheOldHolder` (failure text: `recovery did not take the lease over: epoch 1 -> 1`) | RED |
-| A13-9 | no re-hash immediately before the rename | `TestEditBetweenStageAndApplyIsAConflict`: the edit made between stage and apply is overwritten (failure text: `err=<nil> b="B1" state=done`) | RED |
+| A13-9 | the moved-aside page is not judged against the base hash | `TestEditBetweenStageAndApplyIsAConflict`: the human edit is overwritten (failure text: `err=<nil> b="B1" state=done`) | RED |
+| A13-10 | a backup whose target is missing is not put back | `TestKillAtEachStepThenRecover/moved-1`: `b.md` stays missing and the job conflicts (failure text: `b=""`) | RED |
+| A13-11 | a backup whose target already holds the new content is kept | `TestKillAtEachStepThenRecover/installed-1` (failure text: `temp or backup file left behind: .wikory-backup-b.md-`) | RED |
 
 ```bash
 # A13-1: recovery overwrites unexpected content
@@ -8679,7 +9508,7 @@ scripts/inject.sh internal/publish/publish.go '	if !strings.Contains(string(data
 scripts/inject.sh internal/publish/recover.go '		if m.CheckoutID != p.CheckoutID {' '		if false {' ./internal/publish/ 'TestRecoveryNeverAppliesAnotherCheckoutsJob' 'another checkout'
 
 # A13-4: temps not removed
-scripts/inject.sh internal/publish/recover.go '		p.removeTemps(&m)' '		_ = m' ./internal/publish/ 'TestKillAtEachStepThenRecover/rename-pending' 'temp file left behind'
+scripts/inject.sh internal/publish/recover.go '			if strings.HasPrefix(e.Name(), confine.TempPrefix) {' '			if false && strings.HasPrefix(e.Name(), confine.TempPrefix) {' ./internal/publish/ '^TestKillAtEachStepThenRecover$/^compared-1$' 'temp or backup file left behind: .wikory-tmp-b.md-'
 
 # A13-5: jobs without a manifest never abandoned
 scripts/inject.sh internal/publish/recover.go '		if !withManifest[id] && p.Now().Sub(t) >= p.AbandonAfter {' '		if false && !withManifest[id] && p.Now().Sub(t) >= p.AbandonAfter {' ./internal/publish/ 'TestKillAtEachStepThenRecover/staged' 'aExists=false b="B0" log=0 state=begun rep={Completed:[] Conflicts:[]'
@@ -8693,8 +9522,14 @@ scripts/inject.sh internal/publish/recover.go '		if fp != m.Fingerprint {' '		if
 # A13-8: recovery does not take the lease over
 scripts/inject.sh internal/publish/recover.go '		j, err := p.takeoverLocked(ctx, m.JobID)' '		j, err := Job{Epoch: m.Epoch}, error(nil)' ./internal/publish/ 'TestRecoveryFencesTheOldHolder' 'recovery did not take the lease over: epoch 1 -> 1'
 
-# A13-9: no re-hash immediately before the rename
-scripts/inject.sh internal/publish/publish.go '		if !exists || HashContent(current) != op.Old {' '		if false && (!exists || HashContent(current) != op.Old) {' ./internal/publish/ 'TestEditBetweenStageAndApplyIsAConflict' 'err=<nil> b="B1" state=done'
+# A13-9: the moved-aside page is not judged against the base hash
+scripts/inject.sh internal/publish/publish.go '		return HashContent(current) == op.Old' '		return true' ./internal/publish/ '^TestEditBetweenStageAndApplyIsAConflict$' 'err=<nil> b="B1" state=done'
+
+# A13-10: a backup whose target is missing is not put back
+scripts/inject.sh internal/publish/recover.go '		if _, err := p.Repo.RestoreBackups(d, func(target string, cur []byte) bool {' '		if _, err := p.Repo.RestoreBackups(d+"/none", func(target string, cur []byte) bool {' ./internal/publish/ '^TestKillAtEachStepThenRecover$/^moved-1$' 'b=""'
+
+# A13-11: a backup whose target already holds the new content is kept
+scripts/inject.sh internal/publish/recover.go '			return HashContent(cur) == newHash[path.Join(d, target)]' '			return false && HashContent(cur) == newHash[path.Join(d, target)]' ./internal/publish/ '^TestKillAtEachStepThenRecover$/^installed-1$' 'temp or backup file left behind: .wikory-backup-b.md-'
 ```
 
 Expected: `RED as predicted` (exit 0) for every row except those marked *survives* (`SURVIVED`, exit 1). Append each verdict to `docs/spikes/results/fault-log-A13.section.md`.
@@ -9509,9 +10344,9 @@ git commit -m "feat(app): add wikory init with project id, trust record and reco
 **Depends on:** S14 (fixtures in `internal/decode/testdata/claude-2.1.316/`).
 
 **Interfaces:**
-- Produces: `decode.Kind` with `decode.SessionStart`, `decode.UserPrompt`, `decode.Stop`, `decode.SubagentStop`, `decode.PreCompact`, `decode.SessionEnd`; `type decode.Event struct { Kind; Harness, SessionID, PromptID, TranscriptPath, Cwd, Source, Prompt, LastAssistantMessage, AgentID, AgentType string; StopHookActive bool }`; `decode.ErrMalformed`; `decode.MaxPayload = 1 << 20`; `claude.KindFromArg(arg string) (decode.Kind, bool)` (`session-start`, `user-prompt-submit`, `stop`, `subagent-stop`, `pre-compact`, `session-end`); `claude.Decode(kind decode.Kind, r io.Reader) (decode.Event, error)`.
+- Produces: `decode.Kind` with `decode.SessionStart`, `decode.UserPrompt`, `decode.Stop`, `decode.SubagentStop`, `decode.PreCompact`, `decode.SessionEnd`; `type decode.Event struct { Kind; Harness, SessionID, PromptID, TranscriptPath, Cwd, Source, Prompt, LastAssistantMessage, AgentID, AgentType, AgentTranscriptPath string; StopHookActive bool; BackgroundTasks int }`; `decode.ErrMalformed`; `decode.MaxPayload = 1 << 20`; `claude.KindFromArg(arg string) (decode.Kind, bool)` (`session-start`, `user-prompt-submit`, `stop`, `subagent-stop`, `pre-compact`, `session-end`); `claude.Decode(kind decode.Kind, r io.Reader) (decode.Event, error)`.
 
-The struct tags below follow the documented field names. **If S14's consequences list records a different name for any field (V06), change the tag to match the committed fixture before Step 4**; the fixture test is what proves the decoder against the real 2.1.316 payload. Unknown fields are tolerated (forward compatibility); a mismatched `hook_event_name`, a missing `session_id`, a relative `cwd` or `transcript_path`, or an oversized payload is malformed.
+The struct tags follow the committed 2.1.316 fixtures. V06 (verified): Stop carries `session_id`, `transcript_path`, `cwd`, `hook_event_name`, `prompt_id`, `stop_hook_active` and `last_assistant_message`, plus `effort`, `permission_mode`, `background_tasks` and `session_crons`, which are ignored except `background_tasks` (counted). V07: `prompt_id` is identical in UserPromptSubmit, Stop and SessionEnd and absent from SessionStart, so it is the primary turn id source. V13: subagents share the parent's `session_id`, so the decoder carries `agent_id`, `agent_type` and `agent_transcript_path`, and self-exclusion keys on them, never on `session_id`. V15: a parent Stop can fire while `background_tasks` still lists a running agent, followed by a task-notification prompt and a second Stop; each is its own turn; the fixture test is what proves the decoder against the real 2.1.316 payload. Unknown fields are tolerated (forward compatibility); a mismatched `hook_event_name`, a missing `session_id`, a relative `cwd` or `transcript_path`, or an oversized payload is malformed.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -9577,9 +10412,14 @@ func TestDecodeRealFixtures(t *testing.T) {
 		}
 	}
 	if optionalFixture(t, "subagent-stop.json") {
-		if sub := decodeFixture(t, "subagent-stop.json", decode.SubagentStop); sub.AgentType == "" {
-			t.Fatal("subagent stop should carry agent_type")
+		sub := decodeFixture(t, "subagent-stop.json", decode.SubagentStop)
+		if sub.AgentType == "" || sub.AgentID == "" || sub.AgentTranscriptPath == "" || sub.BackgroundTasks == 0 {
+			t.Fatalf("subagent stop should carry agent_id, agent_type, agent_transcript_path and background_tasks (V13, V15): %+v", sub)
 		}
+	}
+	// V07: SessionEnd carries the same prompt_id; SessionStart carries none.
+	if end := decodeFixture(t, "session-end.json", decode.SessionEnd); end.PromptID != stop.PromptID || ss.PromptID != "" {
+		t.Fatalf("prompt_id session-end=%q stop=%q session-start=%q", end.PromptID, stop.PromptID, ss.PromptID)
 	}
 }
 
@@ -9678,8 +10518,10 @@ type Event struct {
 	Prompt               string
 	LastAssistantMessage string
 	StopHookActive       bool
-	AgentID              string
+	AgentID              string // set on a subagent's events; subagents share the parent's SessionID (V13)
 	AgentType            string
+	AgentTranscriptPath  string
+	BackgroundTasks      int // background tasks still listed on a Stop or SubagentStop (V15)
 }
 ```
 
@@ -9728,9 +10570,14 @@ type payload struct {
 	Prompt               string `json:"prompt"`
 	StopHookActive       bool   `json:"stop_hook_active"`
 	LastAssistantMessage string `json:"last_assistant_message"`
-	AgentID              string `json:"agent_id"`
-	AgentType            string `json:"agent_type"`
+	AgentID              string            `json:"agent_id"`
+	AgentType            string            `json:"agent_type"`
+	AgentTranscriptPath  string            `json:"agent_transcript_path"`
+	BackgroundTasks      []json.RawMessage `json:"background_tasks"`
 }
+
+// payload follows the committed 2.1.316 fixtures (V06). Unknown keys (effort,
+// permission_mode, session_crons, tool_* and any later additions) are ignored.
 
 var winAbs = regexp.MustCompile(`^([A-Za-z]:[\\/]|\\\\)`)
 
@@ -9763,13 +10610,16 @@ func Decode(kind decode.Kind, r io.Reader) (decode.Event, error) {
 	if p.Cwd == "" || !isAbs(p.Cwd) {
 		return decode.Event{}, malformed("cwd %q is not absolute", p.Cwd)
 	}
-	if p.TranscriptPath != "" && !isAbs(p.TranscriptPath) {
-		return decode.Event{}, malformed("transcript_path %q is not absolute", p.TranscriptPath)
+	for _, tp := range []string{p.TranscriptPath, p.AgentTranscriptPath} {
+		if tp != "" && !isAbs(tp) {
+			return decode.Event{}, malformed("transcript path %q is not absolute", tp)
+		}
 	}
 	return decode.Event{Kind: kind, Harness: Harness, SessionID: p.SessionID, PromptID: p.PromptID,
 		TranscriptPath: p.TranscriptPath, Cwd: p.Cwd, Source: p.Source, Prompt: p.Prompt,
 		LastAssistantMessage: p.LastAssistantMessage, StopHookActive: p.StopHookActive,
-		AgentID: p.AgentID, AgentType: p.AgentType}, nil
+		AgentID: p.AgentID, AgentType: p.AgentType, AgentTranscriptPath: p.AgentTranscriptPath,
+		BackgroundTasks: len(p.BackgroundTasks)}, nil
 }
 ```
 
@@ -9788,6 +10638,7 @@ Each row names the fault and the failure predicted **before** running it. Every 
 | A16-2 | size bound off by the whole limit | `TestDecodeRejectsMalformed`: the oversized case fails as bad JSON instead of with a size error (failure text: `oversized: want a size error`) | RED |
 | A16-3 | stop_hook_active tag wrong | `TestDecodeRealFixtures` continuation assertion (requires the S9 fixture; if it is absent this fault survives and that is recorded) | run after S14 (needs the committed fixtures) |
 | A16-4 | prompt_id tag wrong | `TestDecodeRealFixtures`: prompt ids empty | run after S14 (needs the committed fixtures) |
+| A16-5 | `agent_transcript_path` not decoded | `TestDecodeRealFixtures` on the committed `subagent-stop.json` (failure text: `should carry agent_id, agent_type, agent_transcript_path`) | RED |
 
 ```bash
 # A16-1: event name not checked
@@ -9801,6 +10652,9 @@ scripts/inject.sh internal/decode/claude/hook.go '`json:"stop_hook_active"`' '`j
 
 # A16-4: prompt_id tag wrong
 scripts/inject.sh internal/decode/claude/hook.go '`json:"prompt_id"`' '`json:"promptid"`' ./internal/decode/claude/ 'TestDecodeRealFixtures' 'prompt_id ups='
+
+# A16-5: agent_transcript_path not decoded
+scripts/inject.sh internal/decode/claude/hook.go '		AgentID: p.AgentID, AgentType: p.AgentType, AgentTranscriptPath: p.AgentTranscriptPath,' '		AgentID: p.AgentID, AgentType: p.AgentType, AgentTranscriptPath: "",' ./internal/decode/claude/ '^TestDecodeRealFixtures$' 'should carry agent_id, agent_type, agent_transcript_path'
 ```
 
 Expected: `RED as predicted` (exit 0) for every row except those marked *survives* (`SURVIVED`, exit 1). Append each verdict to `docs/spikes/results/fault-log-A16.section.md`.
@@ -9823,10 +10677,10 @@ git commit -m "feat(decode): add Claude Code hook payload decoder tested on real
 
 **Depends on:** A16, S6 (fixture `transcript-tool-use.jsonl`).
 
-The transcript is written asynchronously (spec 6), so the decoder reads only complete lines from a start offset and leaves a trailing partial line for the next read. Field names follow the S6 fixture: assistant lines carry `message.content[]` blocks of `type` `text` or `tool_use` (`id`, `name`, `input`), user lines carry `tool_result` blocks (`tool_use_id`, `is_error`). If S14 recorded different shapes, change the structs to the fixture before Step 4.
+The transcript is written asynchronously (spec 6), so the decoder reads only complete lines from a start offset and leaves a trailing partial line for the next read. Field names follow the S6 fixture: assistant lines carry `message.content[]` blocks of `type` `text` or `tool_use` (`id`, `name`, `input`), user lines carry `tool_result` blocks (`tool_use_id`, `is_error`). S14 confirmed these shapes and added three facts the decoder applies. User lines carry `promptId`, equal to the hooks' `prompt_id` (evidence S5 and S9), and assistant lines inherit the most recent one. Hook continuation reasons are `user` lines with `isMeta: true` (V17). And 90 to 97 percent of a raw transcript is `attachment` and `api-request*` lines (V25). So only `user` and `assistant` lines that are not `isMeta` are turn content; every other line is counted in `Ignored` and dropped at the source.
 
 **Interfaces:**
-- Produces: `type claude.ToolUse struct { ID, Name, FilePath, Command string; Offset int64 }`; `type claude.Message struct { Text string; End int64 }`; `type claude.ToolResult struct { ToolUseID string; IsError bool }`; `type claude.Slice struct { AssistantMessages []Message; ToolUses []ToolUse; Results map[string]ToolResult; End int64; Lines, Skipped int }`; `claude.ReadSlice(r io.ReaderAt, start, limit int64) (Slice, error)`. `AssistantMessages` holds the joined text of each assistant line, in order. `End` is the absolute offset after the last complete line read.
+- Produces: `type claude.ToolUse struct { ID, Name, FilePath, Command string; Offset int64; PromptID string }`; `type claude.Message struct { Text string; End int64; PromptID string }`; `type claude.ToolResult struct { ToolUseID string; IsError bool; Offset int64; PromptID string }`; `type claude.Slice struct { AssistantMessages []Message; ToolUses []ToolUse; Results map[string]ToolResult; End int64; Lines, Skipped, Ignored int }`; `(Slice).ForPrompt(id string) Slice`; `(Slice).Before(limit int64) Slice`; `claude.ReadSlice(r io.ReaderAt, start, limit int64) (Slice, error)`. `AssistantMessages` holds the joined text of each assistant line, in order. `End` is the absolute offset after the last complete line read.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -9901,6 +10755,30 @@ func TestReadSliceRealFixture(t *testing.T) {
 		t.Fatalf("the Bash ttyprobe call and its result were not decoded: %+v", s.ToolUses)
 	}
 }
+
+// Assistant lines inherit the prompt identity of the user line before them; hook
+// continuation lines (isMeta) and non-conversational lines are never turn content.
+func TestReadSliceTracksPromptIdentityAndDropsMetaLines(t *testing.T) {
+	in := `{"type":"user","promptId":"p1","message":{"role":"user","content":"one"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"a1","name":"Bash","input":{"command":"go test ./a"}}]}}
+{"type":"user","promptId":"p1","isMeta":true,"message":{"role":"user","content":"Stop hook feedback:\nWIKORY CONTINUATION"}}
+{"type":"attachment","attachment":{"type":"text","content":[{"type":"text","text":"ATTACHED"}]}}
+{"type":"api-request-blob","message":{"content":[{"type":"text","text":"BLOB"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}
+{"type":"user","promptId":"p2","message":{"role":"user","content":"two"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}
+`
+	s, err := ReadSlice(strings.NewReader(in), 0, int64(len(in)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Ignored != 3 || len(s.AssistantMessages) != 2 || len(s.ToolUses) != 1 {
+		t.Fatalf("meta or non-conversational lines were decoded as content: %+v", s)
+	}
+	if s.ToolUses[0].PromptID != "p1" || s.AssistantMessages[0].PromptID != "p1" || s.AssistantMessages[1].PromptID != "p2" {
+		t.Fatalf("prompt identity not inherited: %+v", s)
+	}
+}
 ```
 
 - [ ] **Step 2: Run it to see it fail**
@@ -9931,18 +10809,22 @@ type ToolUse struct {
 	FilePath string
 	Command  string
 	Offset   int64
+	PromptID string // the turn identity in force at this line; "" when the harness wrote none
 }
 
 // Message is the joined text of one assistant line and the absolute offset just after it.
 type Message struct {
-	Text string
-	End  int64
+	Text     string
+	End      int64
+	PromptID string
 }
 
 // ToolResult is the harness-recorded result of a tool call.
 type ToolResult struct {
 	ToolUseID string
 	IsError   bool
+	Offset    int64
+	PromptID  string
 }
 
 // Slice is what a transcript range contains.
@@ -9952,12 +10834,19 @@ type Slice struct {
 	Results           map[string]ToolResult
 	End               int64
 	Lines             int
-	Skipped           int
+	Skipped           int // lines that are not valid JSON
+	Ignored           int // non-conversational and meta lines, never turn content (V17, V25)
+	prompt            string
 }
 
+// tline is one transcript line. On Claude Code 2.1.316 user lines carry promptId, equal to
+// the hooks' prompt_id (V07, evidence S5 and S9); assistant lines carry none and belong to
+// the most recent user line's prompt.
 type tline struct {
-	Type    string `json:"type"`
-	Message struct {
+	Type     string `json:"type"`
+	IsMeta   bool   `json:"isMeta"`
+	PromptID string `json:"promptId"`
+	Message  struct {
 		Content json.RawMessage `json:"content"`
 	} `json:"message"`
 }
@@ -10005,6 +10894,15 @@ func (s *Slice) decodeLine(line []byte, at, end int64) {
 		s.Skipped++
 		return
 	}
+	if l.Type == "user" && l.PromptID != "" {
+		s.prompt = l.PromptID
+	}
+	// Only conversational lines are turn content. Hook continuation reasons are user lines
+	// with isMeta (V17); attachment, api-request* and the bookkeeping types are dropped (V25).
+	if (l.Type != "user" && l.Type != "assistant") || l.IsMeta {
+		s.Ignored++
+		return
+	}
 	var blocks []block
 	if len(l.Message.Content) > 0 && l.Message.Content[0] == '[' {
 		if json.Unmarshal(l.Message.Content, &blocks) != nil {
@@ -10020,7 +10918,7 @@ func (s *Slice) decodeLine(line []byte, at, end int64) {
 				texts = append(texts, b.Text)
 			}
 		case "tool_use":
-			u := ToolUse{ID: b.ID, Name: b.Name, Command: b.Input.Command, Offset: at}
+			u := ToolUse{ID: b.ID, Name: b.Name, Command: b.Input.Command, Offset: at, PromptID: s.prompt}
 			if editTools[b.Name] {
 				u.FilePath = b.Input.FilePath
 				if u.FilePath == "" {
@@ -10029,12 +10927,54 @@ func (s *Slice) decodeLine(line []byte, at, end int64) {
 			}
 			s.ToolUses = append(s.ToolUses, u)
 		case "tool_result":
-			s.Results[b.ToolUseID] = ToolResult{ToolUseID: b.ToolUseID, IsError: b.IsError}
+			s.Results[b.ToolUseID] = ToolResult{ToolUseID: b.ToolUseID, IsError: b.IsError, Offset: at, PromptID: s.prompt}
 		}
 	}
 	if len(texts) > 0 {
-		s.AssistantMessages = append(s.AssistantMessages, Message{Text: strings.Join(texts, "\n"), End: end})
+		s.AssistantMessages = append(s.AssistantMessages, Message{Text: strings.Join(texts, "\n"), End: end, PromptID: s.prompt})
 	}
+}
+
+// ForPrompt keeps only the facts carrying prompt id.
+func (s Slice) ForPrompt(id string) Slice {
+	out := Slice{Results: map[string]ToolResult{}, End: s.End, Lines: s.Lines, Skipped: s.Skipped, Ignored: s.Ignored}
+	for _, m := range s.AssistantMessages {
+		if m.PromptID == id {
+			out.AssistantMessages = append(out.AssistantMessages, m)
+		}
+	}
+	for _, u := range s.ToolUses {
+		if u.PromptID == id {
+			out.ToolUses = append(out.ToolUses, u)
+		}
+	}
+	for k, v := range s.Results {
+		if v.PromptID == id {
+			out.Results[k] = v
+		}
+	}
+	return out
+}
+
+// Before keeps only the facts on lines that start before the absolute offset limit.
+func (s Slice) Before(limit int64) Slice {
+	out := Slice{Results: map[string]ToolResult{}, End: min(s.End, limit), Lines: s.Lines, Skipped: s.Skipped, Ignored: s.Ignored}
+	for _, m := range s.AssistantMessages {
+		if m.End <= limit {
+			out.AssistantMessages = append(out.AssistantMessages, m)
+		}
+	}
+	for _, u := range s.ToolUses {
+		if u.Offset < limit {
+			out.ToolUses = append(out.ToolUses, u)
+		}
+	}
+	for k, v := range s.Results {
+		if v.Offset < limit {
+			out.Results[k] = v
+		}
+	}
+	return out
 }
 ```
 
@@ -10051,13 +10991,21 @@ Each row names the fault and the failure predicted **before** running it. Every 
 |---|---|---|---|
 | A17-1 | a partial trailing line is consumed | `TestReadSliceSynthetic` reports `End` past the partial line. (failure text: `End=689, want 644 (the partial last line must be left unread)`) | RED |
 | A17-2 | tool use offsets not recorded | `TestReadSliceSynthetic`: offsets out of order (failure text: `tool use offsets out of order: [{ID:t1 Name:Bash FilePath: Command:go`) | RED |
+| A17-3 | assistant lines do not inherit the prompt identity | `TestReadSliceTracksPromptIdentityAndDropsMetaLines` (failure text: `prompt identity not inherited`) | RED |
+| A17-4 | hook continuation lines (`isMeta`) decoded as turn content | `TestReadSliceTracksPromptIdentityAndDropsMetaLines` (failure text: `meta or non-conversational lines were decoded as content`) | RED |
 
 ```bash
 # A17-1: a partial trailing line is consumed
 scripts/inject.sh internal/decode/claude/transcript.go '		if len(line) > 0 && line[len(line)-1] == '"'"'\n'"'"' {' '		if len(line) > 0 {' ./internal/decode/claude/ 'TestReadSliceSynthetic' 'End=689, want 644 (the partial last line must be left unread)'
 
 # A17-2: tool use offsets not recorded
-scripts/inject.sh internal/decode/claude/transcript.go '			u := ToolUse{ID: b.ID, Name: b.Name, Command: b.Input.Command, Offset: at}' '			u := ToolUse{ID: b.ID, Name: b.Name, Command: b.Input.Command}' ./internal/decode/claude/ 'TestReadSliceSynthetic' 'tool use offsets out of order: [{ID:t1 Name:Bash FilePath: Command:go'
+scripts/inject.sh internal/decode/claude/transcript.go '			u := ToolUse{ID: b.ID, Name: b.Name, Command: b.Input.Command, Offset: at, PromptID: s.prompt}' '			u := ToolUse{ID: b.ID, Name: b.Name, Command: b.Input.Command, PromptID: s.prompt}' ./internal/decode/claude/ 'TestReadSliceSynthetic' 'tool use offsets out of order: [{ID:t1 Name:Bash FilePath: Command:go'
+
+# A17-3: assistant lines do not inherit the prompt identity
+scripts/inject.sh internal/decode/claude/transcript.go '	if l.Type == "user" && l.PromptID != "" {' '	if false && l.Type == "user" && l.PromptID != "" {' ./internal/decode/claude/ '^TestReadSliceTracksPromptIdentityAndDropsMetaLines$' 'prompt identity not inherited'
+
+# A17-4: hook continuation lines (isMeta) decoded as turn content
+scripts/inject.sh internal/decode/claude/transcript.go '	if (l.Type != "user" && l.Type != "assistant") || l.IsMeta {' '	if l.Type != "user" && l.Type != "assistant" {' ./internal/decode/claude/ '^TestReadSliceTracksPromptIdentityAndDropsMetaLines$' 'meta or non-conversational lines were decoded as content'
 ```
 
 Expected: `RED as predicted` (exit 0) for every row except those marked *survives* (`SURVIVED`, exit 1). Append each verdict to `docs/spikes/results/fault-log-A17.section.md`.
@@ -10086,16 +11034,18 @@ git commit -m "feat(decode): add Claude Code transcript slice decoder tolerant o
   - `type capture.Recorder struct { Store *store.Store; CheckoutID string; Repo *gitx.Repo; RepoRoot *confine.Root; TranscriptRoots []string; Now func() time.Time; SealTimeout, StaleMarkerAfter time.Duration }`
   - `(*Recorder).TurnStart(ctx, ev decode.Event) error`
   - `(*Recorder).Stop(ctx, ev decode.Event) (turnID string, created bool, err error)`
-  - `(*Recorder).transition(ctx, turnID string, from int, next Record, allowed func(state string, stub bool) bool) (bool, error)` (package-internal, tested directly); `testHookBeforeTransition func(turnID string)`
+  - `(*Recorder).transition(ctx, turnID string, from int, next Record, allowed func(state string, stub bool) bool) (Record, bool, error)` (returns the record actually published, the adopted file when one was on disk; package-internal, tested directly); `testHookBeforeTransition func(turnID string)`
   - turn files: `turns/<checkout>/<turn_id>/v0001.json`, `v0002.json`, ... in the private store, each created exclusively and never rewritten
 
 Rules implemented (spec 6, step 2):
-- **Identity.** `turn_id` is a deterministic hash of the session id and the turn-start marker. The marker is the payload's `prompt_id` when present (V07), else the stored UserPromptSubmit marker, else one derived from the transcript size at Stop.
+- **Identity.** `turn_id` is a deterministic hash of the session id and the turn-start marker. The marker is the payload's `prompt_id` when present (V07, verified), else the stored UserPromptSubmit marker, else one derived from the transcript size at Stop. The final message comes from `last_assistant_message`: the transcript holds no assistant line at Stop time (V08).
+- **Orphan repair continues (round 3, C).** A crash after a stub's file but before its row is repaired from the file, and the Stop then continues into stub completion, so the repaired stub is completed once instead of left in place.
+- **No absolute paths (round 3, E).** A transcript pointer is `{root, rel, id}`: the digest of the approved root, the redacted slash path below it, and a content-independent id. `turn_starts.transcript_path` stores `<root digest>:<rel>`. A transcript is reopened only through the approved root whose digest matches; a relative path the redactor altered no longer opens, so that turn seals incomplete.
 - **Create-if-absent.** The record is created only if absent: an exclusive hard-link create, then `INSERT ... ON CONFLICT DO NOTHING`. A duplicate Stop never overwrites.
 - **Serialised transitions (fix 3).** Every later change is one serialised transition. Inside a single immediate transaction (the database write lock), it re-reads the row and yields if the version moved or the state forbids the change. It then writes the immutable file for version N+1, adopting that file if a crashed earlier attempt already wrote it, and publishes the row **from the content of the file actually on disk**. So the row and the file always agree, and no transition can rewind a turn. Sealing and stub completion share this mechanism.
 - **Stub completion (Q7, accepted).** A late Stop may complete an interrupted stub once, while it is still `captured`. This is the single permitted change to an existing record through a Stop; a sealed record, stub or not, never changes.
 - **Exclusion.** Memory subagents (`agent_type` starting `wikory-`) are excluded.
-- **Redaction (fix 4).** Every persisted text field is redacted **before** it is truncated and written: the request (in both the turn file and `turn_starts`), the final message, commands, verification commands, file paths and git paths. This happens in one place, `redactRecord`, called by `writeVersion`, so truncation can never split a secret into a shape the redactor misses. Caps: request 2,000 characters, final message 4,000, each command 2,000.
+- **Redaction (fix 4).** Every persisted text field is redacted **before** it is truncated and written: the request (in both the turn file and `turn_starts`), the final message, commands, verification commands, file paths, git paths and the branch name. This happens in one place, `redactRecord`, called by `writeVersion`, so truncation can never split a secret into a shape the redactor misses. Caps: request 2,000 characters, final message 4,000, each command 2,000.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -10230,6 +11180,9 @@ package capture
 
 import (
 	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -10344,15 +11297,15 @@ func TestStaleTransitionNeverRewindsVersion(t *testing.T) {
 	rec, _ := r.rec.readVersion(id, 1)
 	next := rec
 	next.State = "captured"
-	if ok, err := r.rec.transition(ctx, id, 1, next, func(string, bool) bool { return true }); !ok || err != nil {
+	if _, ok, err := r.rec.transition(ctx, id, 1, next, func(string, bool) bool { return true }); !ok || err != nil {
 		t.Fatalf("first transition: %v %v", ok, err)
 	}
-	if ok, err := r.rec.transition(ctx, id, 2, next, func(string, bool) bool { return true }); !ok || err != nil {
+	if _, ok, err := r.rec.transition(ctx, id, 2, next, func(string, bool) bool { return true }); !ok || err != nil {
 		t.Fatalf("second transition: %v %v", ok, err)
 	}
 	stale := rec
 	stale.State = "sealed"
-	if ok, err := r.rec.transition(ctx, id, 1, stale, func(string, bool) bool { return true }); ok || err != nil {
+	if _, ok, err := r.rec.transition(ctx, id, 1, stale, func(string, bool) bool { return true }); ok || err != nil {
 		t.Fatalf("a transition from version 1 must yield once the turn is at version 3: ok=%v err=%v", ok, err)
 	}
 	if _, version, _, _ := r.row(t, id); version != 3 {
@@ -10375,7 +11328,7 @@ func TestOrphanedVersionFileIsAdopted(t *testing.T) {
 	}
 	proposed := rec
 	proposed.State = "sealed"
-	if ok, err := r.rec.transition(ctx, id, 1, proposed, func(string, bool) bool { return true }); !ok || err != nil {
+	if _, ok, err := r.rec.transition(ctx, id, 1, proposed, func(string, bool) bool { return true }); !ok || err != nil {
 		t.Fatalf("%v %v", ok, err)
 	}
 	if state, version, _, outcome := r.row(t, id); state != "captured" || version != 2 || outcome != "orphan-from-a-crash" {
@@ -10427,6 +11380,57 @@ func TestCrashBetweenFileAndRowIsRepaired(t *testing.T) {
 		t.Fatalf("row not repaired: %s %d", state, version)
 	}
 }
+
+// A crash after an interrupted stub's file was written but before its row: the next Stop
+// for that turn repairs the row from the file and then completes the stub, once.
+func TestRepairedOrphanStubIsCompletedByItsStop(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t)
+	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "x", "p1", ""))
+	stub := Record{Schema: RecordSchema, TurnID: TurnID("sess-1", "p1"), Version: 1, State: "captured", Outcome: "interrupted",
+		Stub: true, Harness: "claude-code", SessionID: "sess-1", Marker: "p1", CheckoutID: r.rec.CheckoutID,
+		SummaryOrigin: "deterministic", CapturedAt: r.rec.stamp()}
+	if err := r.rec.writeVersion(&stub); err != nil { // the stub file exists, its row does not
+		t.Fatal(err)
+	}
+	if _, _, err := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "late answer")); err != nil {
+		t.Fatal(err)
+	}
+	state, version, isStub, outcome := r.row(t, stub.TurnID)
+	if state != "captured" || version != 2 || isStub || outcome != "completed" || len(r.versions(t, stub.TurnID)) != 2 {
+		t.Fatalf("the repaired stub was not completed: %s v%d stub=%v %s %v", state, version, isStub, outcome, r.versions(t, stub.TurnID))
+	}
+}
+
+// Every persisted string is redacted, metadata included: a token-shaped branch name and
+// file name never reach the store, and no absolute transcript path is persisted.
+func TestMetadataIsRedactedAndNoAbsolutePathIsStored(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t)
+	tok := "ghp_" + strings.Repeat("A1b2", 9)
+	for _, args := range [][]string{{"checkout", "-q", "-b", "fix-" + tok}} {
+		if out, err := exec.Command("git", append([]string{"-C", r.repoDir}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("%v %s", err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(r.repoDir, "notes-"+tok+".txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "x", "p1", ""))
+	id, _, err := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "y"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := r.readVersion(t, id, "v0001.json")
+	var stored string
+	_ = r.rec.Store.DB.QueryRow(`SELECT transcript_path FROM turn_starts WHERE marker = 'p1'`).Scan(&stored)
+	if strings.Contains(body, tok) || strings.Contains(stored, tok) || !strings.Contains(body, `"branch": "fix-`) {
+		t.Fatalf("a token-shaped branch or file name was persisted:\n%s", body)
+	}
+	if strings.Contains(body, r.transcript) || strings.Contains(stored, r.transcript) || filepath.IsAbs(stored) || !strings.Contains(body, `"rel": "session.jsonl"`) {
+		t.Fatalf("an absolute transcript path was persisted: %q\n%s", stored, body)
+	}
+}
 ```
 
 - [ ] **Step 2: Run them to see them fail**
@@ -10451,9 +11455,13 @@ const RecordSchema = "wikory.turn/v1"
 // TurnID is deterministic, so replays and duplicate events are idempotent.
 func TurnID(sessionID, marker string) string { return ids.Digest("turn", sessionID, marker) }
 
-// Pointer locates the turn's slice of the harness transcript.
+// Pointer locates the turn's slice of the harness transcript without an absolute path:
+// Root is the digest of the approved transcript root, Rel the redacted slash path below it,
+// and ID a content-independent identifier of the transcript.
 type Pointer struct {
-	Path        string `json:"path"`
+	Root        string `json:"root"`
+	Rel         string `json:"rel"`
+	ID          string `json:"id"`
 	StartOffset int64  `json:"start_offset"`
 	EndOffset   int64  `json:"end_offset,omitempty"`
 }
@@ -10529,32 +11537,78 @@ import (
 	"strings"
 
 	"github.com/TerrysPOV/Wikory/internal/confine"
+	"github.com/TerrysPOV/Wikory/internal/ids"
 )
 
 var errOutsideRoots = errors.New("capture: transcript is outside the approved transcript roots")
 
-// openTranscript opens a transcript only below an approved root, with no-follow semantics
-// below that root (spec 5.5 rule 7). The caller closes both.
-func (r *Recorder) openTranscript(path string) (*os.File, *confine.Root, error) {
-	if path == "" {
-		return nil, nil, errOutsideRoots
+func rootDigest(dir string) string { return ids.Digest("transcript-root", dir) }
+
+// locate maps a live transcript path to a pointer below an approved root: the root's
+// digest, the slash path relative to it (redacted like every persisted string), and a
+// content-independent id. No absolute path is ever persisted (spec 10.3).
+func (r *Recorder) locate(path string) (Pointer, bool) {
+	if path == "" || !filepath.IsAbs(path) {
+		return Pointer{}, false
 	}
 	dir, err := filepath.EvalSymlinks(filepath.Dir(path))
 	if err != nil {
-		return nil, nil, err
+		return Pointer{}, false
 	}
 	full := filepath.Join(dir, filepath.Base(path))
+	for _, approved := range r.TranscriptRoots {
+		resolved, err := filepath.EvalSymlinks(approved)
+		if err != nil {
+			continue
+		}
+		rel, err := filepath.Rel(resolved, full)
+		if err != nil || rel == "." || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+			continue
+		}
+		cleanRel := clean(filepath.ToSlash(rel), maxPath, map[string]int{})
+		return newPointer(rootDigest(resolved), cleanRel), true
+	}
+	return Pointer{}, false
+}
+
+func newPointer(root, rel string) Pointer {
+	return Pointer{Root: root, Rel: rel, ID: ids.Digest("transcript", root, rel)}
+}
+
+// encodePointer is the form stored in turn_starts.transcript_path: "<root digest>:<rel>".
+func encodePointer(p Pointer) string {
+	if p.Root == "" {
+		return ""
+	}
+	return p.Root + ":" + p.Rel
+}
+
+func decodePointer(s string) Pointer {
+	root, rel, ok := strings.Cut(s, ":")
+	if !ok {
+		return Pointer{}
+	}
+	return newPointer(root, rel)
+}
+
+// openPointer opens a transcript through the approved root whose digest the pointer names,
+// with no-follow semantics below that root (spec 5.5 rule 7). A relative path that the
+// redactor altered no longer names the file, so such a turn seals incomplete. The caller
+// closes both.
+func (r *Recorder) openPointer(p Pointer) (*os.File, *confine.Root, error) {
+	if p.Root == "" || p.Rel == "" {
+		return nil, nil, errOutsideRoots
+	}
 	for _, approved := range r.TranscriptRoots {
 		root, err := confine.Open(approved)
 		if err != nil {
 			continue
 		}
-		rel, err := filepath.Rel(root.Path(), full)
-		if err != nil || rel == "." || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+		if rootDigest(root.Path()) != p.Root {
 			root.Close()
 			continue
 		}
-		f, err := root.OpenRead(filepath.ToSlash(rel))
+		f, err := root.OpenRead(p.Rel)
 		if err != nil {
 			root.Close()
 			return nil, nil, err
@@ -10564,9 +11618,13 @@ func (r *Recorder) openTranscript(path string) (*os.File, *confine.Root, error) 
 	return nil, nil, errOutsideRoots
 }
 
-// transcriptSize is the current length of the transcript, or 0 when it cannot be read.
+// transcriptSize is the current length of the live transcript, or 0 when it cannot be read.
 func (r *Recorder) transcriptSize(path string) int64 {
-	f, root, err := r.openTranscript(path)
+	p, ok := r.locate(path)
+	if !ok {
+		return 0
+	}
+	f, root, err := r.openPointer(p)
 	if err != nil {
 		return 0
 	}
@@ -10662,7 +11720,8 @@ func redactRecord(rec *Record) {
 	c := rec.Redactions
 	rec.Request = clean(rec.Request, maxRequest, c)
 	rec.FinalMessage = clean(rec.FinalMessage, maxFinal, c)
-	rec.Transcript.Path = clean(rec.Transcript.Path, maxPath, c)
+	rec.Transcript.Rel = clean(rec.Transcript.Rel, maxPath, c)
+	rec.Git.Branch = clean(rec.Git.Branch, maxPath, c)
 	for i := range rec.FilesTouched {
 		rec.FilesTouched[i] = clean(rec.FilesTouched[i], maxPath, c)
 	}
@@ -10695,9 +11754,10 @@ func (r *Recorder) TurnStart(ctx context.Context, ev decode.Event) error {
 		return err
 	}
 	req := clean(ev.Prompt, maxRequest, map[string]int{})
+	ptr, _ := r.locate(ev.TranscriptPath)
 	_, err := r.Store.DB.ExecContext(ctx, `INSERT INTO turn_starts(session_id, marker, checkout_id, transcript_path, transcript_offset, request, at)
 		VALUES(?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, marker) DO NOTHING`,
-		ev.SessionID, marker, r.CheckoutID, ev.TranscriptPath, r.transcriptSize(ev.TranscriptPath), req, r.stamp())
+		ev.SessionID, marker, r.CheckoutID, encodePointer(ptr), r.transcriptSize(ev.TranscriptPath), req, r.stamp())
 	return err
 }
 
@@ -10734,7 +11794,7 @@ func (r *Recorder) stubOpen(ctx context.Context, cond string, args ...any) error
 	for _, s := range open {
 		rec := Record{Schema: RecordSchema, TurnID: TurnID(s.session, s.marker), Version: 1, State: "captured",
 			Outcome: "interrupted", Stub: true, Harness: "claude-code", SessionID: s.session, Marker: s.marker,
-			CheckoutID: r.CheckoutID, Request: s.request, Transcript: Pointer{Path: s.path, StartOffset: s.offset},
+			CheckoutID: r.CheckoutID, Request: s.request, Transcript: withOffset(decodePointer(s.path), s.offset),
 			SummaryOrigin: "deterministic", CapturedAt: r.stamp()}
 		if _, _, err := r.createOrComplete(ctx, rec); err != nil {
 			return err
@@ -10766,7 +11826,12 @@ func (r *Recorder) newRecord(ev decode.Event, marker string) Record {
 	return Record{Schema: RecordSchema, TurnID: TurnID(ev.SessionID, marker), Version: 1, State: "captured",
 		Outcome: "completed", Harness: ev.Harness, SessionID: ev.SessionID, Marker: marker, CheckoutID: r.CheckoutID,
 		FinalMessage: ev.LastAssistantMessage, FinalMessageHash: finalHash(ev.LastAssistantMessage),
-		Transcript: Pointer{Path: ev.TranscriptPath}, SummaryOrigin: "deterministic", CapturedAt: r.stamp()}
+		SummaryOrigin: "deterministic", CapturedAt: r.stamp()}
+}
+
+func withOffset(p Pointer, off int64) Pointer {
+	p.StartOffset = off
+	return p
 }
 
 // Stop captures the turn deterministically. created is false for a duplicate.
@@ -10786,10 +11851,11 @@ func (r *Recorder) Stop(ctx context.Context, ev decode.Event) (string, bool, err
 		marker = "stop:" + ids.Digest(ev.TranscriptPath, fmt.Sprint(r.transcriptSize(ev.TranscriptPath)))
 	}
 	rec := r.newRecord(ev, marker)
+	rec.Transcript, _ = r.locate(ev.TranscriptPath)
 	if found {
 		rec.Request, rec.Transcript.StartOffset = start.request, start.offset
 		if start.path != "" {
-			rec.Transcript.Path = start.path
+			rec.Transcript = withOffset(decodePointer(start.path), start.offset)
 		}
 	}
 	rec.Git = r.gitFacts(ctx)
@@ -10847,38 +11913,40 @@ func boolInt(b bool) int {
 // version from+1, adopting that file if a crashed earlier attempt already wrote it, and
 // publishes the row from the content of the file actually on disk. The row and the file
 // therefore always agree, and a transition can never rewind a turn to an older version.
-func (r *Recorder) transition(ctx context.Context, turnID string, from int, next Record, allowed func(state string, stub bool) bool) (bool, error) {
+// It returns the record actually published, which is the adopted file when one was on
+// disk, so a caller never counts a proposal that did not take effect.
+func (r *Recorder) transition(ctx context.Context, turnID string, from int, next Record, allowed func(state string, stub bool) bool) (Record, bool, error) {
 	if testHookBeforeTransition != nil {
 		testHookBeforeTransition(turnID)
 	}
 	tx, err := r.Store.DB.BeginTx(ctx, nil) // _txlock=immediate: the write lock is taken here
 	if err != nil {
-		return false, err
+		return Record{}, false, err
 	}
 	defer tx.Rollback()
 	var version, stub int
 	var state string
 	if err := tx.QueryRowContext(ctx, `SELECT version, state, stub FROM turns WHERE turn_id = ?`, turnID).Scan(&version, &state, &stub); err != nil {
-		return false, err
+		return Record{}, false, err
 	}
 	if version != from || !allowed(state, stub == 1) {
-		return false, nil // another transition won; this one yields
+		return Record{}, false, nil // another transition won; this one yields
 	}
 	next.Version = from + 1
 	if err := r.writeVersion(&next); errors.Is(err, confine.ErrExist) {
 		adopted, rerr := r.readVersion(turnID, next.Version)
 		if rerr != nil {
-			return false, rerr
+			return Record{}, false, rerr
 		}
 		next = adopted
 	} else if err != nil {
-		return false, err
+		return Record{}, false, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE turns SET version = ?, state = ?, stub = ?, outcome = ?, updated_at = ? WHERE turn_id = ?`,
 		next.Version, next.State, boolInt(next.Stub), next.Outcome, r.stamp(), turnID); err != nil {
-		return false, err
+		return Record{}, false, err
 	}
-	return true, tx.Commit()
+	return next, true, tx.Commit()
 }
 
 // createOrComplete is create-if-absent, plus the single permitted change to an existing
@@ -10901,15 +11969,19 @@ func (r *Recorder) createOrComplete(ctx context.Context, rec Record) (string, bo
 		if err != nil {
 			return "", false, err
 		}
-		return rec.TurnID, false, r.insertRow(ctx, r.Store.DB, first)
-	}
-	if qerr != nil {
+		if err := r.insertRow(ctx, r.Store.DB, first); err != nil {
+			return "", false, err
+		}
+		// The repaired row may be an interrupted stub that this Stop completes: continue
+		// into the completion path below instead of returning with the stub in place.
+		version, state, stub = first.Version, first.State, boolInt(first.Stub)
+	} else if qerr != nil {
 		return "", false, qerr
 	}
 	if stub == 1 && !rec.Stub && state == "captured" {
 		next := rec
 		next.Stub, next.Outcome, next.State = false, "completed", "captured"
-		if _, err := r.transition(ctx, rec.TurnID, version, next, func(s string, isStub bool) bool { return s == "captured" && isStub }); err != nil {
+		if _, _, err := r.transition(ctx, rec.TurnID, version, next, func(s string, isStub bool) bool { return s == "captured" && isStub }); err != nil {
 			return "", false, err
 		}
 	}
@@ -10960,6 +12032,9 @@ Each row names the fault and the failure predicted **before** running it. Every 
 | A18-7 | row repair skipped | `TestCrashBetweenFileAndRowIsRepaired` (failure text: `sql: no rows in result set`) | RED |
 | A18-8 | commands stored raw | `TestSealedRecordRedactsCommandsAndVerification`: the token reaches v0002 (failure text: `a secret reached the store: {`) | RED |
 | A18-9 | final message stored raw | `TestRequestAndFinalAreRedacted`: the token reaches v0001 (failure text: `secret reached the store: {`) | RED |
+| A18-10 | a repaired orphan stub is left as a stub | `TestRepairedOrphanStubIsCompletedByItsStop` (failure text: `the repaired stub was not completed`) | RED |
+| A18-11 | branch name not redacted | `TestMetadataIsRedactedAndNoAbsolutePathIsStored` (failure text: `a token-shaped branch or file name was persisted`) | RED |
+| A18-12 | the absolute transcript path persisted beside the pointer | `TestMetadataIsRedactedAndNoAbsolutePathIsStored` (failure text: `an absolute transcript path was persisted`) | RED |
 
 ```bash
 # A18-1: create overwrites
@@ -10981,13 +12056,22 @@ scripts/inject.sh internal/capture/capture.go '	if isMemoryAgent(ev) {' '	if fal
 scripts/inject.sh internal/capture/capture.go '	req := clean(ev.Prompt, maxRequest, map[string]int{})' '	req := ev.Prompt' ./internal/capture/ 'TestRequestAndFinalAreRedacted' 'the turn-start row stored the raw request: "use ghp_ZZZZZZZZZZZZZZZZZZ'
 
 # A18-7: row repair skipped
-scripts/inject.sh internal/capture/capture.go '		return rec.TurnID, false, r.insertRow(ctx, r.Store.DB, first)' '		return rec.TurnID, false, func() error { _ = first; return nil }()' ./internal/capture/ 'TestCrashBetweenFileAndRowIsRepaired' 'sql: no rows in result set'
+scripts/inject.sh internal/capture/capture.go '		if err := r.insertRow(ctx, r.Store.DB, first); err != nil {' '		if err := func() error { _ = first; return nil }(); err != nil {' ./internal/capture/ 'TestCrashBetweenFileAndRowIsRepaired' 'sql: no rows in result set'
 
 # A18-8: commands stored raw
 scripts/inject.sh internal/capture/capture.go '		rec.Commands[i].Text = clean(rec.Commands[i].Text, maxCommand, c)' '		_ = i' ./internal/capture/ 'TestSealedRecordRedactsCommandsAndVerification' 'a secret reached the store: {'
 
 # A18-9: final message stored raw
 scripts/inject.sh internal/capture/capture.go '	rec.FinalMessage = clean(rec.FinalMessage, maxFinal, c)' '	_ = maxFinal' ./internal/capture/ 'TestRequestAndFinalAreRedacted' 'secret reached the store: {'
+
+# A18-10: a repaired orphan stub is left as a stub
+scripts/inject.sh internal/capture/capture.go '		version, state, stub = first.Version, first.State, boolInt(first.Stub)' '		return rec.TurnID, false, nil' ./internal/capture/ '^TestRepairedOrphanStubIsCompletedByItsStop$' 'the repaired stub was not completed'
+
+# A18-11: branch name not redacted
+scripts/inject.sh internal/capture/capture.go '	rec.Git.Branch = clean(rec.Git.Branch, maxPath, c)' '	rec.Git.Branch = capText(rec.Git.Branch, maxPath)' ./internal/capture/ '^TestMetadataIsRedactedAndNoAbsolutePathIsStored$' 'a token-shaped branch or file name was persisted'
+
+# A18-12: the absolute transcript path persisted beside the pointer
+scripts/inject.sh internal/capture/capture.go 'encodePointer(ptr), r.transcriptSize' 'encodePointer(ptr)+ev.TranscriptPath, r.transcriptSize' ./internal/capture/ '^TestMetadataIsRedactedAndNoAbsolutePathIsStored$' 'an absolute transcript path was persisted'
 ```
 
 Expected: `RED as predicted` (exit 0) for every row except those marked *survives* (`SURVIVED`, exit 1). Append each verdict to `docs/spikes/results/fault-log-A18.section.md`.
@@ -11012,9 +12096,10 @@ git commit -m "feat(capture): add deterministic turn record with create-if-absen
 - Produces: `(*Recorder).Seal(ctx, deadline time.Time) (int, error)`.
 
 `Seal` completes captured records of this checkout, under three rules:
-- **Bounded slice (fix 5).** Each turn's slice is bounded: it starts at this turn's start marker and stops at the next turn-start marker recorded after it, by insertion order, so two markers with the same offset still separate. With no next turn, this turn's own end marker bounds it: the first assistant message in the slice whose canonical hash equals the recorded final message. The slice is never extended to EOF as a source of facts, and identical final messages in different turns cannot complete the wrong one.
+- **Bounded slice (fix 5, revised in round 3, D).** With prompt identity (the slice holds lines carrying this turn's `prompt_id`), exactly those lines are the turn, whatever the offsets say; this survives two turns starting before the first one's lines are flushed (both at offset 0, since the transcript lags the Stop, V08). Without identity, the slice stops at the next turn-start marker recorded after this one, by insertion order; if another turn of the same session and transcript recorded the same start offset, the boundary is ambiguous and the turn is never completed: on timeout it is sealed incomplete with nothing attached. With no next turn, this turn's own end marker bounds it: the first assistant message in the slice whose canonical hash equals the recorded final message. The slice is never extended to EOF as a source of facts, and identical final messages in different turns cannot complete the wrong one.
 - **Timeout.** A turn whose end marker is not in its slice by `SealTimeout` is sealed with `incomplete: true` and no facts.
 - **Filling.** Completion fills only missing fields (`files_touched`, `commands`, `verification`, transcript end offset), taken from lines before the end marker, through the shared serialised transition (A18). A sealed record never changes.
+- **Counting (round 3, F).** `Seal` counts a turn only when the published record is `sealed`; an adopted captured version left by a crashed attempt is not a seal.
 
 `(*Recorder).SweepStale` (A18) is also exercised here. `claude.Message` and `ToolUse.Offset` (A17) carry the positions this needs.
 
@@ -11209,6 +12294,103 @@ func TestSealedRecordRedactsCommandsAndVerification(t *testing.T) {
 		t.Fatalf("a secret reached the store: %s", body)
 	}
 }
+
+// A crashed earlier attempt left a captured version 2 on disk. A timed-out seal proposes
+// version 2 as sealed, adopts the file instead, and must not count it as sealed.
+func TestSealDoesNotCountAnAdoptedCapturedVersion(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t)
+	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "x", "p1", ""))
+	id, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "never written"))
+	orphan, _ := r.rec.readVersion(id, 1)
+	orphan.Version = 2
+	if err := r.rec.writeVersion(&orphan); err != nil {
+		t.Fatal(err)
+	}
+	r.clk.t = r.clk.t.Add(11 * time.Minute)
+	n, err := r.rec.Seal(ctx, time.Now().Add(time.Second))
+	state, version, _, _ := r.row(t, id)
+	if err != nil || n != 0 || state != "captured" || version != 2 {
+		t.Fatalf("an adopted captured version was counted as sealed: n=%d state=%s v%d err=%v", n, state, version, err)
+	}
+}
+
+// Two turns start before turn 1's lines are flushed, so both record offset 0, and both
+// end with the same text. With the transcript's prompt identity each turn gets exactly its
+// own facts. Both records are inspected.
+func TestDelayedFlushWithPromptIdentityAttributesEachTurn(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t)
+	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn one", "p1", ""))
+	id1, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "Done."))
+	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn two", "p2", "")) // still offset 0
+	r.appendTranscript(t,
+		`{"type":"user","promptId":"p1","message":{"role":"user","content":"turn one"}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"a1","name":"Bash","input":{"command":"go test ./a"}}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}`,
+		`{"type":"user","promptId":"p2","message":{"role":"user","content":"turn two"}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"go test ./b"}}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}`)
+	id2, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p2", "Done."))
+	if n, err := r.rec.Seal(ctx, time.Now().Add(time.Second)); err != nil || n != 2 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	one, two := r.readVersion(t, id1, "v0002.json"), r.readVersion(t, id2, "v0002.json")
+	if !strings.Contains(one, "go test ./a") || strings.Contains(one, "go test ./b") ||
+		!strings.Contains(two, "go test ./b") || strings.Contains(two, "go test ./a") {
+		t.Fatalf("turn facts crossed a boundary:\nturn 1: %s\nturn 2: %s", one, two)
+	}
+}
+
+// The same delayed flush without prompt identity: the boundary is ambiguous, so neither
+// turn is completed, and on timeout both are sealed incomplete with nothing attached.
+func TestDelayedFlushWithoutIdentityAttachesNothing(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t)
+	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn one", "p1", ""))
+	id1, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "Done."))
+	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn two", "p2", ""))
+	r.appendTranscript(t,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"a1","name":"Bash","input":{"command":"go test ./a"}}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"go test ./b"}}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}`)
+	id2, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p2", "Done."))
+	if n, _ := r.rec.Seal(ctx, time.Now().Add(time.Second)); n != 0 {
+		t.Fatalf("an ambiguous turn was completed: n=%d", n)
+	}
+	r.clk.t = r.clk.t.Add(11 * time.Minute)
+	if n, err := r.rec.Seal(ctx, time.Now().Add(time.Second)); err != nil || n != 2 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	for _, id := range []string{id1, id2} {
+		body := r.readVersion(t, id, "v0002.json")
+		if !strings.Contains(body, `"incomplete": true`) || strings.Contains(body, "go test") {
+			t.Fatalf("an ambiguous turn was given facts: %s", body)
+		}
+	}
+}
+
+// Turn 1's final message never reached the transcript, and turn 2 started at a later
+// offset and ended with the same text. The next-turn bound alone must keep turn 2's lines
+// from completing turn 1.
+func TestRepeatedFinalTextAcrossDistinctOffsetsDoesNotCompleteTheWrongTurn(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t)
+	useA := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"a1","name":"Bash","input":{"command":"go test ./a"}}]}}`
+	useB := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"go test ./b"}}]}}`
+	done := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}`
+	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn one", "p1", ""))
+	r.appendTranscript(t, useA) // turn 1's own final message is never written
+	id1, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "Done."))
+	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn two", "p2", "")) // a later offset
+	r.appendTranscript(t, useB, done)
+	_, _, _ = r.rec.Stop(ctx, r.ev(decode.Stop, "", "p2", "Done."))
+	_, _ = r.rec.Seal(ctx, time.Now().Add(time.Second))
+	if v := r.versions(t, id1); len(v) != 1 {
+		t.Fatalf("turn 1 was completed from turn 2's lines: %v", v)
+	}
+}
 ```
 
 `internal/capture/seal_unix_test.go`:
@@ -11308,22 +12490,56 @@ func (r *Recorder) Seal(ctx context.Context, deadline time.Time) (int, error) {
 	return sealed, nil
 }
 
-// sliceLimit bounds a turn's slice at the start of the next turn in the same transcript
-// (the next turn-start marker recorded after this one, by insertion order), so a turn never
-// reads another turn's lines, even when both markers carry the same offset. With no next
-// turn, this turn's own end marker (its final message) bounds it; facts after it are ignored.
-func (r *Recorder) sliceLimit(ctx context.Context, rec Record) (int64, error) {
+// bound returns the part of the transcript that belongs to this turn.
+//
+// With identity: Claude Code writes promptId on user lines, equal to the hooks' prompt_id
+// (V07), and the decoder carries it onto the lines that follow. When the slice holds lines
+// with this turn's prompt id, exactly those lines are the turn, whatever the offsets say;
+// this is what survives two turns starting before the first one's lines were flushed.
+//
+// Without identity: the turn is bounded at the start of the next turn in the same
+// transcript (the next turn-start marker, by insertion order). If another turn of the same
+// session and transcript recorded the same start offset, the boundary is ambiguous: the
+// turn is never completed, and on timeout it is sealed incomplete with nothing attached.
+func (r *Recorder) bound(ctx context.Context, rec Record, s claude.Slice) (claude.Slice, bool, error) {
+	if rec.Marker != "" && hasPrompt(s, rec.Marker) {
+		return s.ForPrompt(rec.Marker), true, nil
+	}
+	var same int
+	if err := r.Store.DB.QueryRowContext(ctx, `SELECT count(*) FROM turn_starts ts1 JOIN turn_starts ts2
+		ON ts2.session_id = ts1.session_id AND ts2.transcript_path = ts1.transcript_path
+		AND ts2.transcript_offset = ts1.transcript_offset AND ts2.marker <> ts1.marker
+		WHERE ts1.session_id = ? AND ts1.marker = ?`, rec.SessionID, rec.Marker).Scan(&same); err != nil {
+		return s, false, err
+	}
+	if same > 0 {
+		return claude.Slice{}, false, nil
+	}
 	var next int64
 	err := r.Store.DB.QueryRowContext(ctx, `SELECT ts2.transcript_offset FROM turn_starts ts1
 		JOIN turn_starts ts2 ON ts2.session_id = ts1.session_id AND ts2.transcript_path = ts1.transcript_path AND ts2.rowid > ts1.rowid
 		WHERE ts1.session_id = ? AND ts1.marker = ? ORDER BY ts2.rowid LIMIT 1`, rec.SessionID, rec.Marker).Scan(&next)
 	if errors.Is(err, sql.ErrNoRows) {
-		return maxSlice, nil
+		return s, true, nil
 	}
 	if err != nil {
-		return 0, err
+		return s, false, err
 	}
-	return max(next-rec.Transcript.StartOffset, 0), nil
+	return s.Before(next), true, nil
+}
+
+func hasPrompt(s claude.Slice, id string) bool {
+	for _, m := range s.AssistantMessages {
+		if m.PromptID == id {
+			return true
+		}
+	}
+	for _, u := range s.ToolUses {
+		if u.PromptID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Recorder) sealOne(ctx context.Context, id string, version int) (bool, error) {
@@ -11333,14 +12549,17 @@ func (r *Recorder) sealOne(ctx context.Context, id string, version int) (bool, e
 	}
 	captured, _ := time.Parse(time.RFC3339Nano, rec.CapturedAt)
 	timedOut := r.Now().Sub(captured) >= r.SealTimeout
-	limit, err := r.sliceLimit(ctx, rec)
-	if err != nil {
-		return false, err
-	}
-	slice, readErr := r.readSlice(rec.Transcript, limit)
+	slice, readErr := r.readSlice(rec.Transcript, maxSlice)
 	end, complete := int64(0), false
 	if readErr == nil && rec.FinalMessageHash != "" {
-		end, complete = endMarker(slice, rec.FinalMessageHash)
+		own, ok, err := r.bound(ctx, rec, slice)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			slice = own
+			end, complete = endMarker(slice, rec.FinalMessageHash)
+		}
 	}
 	if !complete && !timedOut {
 		return false, nil
@@ -11352,11 +12571,12 @@ func (r *Recorder) sealOne(ctx context.Context, id string, version int) (bool, e
 	if complete {
 		fillFromSlice(&next, slice, end)
 	}
-	return r.transition(ctx, id, version, next, func(state string, _ bool) bool { return state == "captured" })
+	published, ok, err := r.transition(ctx, id, version, next, func(state string, _ bool) bool { return state == "captured" })
+	return ok && published.State == "sealed", err // an adopted captured version is not a seal
 }
 
 func (r *Recorder) readSlice(p Pointer, limit int64) (claude.Slice, error) {
-	f, root, err := r.openTranscript(p.Path)
+	f, root, err := r.openPointer(p)
 	if err != nil {
 		return claude.Slice{}, err
 	}
@@ -11417,7 +12637,10 @@ Each row names the fault and the failure predicted **before** running it. Every 
 | A19-3 | verification passes without a tool result | `TestUnobservedCommandIsNotVerified`: `"passed": true` appears (failure text: `an agent`) | RED |
 | A19-4 | stale sweep ignores the age | `TestSweepLeavesRecentMarkersOfLiveSessions (failure text: `a live session`) | RED |
 | A19-5 | facts read past this turn's end marker | `TestTurnSliceStopsAtTheNextTurn`: turn 2 holds the continuation's command (failure text: `turn facts crossed a boundary`) | RED |
-| A19-6 | a repeated final text completes the wrong turn | `TestRepeatedFinalTextDoesNotCompleteTheWrongTurn` (failure text: `turn 1 was completed from turn 2`) | RED |
+| A19-6 | the next-turn bound dropped | `TestRepeatedFinalTextAcrossDistinctOffsetsDoesNotCompleteTheWrongTurn`: turn 2's identical final text completes turn 1 (failure text: `turn 1 was completed from turn 2`). The same-offset case is the ambiguity rule's, row A19-9 | RED |
+| A19-7 | an adopted captured version counted as sealed | `TestSealDoesNotCountAnAdoptedCapturedVersion` (failure text: `an adopted captured version was counted as sealed: n=1`) | RED |
+| A19-8 | prompt identity ignored when bounding a turn | `TestDelayedFlushWithPromptIdentityAttributesEachTurn`: both turns fall back to the ambiguous rule and neither completes (failure text: `n=0 err=<nil>`) | RED |
+| A19-9 | an ambiguous boundary (two turns at one offset) treated as known | `TestDelayedFlushWithoutIdentityAttachesNothing`: turn 2 is completed from turn 1's lines (failure text: `an ambiguous turn was completed: n=1`) | RED |
 
 ```bash
 # A19-1: sealed on any Stop
@@ -11435,8 +12658,17 @@ scripts/inject.sh internal/capture/capture.go '	cutoff := r.Now().Add(-r.StaleMa
 # A19-5: facts read past this turn's end marker
 scripts/inject.sh internal/capture/seal.go '			if u.Offset >= end || u.Command == "" {' '			if u.Command == "" {' ./internal/capture/ 'TestTurnSliceStopsAtTheNextTurn' 'turn facts crossed a boundary'
 
-# A19-6: a repeated final text completes the wrong turn
-scripts/inject.sh internal/capture/seal.go '	return max(next-rec.Transcript.StartOffset, 0), nil' '	return maxSlice + 0*next, nil' ./internal/capture/ 'TestRepeatedFinalTextDoesNotCompleteTheWrongTurn' 'turn 1 was completed from turn 2'
+# A19-6: the next-turn bound dropped (a later turn's identical final text completes this one)
+scripts/inject.sh internal/capture/seal.go '	return s.Before(next), true, nil' '	return s, true, nil' ./internal/capture/ '^TestRepeatedFinalTextAcrossDistinctOffsetsDoesNotCompleteTheWrongTurn$' 'turn 1 was completed from turn 2'
+
+# A19-7: an adopted captured version counted as sealed
+scripts/inject.sh internal/capture/seal.go '	return ok && published.State == "sealed", err' '	return ok || published.State == "sealed", err' ./internal/capture/ '^TestSealDoesNotCountAnAdoptedCapturedVersion$' 'an adopted captured version was counted as sealed: n=1'
+
+# A19-8: prompt identity ignored when bounding a turn
+scripts/inject.sh internal/capture/seal.go '	if rec.Marker != "" && hasPrompt(s, rec.Marker) {' '	if false && hasPrompt(s, rec.Marker) {' ./internal/capture/ '^TestDelayedFlushWithPromptIdentityAttributesEachTurn$' 'n=0 err=<nil>'
+
+# A19-9: an ambiguous boundary (two turns at one offset) treated as known
+scripts/inject.sh internal/capture/seal.go '	if same > 0 {' '	if false && same > 0 {' ./internal/capture/ '^TestDelayedFlushWithoutIdentityAttachesNothing$' 'an ambiguous turn was completed: n=1'
 ```
 
 Expected: `RED as predicted` (exit 0) for every row except those marked *survives* (`SURVIVED`, exit 1). Append each verdict to `docs/spikes/results/fault-log-A19.section.md`.
@@ -13351,7 +14583,7 @@ git commit -m "feat(app): add context and search commands with the progress rule
 ### Task A24: `wikory hook <event>`: capture, briefing, degraded mode, latency budgets
 
 **Files:**
-- Create: `internal/app/hook_cmd.go`, `internal/app/hook_cmd_test.go`, `internal/app/hook_latency_test.go`, `internal/app/race_on_test.go`, `internal/app/race_off_test.go`
+- Create: `internal/app/hook_cmd.go`, `internal/app/hooklog_unix.go`, `internal/app/hooklog_windows.go`, `internal/app/hook_cmd_test.go`, `internal/app/hook_stall_unix_test.go`, `internal/app/hook_latency_test.go`, `internal/app/race_on_test.go`, `internal/app/race_off_test.go`
 - Modify: `internal/app/run.go` (one line: raw commands honour `--json`), `internal/app/project.go` (the `testHookSlowDiscover` hook in `discover`, shown in the A15 block)
 
 **Depends on:** A18, A19, A23.
@@ -13365,6 +14597,9 @@ Behaviour, per event (Claude Code, 1a):
 - **UserPromptSubmit**: record the turn-start marker, seal briefly (100 ms), print nothing.
 - **Stop**: capture the deterministic record, print nothing (no continuation in 1a: no model work).
 - Always exit 0. Malformed input, unknown events and internal errors are logged by kind and counted.
+- **Budget from the first byte (round 3, G).** The deadline starts before stdin is read; a payload that does not arrive within it ends the hook (SessionStart prints the status-only fallback). The error log is opened with `O_NONBLOCK|O_NOFOLLOW` and an `fstat` regular-file check, so a FIFO or device at `hook-errors.log` can neither stall the hook nor receive its log.
+- **No detached work (V09 refuted).** Claude Code kills a hook's descendants, so no hook starts a process meant to outlive it. Lease reclaim, the orphan scan and trust checks run lazily at the next Wikory operation or inside the hook's own budget; headless SessionEnd consolidation by a detached child is not available, and its route (the next hook invocation, or a separately started process) is adjudicated before 1c.
+- **Continuation rounds (V16).** 1a never blocks a Stop. A Stop with `stop_hook_active: true` is another hook's continuation round for the same `prompt_id`: a duplicate Stop, which never overwrites the first record; reconciling the continuation's final message is 1b work.
 
 `WIKORY_TRANSCRIPT_ROOTS` (path-list) overrides the approved transcript roots; the default is `$CLAUDE_CONFIG_DIR/projects`, else `$HOME/.claude/projects`.
 
@@ -13613,6 +14848,105 @@ func TestHookTimeoutDoesNoSynchronousWork(t *testing.T) {
 }
 ```
 
+`internal/app/hook_stall_unix_test.go`:
+
+```go
+//go:build unix
+
+package app
+
+import (
+	"bytes"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+// runHookAsync runs the hook in a goroutine with stdin from in and reports how long it took,
+// failing if it does not return at all within limit.
+func runHookAsync(t *testing.T, h *hookRig, in io.Reader, limit time.Duration) (string, time.Duration) {
+	t.Helper()
+	var out bytes.Buffer
+	env := &Env{IO: IO{In: in, Out: &out, Err: io.Discard}, Version: "test", Cwd: h.dir,
+		Getenv: func(k string) string {
+			if k == "WIKORY_DATA_DIR" {
+				return h.c.dataDir
+			}
+			if v, ok := h.c.extra[k]; ok {
+				return v
+			}
+			return os.Getenv(k)
+		}}
+	done := make(chan struct{})
+	start := time.Now()
+	go func() { RunEnv([]string{"hook", "session-start"}, env); close(done) }()
+	select {
+	case <-done:
+		return out.String(), time.Since(start)
+	case <-time.After(limit):
+		t.Fatalf("the hook did not return within %v", limit)
+		return "", 0
+	}
+}
+
+func fifoAtHookLog(t *testing.T, h *hookRig) string {
+	t.Helper()
+	if err := os.MkdirAll(h.c.dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(h.c.dataDir, "hook-errors.log")
+	if err := syscall.Mkfifo(p, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// A FIFO at the error log path (no reader, then a reader that never drains it) must not
+// stall the SessionStart timeout path past its budget.
+func TestFIFOAtHookErrorLogDoesNotStallSessionStart(t *testing.T) {
+	for _, withReader := range []bool{false, true} {
+		h := newHookRig(t)
+		h.c.extra["WIKORY_HOOK_BUDGET_MS"] = "300"
+		p := fifoAtHookLog(t, h)
+		var r *os.File
+		if withReader {
+			var err error
+			if r, err = os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0); err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+		}
+		testHookSlowBriefing = func() { time.Sleep(900 * time.Millisecond) }
+		out, el := runHookAsync(t, h, strings.NewReader(h.payload("SessionStart", h.dir, map[string]any{"source": "startup"})), 5*time.Second)
+		testHookSlowBriefing = nil
+		if el > 700*time.Millisecond*slack() || !strings.Contains(out, "timed out") {
+			t.Fatalf("reader=%v: a FIFO at the log path stalled the hook: %v %q", withReader, el, out)
+		}
+		if r != nil {
+			if n, _ := r.Read(make([]byte, 512)); n > 0 {
+				t.Fatalf("the hook wrote its error log into a FIFO (%d bytes)", n)
+			}
+		}
+	}
+}
+
+// Stdin that never arrives must not stall SessionStart: the budget starts before the read.
+func TestStalledStdinDoesNotStallSessionStart(t *testing.T) {
+	h := newHookRig(t)
+	h.c.extra["WIKORY_HOOK_BUDGET_MS"] = "300"
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	out, el := runHookAsync(t, h, pr, 5*time.Second)
+	if el > 700*time.Millisecond*slack() || !strings.Contains(out, "did not arrive") {
+		t.Fatalf("a stalled stdin stalled the hook: %v %q", el, out)
+	}
+}
+```
+
 `internal/app/hook_latency_test.go`:
 
 ```go
@@ -13737,7 +15071,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -13776,7 +15109,7 @@ func logHookError(env *Env, kind string) {
 	if store.EnsurePrivateDir(dir) != nil {
 		return
 	}
-	f, err := os.OpenFile(filepath.Join(dir, "hook-errors.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	f, err := openHookLog(filepath.Join(dir, "hook-errors.log")) // never blocks; regular files only
 	if err != nil {
 		return
 	}
@@ -13804,6 +15137,7 @@ func newRecorder(p *project, env *Env) *capture.Recorder {
 
 func runHook(ctx context.Context, env *Env, args []string) (res Result, err error) {
 	start := time.Now()
+	deadline := start.Add(hookBudget(env)) // the budget starts before stdin is read
 	action := "none"
 	defer func() {
 		if r := recover(); r != nil {
@@ -13822,21 +15156,39 @@ func runHook(ctx context.Context, env *Env, args []string) (res Result, err erro
 		logHookError(env, "unknown-event")
 		return
 	}
-	ev, derr := claude.Decode(kind, env.IO.In)
-	if derr != nil {
-		logHookError(env, "malformed")
+	type decoded struct {
+		ev  decode.Event
+		err error
+	}
+	got := make(chan decoded, 1)
+	go func() {
+		ev, err := claude.Decode(kind, env.IO.In)
+		got <- decoded{ev, err}
+	}()
+	var ev decode.Event
+	select {
+	case d := <-got:
+		if d.err != nil {
+			logHookError(env, "malformed")
+			return
+		}
+		ev = d.ev
+	case <-time.After(time.Until(deadline)):
+		logHookError(env, "stdin-timeout")
+		if kind == decode.SessionStart && !env.JSON {
+			action = "briefing"
+			writeSessionStart(env, degradedBriefing(nil, "the hook input did not arrive within "+hookBudget(env).String()))
+		}
 		return
 	}
 	e2 := *env
 	e2.Cwd = ev.Cwd
 	switch kind {
 	case decode.SessionStart:
-		text := sessionStart(ctx, &e2, ev)
+		text := sessionStart(ctx, &e2, ev, deadline)
 		action = "briefing"
 		if text != "" && !env.JSON {
-			out, _ := json.Marshal(map[string]any{"hookSpecificOutput": map[string]any{
-				"hookEventName": "SessionStart", "additionalContext": text}})
-			fmt.Fprintln(env.IO.Out, string(out))
+			writeSessionStart(env, text)
 		}
 	case decode.UserPrompt:
 		action = userPrompt(ctx, &e2, ev)
@@ -13846,9 +15198,15 @@ func runHook(ctx context.Context, env *Env, args []string) (res Result, err erro
 	return
 }
 
-func sessionStart(ctx context.Context, env *Env, ev decode.Event) string {
+func writeSessionStart(env *Env, text string) {
+	out, _ := json.Marshal(map[string]any{"hookSpecificOutput": map[string]any{
+		"hookEventName": "SessionStart", "additionalContext": text}})
+	fmt.Fprintln(env.IO.Out, string(out))
+}
+
+// sessionStart answers within what is left of the hook's budget, which began before stdin.
+func sessionStart(ctx context.Context, env *Env, ev decode.Event, deadline time.Time) string {
 	budget := hookBudget(env)
-	deadline := time.Now().Add(budget)
 	slow := testHookSlowBriefing // read here, not in the goroutine, so tests can reset it without a data race
 	done := make(chan string, 1)
 	go func() {
@@ -13868,7 +15226,7 @@ func sessionStart(ctx context.Context, env *Env, ev decode.Event) string {
 	select {
 	case s := <-done:
 		return s
-	case <-time.After(budget):
+	case <-time.After(time.Until(deadline)):
 		logHookError(env, "timeout")
 		return fallback
 	}
@@ -13938,6 +15296,66 @@ func stopCapture(ctx context.Context, env *Env, ev decode.Event) string {
 }
 ```
 
+The error log is opened by a platform helper that can never block:
+
+`internal/app/hooklog_unix.go`:
+
+```go
+//go:build unix
+
+package app
+
+import (
+	"errors"
+	"os"
+
+	"golang.org/x/sys/unix"
+)
+
+// openHookLog opens the error log for appending without ever blocking: O_NONBLOCK means a
+// FIFO at that path cannot stall the open (or a later write), O_NOFOLLOW refuses a symlink,
+// and the fstat check refuses anything but a regular file.
+func openHookLog(path string) (*os.File, error) {
+	fd, err := unix.Open(path, unix.O_WRONLY|unix.O_APPEND|unix.O_CREAT|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFREG {
+		unix.Close(fd)
+		return nil, errors.New("hook log is not a regular file")
+	}
+	return os.NewFile(uintptr(fd), path), nil
+}
+```
+
+`internal/app/hooklog_windows.go`:
+
+```go
+//go:build windows
+
+package app
+
+import (
+	"errors"
+	"os"
+)
+
+// openHookLog: Windows has no FIFOs in the file namespace; a named pipe cannot be created
+// at a plain path, so the regular-file check after the open is the guard.
+func openHookLog(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, errors.New("hook log is not a regular file")
+	}
+	return f, nil
+}
+```
+
 Note on the seal deadline in `sessionStartBriefing`: sealing gets the first 40 per cent of the remaining budget, so the briefing always keeps most of it.
 
 - [ ] **Step 5: Run them to see them pass**
@@ -13956,19 +15374,24 @@ Each row names the fault and the failure predicted **before** running it. Every 
 | A24-3 | the servable gate opened to any store | `TestHookCopiedCheckoutGetsNoPrivateData`: the copy's page `Retries are capped` is served and its Stop is captured (failure text: `an unregistered checkout was served memory: wikory: mode=full \| last c`) | RED |
 | A24-4 | payload logged | `TestHookMalformedInputExitsZeroAndLogsOnlyTheKind`: the marker appears (failure text: `relative-PAYLOAD-CONTENT-MUST-NOT-BE-LOGGED`) | RED |
 | A24-5 | synchronous discovery after the deadline | `TestHookTimeoutDoesNoSynchronousWork`: the hook waits for the slow discovery (failure text: `budget 300ms plus 250ms slack`) | RED |
+| A24-6 | the error log opened without `O_NONBLOCK` | `TestFIFOAtHookErrorLogDoesNotStallSessionStart`: the open of a FIFO with no reader blocks (failure text: `the hook did not return within`) | RED |
+| A24-7 | the error log accepted when it is not a regular file | `TestFIFOAtHookErrorLogDoesNotStallSessionStart` with a reader (failure text: `the hook wrote its error log into a FIFO`) | RED |
+| A24-8 | stdin read with no deadline | `TestStalledStdinDoesNotStallSessionStart` (failure text: `the hook did not return within`) | RED |
 
 ```bash
 # A24-1: decode error propagated
 scripts/inject.sh internal/app/hook_cmd.go '		err = nil // a hook never fails the harness' '		if action == "none" { err = fmt.Errorf("hook failed") }' ./internal/app/ 'TestHookMalformedInputExitsZeroAndLogsOnlyTheKind' '{stop {PAYLOAD-CONTENT-MUST-NOT-BE-LOGGED}: code=1 out=""'
 
 # A24-2: no deadline
-scripts/inject.sh internal/app/hook_cmd.go '	case <-time.After(budget):' '	case <-time.After(time.Hour):' ./internal/app/ 'TestHookDegradedOnTimeout' 'out=wikory: mode=full'
+scripts/inject.sh internal/app/hook_cmd.go '	case <-time.After(time.Until(deadline)):
+		logHookError(env, "timeout")' '	case <-time.After(time.Hour):
+		logHookError(env, "timeout")' ./internal/app/ 'TestHookDegradedOnTimeout' 'out=wikory: mode=full'
 
 # A24-3: the servable gate opened to any store
 scripts/inject.sh internal/app/briefing.go 'return p.Store != nil && p.Registered && p.Trusted }' 'return p.Store != nil }' ./internal/app/ 'TestHookCopiedCheckoutGetsNoPrivateData' 'an unregistered checkout was served memory: wikory: mode=full | last c'
 
 # A24-4: payload logged
-scripts/inject.sh internal/app/hook_cmd.go '		logHookError(env, "malformed")' '		logHookError(env, "malformed "+derr.Error())' ./internal/app/ 'TestHookMalformedInputExitsZeroAndLogsOnlyTheKind' 'relative-PAYLOAD-CONTENT-MUST-NOT-BE-LOGGED'
+scripts/inject.sh internal/app/hook_cmd.go '			logHookError(env, "malformed")' '			logHookError(env, "malformed "+d.err.Error())' ./internal/app/ 'TestHookMalformedInputExitsZeroAndLogsOnlyTheKind' 'relative-PAYLOAD-CONTENT-MUST-NOT-BE-LOGGED'
 
 # A24-5: synchronous discovery after the deadline
 scripts/inject.sh internal/app/hook_cmd.go '		return fallback
@@ -13976,6 +15399,17 @@ scripts/inject.sh internal/app/hook_cmd.go '		return fallback
 		_ = root
 		return fallback
 ' ./internal/app/ 'TestHookTimeoutDoesNoSynchronousWork' 'budget 300ms plus 250ms slack'
+
+# A24-6: the error log opened without O_NONBLOCK (a FIFO with no reader blocks the open)
+scripts/inject.sh internal/app/hooklog_unix.go 'unix.O_CREAT|unix.O_NONBLOCK|unix.O_NOFOLLOW' 'unix.O_CREAT|unix.O_NOFOLLOW' ./internal/app/ '^TestFIFOAtHookErrorLogDoesNotStallSessionStart$' 'the hook did not return within'
+
+# A24-7: the error log accepted when it is not a regular file
+scripts/inject.sh internal/app/hooklog_unix.go '	if err := unix.Fstat(fd, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFREG {' '	if err := unix.Fstat(fd, &st); err != nil {' ./internal/app/ '^TestFIFOAtHookErrorLogDoesNotStallSessionStart$' 'the hook wrote its error log into a FIFO'
+
+# A24-8: stdin read with no deadline (the budget starts only after the payload arrives)
+scripts/inject.sh internal/app/hook_cmd.go '	case <-time.After(time.Until(deadline)):
+		logHookError(env, "stdin-timeout")' '	case <-time.After(time.Until(deadline) + time.Hour):
+		logHookError(env, "stdin-timeout")' ./internal/app/ '^TestStalledStdinDoesNotStallSessionStart$' 'the hook did not return within'
 ```
 
 Expected: `RED as predicted` (exit 0) for every row except those marked *survives* (`SURVIVED`, exit 1). Append each verdict to `docs/spikes/results/fault-log-A24.section.md`.
@@ -13983,7 +15417,7 @@ Expected: `RED as predicted` (exit 0) for every row except those marked *survive
 - [ ] **Step 7: Commit**
 
 ```bash
-git add internal/app/hook_cmd.go internal/app/hook_cmd_test.go internal/app/hook_latency_test.go internal/app/race_on_test.go internal/app/race_off_test.go internal/app/run.go internal/app/project.go docs/spikes/results docs/verified-capabilities.md
+git add internal/app/hook_cmd.go internal/app/hooklog_unix.go internal/app/hooklog_windows.go internal/app/hook_cmd_test.go internal/app/hook_stall_unix_test.go internal/app/hook_latency_test.go internal/app/race_on_test.go internal/app/race_off_test.go internal/app/run.go internal/app/project.go docs/spikes/results docs/verified-capabilities.md
 git commit -m "feat(app): add hook entry point with capture, briefing, degraded mode and budgets"
 ```
 
@@ -14274,7 +15708,7 @@ git commit -m "feat(app): add page stamp so hand-written claims get binary-autho
 **Interfaces:**
 - Produces: `type Capabilities struct { CanContinueOnStop, CanInjectOnSessionStart, HasSubagents, ModelPins, TranscriptStable bool }`; `knownGood map[string]Capabilities`; `modeFor(version string) (Capabilities, string)`; package variable `probeClaudeVersion func(ctx) string`; commands `doctor` and `recover`.
 
-`knownGood` starts with one row, `2.1.316`, whose values come from `docs/verified-capabilities.md` (V06, V09, V11, V15, V16 and V17 decide them; until stage 0 is closed, use the documented values below and mark the row "per S14"). Doctor reports: the executable path and the `wikory` found on `PATH` (and whether they are the same file, which matters because hooks resolve `wikory` from `PATH`, spec 10.5), the version, the Claude Code version and whether it is known-good, the capability flags and the mode, whether the repository is initialised, registered and trusted, the store directory, pending turns, incomplete and conflicted jobs, hook errors logged, and uncommitted changes under `project-memory/` (Wikory never commits, spec 4.5). On Windows it states that owner-only ACLs arrive in 1d. It also lists each approved transcript root (adjudicated Q19: `$CLAUDE_CONFIG_DIR/projects`, else `$HOME/.claude/projects`, or `WIKORY_TRANSCRIPT_ROOTS`) and whether it opens as a confined root. `recover` runs publish recovery for this checkout and reports what it did.
+`knownGood` starts with one row, `2.1.316`, whose values come from `docs/verified-capabilities.md` (stage 0 is closed, 9c8f28a: V16 verified gives `CanContinueOnStop`; V06 and V07 give `CanInjectOnSessionStart`; V11 and V12 give `HasSubagents`; V08 shows the transcript lags the Stop, so `TranscriptStable` is false; `ModelPins` stays true, not contradicted; V09 refuted changes no flag but forbids detached work, A24). Doctor reports: the executable path and the `wikory` found on `PATH` (and whether they are the same file, which matters because hooks resolve `wikory` from `PATH`, spec 10.5), the version, the Claude Code version and whether it is known-good, the capability flags and the mode, whether the repository is initialised, registered and trusted, the store directory, pending turns, incomplete and conflicted jobs, hook errors logged, and uncommitted changes under `project-memory/` (Wikory never commits, spec 4.5). On Windows it states that owner-only ACLs arrive in 1d. It also lists each approved transcript root (adjudicated Q19: `$CLAUDE_CONFIG_DIR/projects`, else `$HOME/.claude/projects`, or `WIKORY_TRANSCRIPT_ROOTS`) and whether it opens as a confined root. `recover` runs publish recovery for this checkout and reports what it did.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -14613,7 +16047,7 @@ git commit -m "feat(app): add minimal doctor and publish recovery command"
 
 **Depends on:** A24, S7 (V14: exec form verified).
 
-The plugin is a manifest and hook wiring only (spec 8.1). Each hook is a direct `wikory hook <event>` call in exec form (`command` plus `args`, no shell), which works on Windows with a real `wikory.exe` (spec 8.2, V14). 1a registers `SessionStart`, `UserPromptSubmit` and `Stop` only (spec question Q20). No agents, no commands, no MCP in 1a. Timeouts are low: the binary enforces its own 2 s briefing deadline inside the 5 s hook timeout.
+The plugin is a manifest and hook wiring only (spec 8.1). Each hook is a direct `wikory hook <event>` call in exec form (`command` plus `args`, no shell), which works on Windows with a real `wikory.exe` (spec 8.2, V14). 1a registers `SessionStart`, `UserPromptSubmit` and `Stop` only (spec question Q20). Stage 0: V14 verified exec-form hooks running a plugin-bundled `${CLAUDE_PLUGIN_ROOT}/bin/` binary on macOS; 1a keeps `wikory` resolved from `PATH` (spec 10.5, reported by `wikory doctor`), with a bundled binary as the fallback if CI shows PATH resolution failing. V19: a plugin cannot supply `statusLine` (only `subagentStatusLine`), so 1a ships none; the status line is wrapped from the user's own settings later (spec 8.8). No agents, no commands, no MCP in 1a. Timeouts are low: the binary enforces its own 2 s briefing deadline inside the 5 s hook timeout.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -14857,8 +16291,8 @@ scripts/inject_selftest.sh >/dev/null 2>&1 && echo "PASS  inject.sh reports comp
 scripts/scrub_selftest.sh >/dev/null 2>&1 && echo "PASS  scrub-fixture.sh refuses residue without printing it" || { echo "FAIL  scripts/scrub_selftest.sh"; fail=1; }
 check "duplicate Stop events"              'TestDuplicateStopNeverOverwrites|TestStopWithoutPromptIDUsesStoredMarker' ./internal/capture/
 check "capture versions serialised"        'TestStaleTransitionNeverRewindsVersion|TestOrphanedVersionFileIsAdopted|TestConcurrentSealAndStubCompletionAgree' ./internal/capture/
-check "turn slices bounded"                'TestTurnSliceStopsAtTheNextTurn|TestRepeatedFinalTextDoesNotCompleteTheWrongTurn' ./internal/capture/
-check "every persisted field redacted"     'TestRequestAndFinalAreRedacted|TestSealedRecordRedactsCommandsAndVerification' ./internal/capture/
+check "turn slices bounded"                'TestTurnSliceStopsAtTheNextTurn|TestRepeatedFinalText|TestDelayedFlush|TestSealDoesNotCountAnAdoptedCapturedVersion|TestRepairedOrphanStubIsCompletedByItsStop' ./internal/capture/
+check "every persisted field redacted"     'TestRequestAndFinalAreRedacted|TestSealedRecordRedactsCommandsAndVerification|TestMetadataIsRedactedAndNoAbsolutePathIsStored' ./internal/capture/
 check "duplicate Stop through the hook"    'TestHookStopCapturesAndDuplicateIsIdempotent' ./internal/app/
 check "interruption before the first Stop" 'TestInterruptionBeforeFirstStop|TestSessionStartStubsStaleMarkersOfOtherSessions' ./internal/capture/
 check "interruption disclosed in briefing" 'TestHookInterruptionBeforeFirstStopIsDisclosed' ./internal/app/
@@ -14867,7 +16301,9 @@ check "malformed input through the hook"   'TestHookMalformedInputExitsZeroAndLo
 check "stale or switched checkout"         'TestHookCopiedCheckoutGetsNoPrivateData|TestHookMovedCheckoutIsUnregistered|TestHookNewWorktreeOfTrustedCloneIsRegistered' ./internal/app/
 check "branch switch scope"                'TestSearchAfterBranchSwitch|TestSearchScopeIsThisCheckoutOnly' ./internal/retrieve/
 check "checkout binding of publish"        'TestWrongCheckoutRefused|TestRecoveryNeverAppliesAnotherCheckoutsJob' ./internal/publish/
-check "symlink and path escape (confine)"  'TestRefuses|TestDirectorySwapAfterWalkCannotRedirect|TestComponentSwapBetweenCheckAndOpenIsRefused|TestFileSwapBetweenCheckAndOpenIsRefused|TestOpenRefusesSymlinkedRoot|TestRootSwapDuringOpenIsRefused|TestRootHandleSurvivesReplacementAfterOpen|TestWriteAtomicRefusesSymlinkTarget|TestWriteFileCheckedAbortsWhenTargetChanged' ./internal/confine/
+check "symlink and path escape (confine)"  'TestRefuses|TestDirectorySwapAfterWalkCannotRedirect|TestComponentSwapBetweenCheckAndOpenIsRefused|TestFileSwapBetweenCheckAndOpenIsRefused|TestOpenRefusesSymlinkedRoot|TestRootSwapDuringOpenIsRefused|TestRootHandleSurvivesReplacementAfterOpen|TestWriteAtomicRefusesSymlinkTarget|SubstitutedBySymlinkToMovedOriginalIsRefused' ./internal/confine/
+check "human edits never overwritten"     'TestReplace|TestRestoreBackupsPutsBackAMissingTarget' ./internal/confine/
+check "human save after a killed replace"  'TestHumanSaveAfterAKilledMoveAsideKeepsBothVersions' ./internal/publish/
 check "hostile git configuration"          'TestRepositoryFsmonitorIsNeverRun|TestRepositoryCleanFilterIsNeverRun|TestAmbiguousShortIDIsAnError' ./internal/gitx/
 check "symlink and path escape (readers)"  'TestRefreshRefusesSymlinkedPagesAndDirs|TestGitEnvWorkBlobIsConfined|TestSymlinkedTranscriptIsRefused|TestInitRefusesSymlinkedProjectMemory' ./...
 check "kill at each publish step"          'TestKillAtEachStepThenRecover|TestHumanEditAfterPartialPublishIsNeverOverwritten|TestHumanEditOfAnAlreadyAppliedPageIsAConflict' ./internal/publish/
@@ -14876,7 +16312,7 @@ check "owner-only permissions"             'TestStoreIsOwnerOnlyUnderPermissiveU
 check "validator rules"                    'TestRule|TestShortEvidenceIsResolvedAndAmbiguityIsAnError|TestDeriveNeverConfirmsAShortID' ./internal/validate/
 check "stamp keeps dirty evidence unverified" 'TestStamp' ./internal/app/
 check "sanitiser"                          'TestSanitize|TestSearchSanitisesFileNames' ./internal/retrieve/
-check "latency budgets"                    'TestSessionStartWithinTwoSecondsOnAFixtureWiki|TestStopCaptureWithinBudget|TestHookDegradedOnTimeout|TestHookTimeoutDoesNoSynchronousWork' ./internal/app/
+check "latency budgets"                    'TestSessionStartWithinTwoSecondsOnAFixtureWiki|TestStopCaptureWithinBudget|TestHookDegradedOnTimeout|TestHookTimeoutDoesNoSynchronousWork|TestFIFOAtHookErrorLogDoesNotStallSessionStart|TestStalledStdinDoesNotStallSessionStart' ./internal/app/
 check "degraded on a corrupt database"     'TestHookDegradedOnCorruptDatabase' ./internal/app/
 exit $fail
 ```
@@ -15019,7 +16455,7 @@ These were raised for 1a and **adjudicated by the orchestrator (final; none esca
 | Q9 | Unregistered or untrusted checkouts in 1a | 4.3, 10.4 | Fail closed: one-line status, nothing private, no capture | A24 |
 | Q10 | Duplicate fields in a claim comment | 14.6 | Malformed | A9 |
 | Q11 | Git clean filters and hostile config | 5.5 rule 2, 10.3 | **Adjudicated: defences always on.** `core.fsmonitor=false`, `core.untrackedCache=false`, `core.hooksPath` and `core.attributesFile` set to the null device, `diff.external=`, every filter and diff driver the repository names overridden to empty (`clean`, `smudge`, `process`, `textconv`, `command`, `required=false`), `GIT_CONFIG_NOSYSTEM=1`, `GIT_ATTR_NOSYSTEM=1`, `--literal-pathspecs`, `--no-optional-locks`, and `hash-object --no-filters`. `safe.directory` is never widened. Comparing like with like through the clean filter is **deferred to the engine specification (14.6)**; until then a source with an eol or clean-filter conversion may read as STALE, which is the conservative direction | A8, A11 |
-| Q12 | Windows confinement residual race | 5.5 rule 7 | **Rejected (rule 7 is frozen).** `os.Root` on both unix and Windows, with every component identity-checked after its open; no pre-check then re-resolve. Windows `os.Root` and `os.SameFile` behaviour is a verified S2 result (V03) and is tested in CI, not waived | A3, A4, S2 |
+| Q12 | Windows confinement residual race | 5.5 rule 7 | **Rejected (rule 7 is frozen).** Revised in round 3: identity checks alone do not meet rule 7 (a component renamed away and replaced by a relative symlink to the moved original passes them). Unix opens every component with `openat` and `O_NOFOLLOW`; Windows keeps `os.Root` with reparse-point checks before and after each open, its residual stated in A3 and A4, `pending-ci` and beta until 1d. Not waived | A3, A4, S2 |
 | Q13 | Per-operation publish state in the manifest only | 6 | **Rejected.** Each operation is marked in the manifest **and** the database (`job_ops`), and recovery re-verifies the on-disk hash of operations already marked | A12, A13 |
 | Q14 | `turn_id` marker | 5.2, 6 | `prompt_id` when present, else the stored marker, else one derived at Stop | A18 |
 | Q15 | MCP in 1a | 3, 8.3, 12 | None in 1a; arrives with the recorder in 1b | A27 |
