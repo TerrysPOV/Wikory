@@ -228,6 +228,34 @@ func TestDriverDiscoveryFailsClosed(t *testing.T) {
 	})
 }
 
+// The isolation in TestMain must not hide the behaviour it isolates from: a driver named in
+// the user's global config is read and neutralised exactly like one in the repository's own.
+func TestGlobalDriversAreNeutralised(t *testing.T) {
+	cfg := "[filter \"evil\"]\n\tclean = touch PWNED\n\trequired = true\n"
+	if err := os.WriteFile(isolatedGlobalConfig, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.WriteFile(isolatedGlobalConfig, nil, 0o600); err != nil {
+			t.Error(err)
+		}
+	})
+	r, err := Discover(context.Background(), newRepo(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, o := range r.neutralise {
+		got[o[0]] = o[1]
+	}
+	if v, ok := got["filter.evil.clean"]; !ok || v != "" {
+		t.Errorf("the global filter.evil.clean is not neutralised: %v", r.neutralise)
+	}
+	if v, ok := got["filter.evil.required"]; !ok || v != "false" {
+		t.Errorf("the global filter.evil.required is not set to false: %v", r.neutralise)
+	}
+}
+
 // git refuses a corrupt config before the override read is reached, so this end-to-end check
 // passes with or without the fail-closed read; TestDriverDiscoveryFailsClosed is the guard.
 func TestDiscoverRefusesCorruptConfig(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -121,6 +122,9 @@ func TestOpenRefusesSymlinkedRoot(t *testing.T) {
 }
 
 func TestRootSwapDuringOpenIsRefused(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows refuses to rename a directory that is open, so this swap cannot happen there")
+	}
 	_, rootDir, _ := tree(t)
 	other := rootDir + "-other"
 	if err := os.MkdirAll(other, 0o755); err != nil {

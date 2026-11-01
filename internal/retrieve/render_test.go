@@ -1,6 +1,7 @@
 package retrieve
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 
@@ -44,6 +45,18 @@ func TestSearchDoesNotRenderDependencyPathsAsMarkup(t *testing.T) {
 	meta := "<!-- claim c=01J8Q4ZK8N3X2T5V6W7Y8Z9A0B kind=current-impl status=verified vrev=" + gitT(t, dir, "rev-parse", "--short=12", "HEAD") +
 		" scope=repo ev=src/queue.go@sha1:" + oid + ";" + bad + "@sha1:" + oid + " dep=src/queue.go;" + bad + " th=" + claim.TextHash(text) + " -->"
 	writePage(t, dir, "p.md", "# P\n\n"+meta+"\n"+text+"\n")
+	if runtime.GOOS == "windows" {
+		// Windows names cannot contain '<' or '>', so confine.Split refuses this path when the
+		// comment is parsed: the claim is dropped as malformed and its text is never indexed.
+		// The markup therefore cannot reach the renderer there; assert that refusal instead.
+		if _, err := claim.ParseComment(meta); err == nil {
+			t.Fatal("a dependency path holding markup must be refused where the platform forbids those characters")
+		}
+		if hits := searchIn(t, dir, "co-1", "pangolin", SearchOpts{Limit: 5}); len(hits) != 0 {
+			t.Fatalf("a claim with a refused path must not be searchable: %+v", hits)
+		}
+		return
+	}
 	hits := searchIn(t, dir, "co-1", "pangolin", SearchOpts{Limit: 5})
 	if len(hits) == 0 {
 		t.Fatal("the claim should match")
