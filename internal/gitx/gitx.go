@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -27,9 +28,12 @@ type Repo struct {
 	Top       string
 	CommonDir string
 	GitDir    string
-	// neutralise overrides every filter and diff driver the repository's own config names,
-	// so no clean, smudge, process, textconv or external diff command it defines can run.
-	neutralise []string
+	// neutralise holds key/value config overrides, one per filter and diff driver setting
+	// the repository's own config names, so no clean, smudge, process, textconv or command
+	// it defines can run. They reach git through GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n, never
+	// as `-c key=value`: a subsection name may contain '=', and git would split a `-c`
+	// argument at the first one.
+	neutralise [][2]string
 }
 
 // safety applies to every invocation, whatever the repository's configuration says. Wikory
@@ -37,6 +41,31 @@ type Repo struct {
 // filters is deferred to the engine specification (spec 14.6): blobs are hashed raw.
 var safety = []string{"-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "core.hooksPath=" + os.DevNull,
 	"-c", "core.attributesFile=" + os.DevNull, "-c", "diff.external=", "--no-optional-locks", "--literal-pathspecs"}
+
+// baseConfig is applied to every invocation, after any environment config is cleared. It
+// keeps git from walking into submodules, which have config and attributes of their own that
+// no list built from this repository's config can cover.
+var baseConfig = [][2]string{{"status.submoduleSummary", "false"}, {"submodule.recurse", "false"}, {"diff.ignoreSubmodules", "all"}}
+
+// gitEnv is the environment for one git invocation. The caller's GIT_CONFIG_COUNT and its
+// KEY and VALUE entries are dropped and replaced by baseConfig followed by extra, each key
+// and value in its own variable.
+func gitEnv(extra [][2]string) []string {
+	all := append(append([][2]string{}, baseConfig...), extra...)
+	env := make([]string, 0, len(os.Environ())+2*len(all)+5)
+	for _, kv := range os.Environ() {
+		up := strings.ToUpper(kv)
+		if strings.HasPrefix(up, "GIT_CONFIG_COUNT=") || strings.HasPrefix(up, "GIT_CONFIG_KEY_") || strings.HasPrefix(up, "GIT_CONFIG_VALUE_") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	env = append(env, "GIT_CONFIG_COUNT="+strconv.Itoa(len(all)))
+	for i, o := range all {
+		env = append(env, "GIT_CONFIG_KEY_"+strconv.Itoa(i)+"="+o[0], "GIT_CONFIG_VALUE_"+strconv.Itoa(i)+"="+o[1])
+	}
+	return append(env, "GIT_TERMINAL_PROMPT=0", "LC_ALL=C", "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1")
+}
 
 var driverRe = regexp.MustCompile(`^(filter|diff)\.(.+)\.(clean|smudge|process|required|textconv|command)$`)
 
@@ -52,10 +81,10 @@ func (e *Error) Error() string {
 }
 func (e *Error) Unwrap() error { return e.Err }
 
-func run(ctx context.Context, dir string, extra []string, stdin []byte, args ...string) ([]byte, error) {
-	full := append(append(append([]string{"-C", dir}, safety...), extra...), args...)
+func run(ctx context.Context, dir string, extra [][2]string, stdin []byte, args ...string) ([]byte, error) {
+	full := append(append([]string{"-C", dir}, safety...), args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "LC_ALL=C", "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1")
+	cmd.Env = gitEnv(extra)
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
@@ -91,11 +120,33 @@ func Discover(ctx context.Context, dir string) (*Repo, error) {
 			return nil, err
 		}
 	}
-	// Reading config runs nothing. Every named filter and diff driver is overridden to empty.
-	names, _ := run(ctx, r.Top, nil, nil, "config", "--null", "--name-only", "--get-regexp", `^(filter|diff)\.`)
+	// Reading config runs nothing. Every named filter and diff driver is overridden to empty,
+	// and a failure to read it means no Repo at all.
+	if r.neutralise, err = driverOverrides(ctx, r.Top); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// driverOverrides lists the overrides that empty every filter and diff driver setting the
+// repository's config names. It fails closed: exit status 1 with an empty stderr is git's
+// "no matching keys" and gives an empty list (the pattern needs a subsection, so the
+// command-line keys set here, such as diff.external, never match); any other failure, including exit status 1
+// with warnings (a config path git cannot read), is an error.
+func driverOverrides(ctx context.Context, top string) ([][2]string, error) {
+	names, err := run(ctx, top, nil, nil, "config", "--null", "--name-only", "--get-regexp", `^(filter|diff)\..+\.`)
+	if err != nil {
+		var ge *Error
+		var ee *exec.ExitError
+		if !(errors.As(err, &ge) && errors.As(err, &ee) && ee.ExitCode() == 1 && ge.Stderr == "") {
+			return nil, fmt.Errorf("gitx: reading repository config: %w", err)
+		}
+		return nil, nil
+	}
+	var out [][2]string
 	seen := map[string]bool{}
 	for _, n := range bytes.Split(names, []byte{0}) {
-		m := driverRe.FindStringSubmatch(strings.TrimSpace(string(n)))
+		m := driverRe.FindStringSubmatch(string(n))
 		if m == nil {
 			continue
 		}
@@ -103,15 +154,15 @@ func Discover(ctx context.Context, dir string) (*Repo, error) {
 			m[1] + "." + m[2] + ".textconv", m[1] + "." + m[2] + ".command"} {
 			if !seen[key] {
 				seen[key] = true
-				r.neutralise = append(r.neutralise, "-c", key+"=")
+				out = append(out, [2]string{key, ""})
 			}
 		}
 		if req := m[1] + "." + m[2] + ".required"; !seen[req] {
 			seen[req] = true
-			r.neutralise = append(r.neutralise, "-c", req+"=false")
+			out = append(out, [2]string{req, "false"})
 		}
 	}
-	return &r, nil
+	return out, nil
 }
 
 // ObjectFormat is the repository's hash algorithm: "sha1" or "sha256".
@@ -234,7 +285,7 @@ func (r *Repo) OriginURL(ctx context.Context) string {
 
 // Dirty lists changed and untracked paths under pathspec, repository-relative.
 func (r *Repo) Dirty(ctx context.Context, pathspec string) ([]string, error) {
-	out, err := r.git(ctx, nil, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", pathspec)
+	out, err := r.git(ctx, nil, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all", "--", pathspec)
 	if err != nil {
 		return nil, err
 	}

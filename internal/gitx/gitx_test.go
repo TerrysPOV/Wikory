@@ -176,10 +176,69 @@ func TestDriversAreNeutralised(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := strings.Join(r.neutralise, " ")
-	for _, want := range []string{"filter.evil.clean=", "filter.evil.smudge=", "filter.evil.process=", "filter.evil.required=false", "diff.evil.textconv=", "diff.evil.command="} {
-		if !strings.Contains(got, "-c "+want) {
-			t.Errorf("missing override %q in %q", want, got)
+	got := map[string]string{}
+	for _, o := range r.neutralise {
+		got[o[0]] = o[1]
+	}
+	want := map[string]string{"filter.evil.clean": "", "filter.evil.smudge": "", "filter.evil.process": "", "filter.evil.required": "false",
+		"diff.evil.textconv": "", "diff.evil.command": ""}
+	for k, v := range want {
+		if gv, ok := got[k]; !ok || gv != v {
+			t.Errorf("missing override %q=%q in %v", k, v, r.neutralise)
 		}
+	}
+}
+
+// The config read that builds the override list must fail closed: a Repo returned without
+// its overrides would run whatever the repository names. Exit status 1 with an empty stderr
+// is git's "no matching keys" and means an empty list; every other failure is an error,
+// including exit 1 with warnings (an unreadable config file reads as "no keys").
+func TestDriverDiscoveryFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	t.Run("no keys is an empty list", func(t *testing.T) {
+		got, err := driverOverrides(ctx, newRepo(t))
+		if err != nil || len(got) != 0 {
+			t.Fatalf("want an empty list and no error, got %v %v", got, err)
+		}
+	})
+	t.Run("corrupt config", func(t *testing.T) {
+		dir := newRepo(t)
+		f, err := os.OpenFile(filepath.Join(dir, ".git", "config"), os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = f.WriteString("[broken\n")
+		_ = f.Close()
+		if got, err := driverOverrides(ctx, dir); err == nil {
+			t.Fatalf("a corrupt config returned no error: %v", got)
+		}
+	})
+	t.Run("config is a directory", func(t *testing.T) {
+		dir := newRepo(t)
+		cfg := filepath.Join(dir, ".git", "config")
+		if err := os.Remove(cfg); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(cfg, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := driverOverrides(ctx, dir); err == nil {
+			t.Fatalf("an unreadable config returned no error: %v", got)
+		}
+	})
+}
+
+// git refuses a corrupt config before the override read is reached, so this end-to-end check
+// passes with or without the fail-closed read; TestDriverDiscoveryFailsClosed is the guard.
+func TestDiscoverRefusesCorruptConfig(t *testing.T) {
+	dir := newRepo(t)
+	f, err := os.OpenFile(filepath.Join(dir, ".git", "config"), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.WriteString("[broken\n")
+	_ = f.Close()
+	if r, err := Discover(context.Background(), dir); err == nil || r != nil {
+		t.Fatalf("a corrupt config must give an error and no Repo, got %+v %v", r, err)
 	}
 }
