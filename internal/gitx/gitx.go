@@ -19,6 +19,10 @@ var (
 	ErrNotRepo       = errors.New("gitx: not inside a git work tree")
 	ErrAmbiguous     = errors.New("gitx: short object id is ambiguous")
 	ErrUnknownObject = errors.New("gitx: object not found")
+	// ErrWorktreeRedirected means git reports a work tree that is neither the current
+	// directory nor one of its ancestors, as core.worktree in the repository's config can
+	// make it. Wikory writes inside the work tree, so it refuses to follow the redirection.
+	ErrWorktreeRedirected = errors.New("gitx: the repository config redirects its work tree outside the current directory")
 )
 
 var shaRe = regexp.MustCompile(`^[0-9a-f]{4,64}$`)
@@ -28,6 +32,8 @@ type Repo struct {
 	Top       string
 	CommonDir string
 	GitDir    string
+	// Confirmed is true only when git itself vouches that Top is a worktree of this clone.
+	Confirmed bool
 	// neutralise holds key/value config overrides, one per filter and diff driver setting
 	// the repository's own config names, so no clean, smudge, process, textconv or command
 	// it defines can run. They reach git through GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n, never
@@ -129,12 +135,73 @@ func Discover(ctx context.Context, dir string) (*Repo, error) {
 			return nil, err
 		}
 	}
+	// core.worktree in the repository's config can name any directory. Everything Wikory
+	// writes goes inside the work tree, so one that does not contain dir is refused.
+	if !containsDir(r.Top, dir) {
+		return nil, ErrWorktreeRedirected
+	}
 	// Reading config runs nothing. Every named filter and diff driver is overridden to empty,
 	// and a failure to read it means no Repo at all.
 	if r.neutralise, err = driverOverrides(ctx, r.Top); err != nil {
 		return nil, err
 	}
+	r.Confirmed = r.confirm(ctx)
 	return &r, nil
+}
+
+// containsDir reports whether dir is top or lies below it. It compares file identity, not
+// strings, so a case-insensitive file system or a symlinked spelling of dir is not refused.
+func containsDir(top, dir string) bool {
+	topInfo, err := os.Stat(top)
+	if err != nil {
+		return false
+	}
+	d, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	for {
+		if info, err := os.Stat(d); err == nil && os.SameFile(info, topInfo) {
+			return true
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			return false
+		}
+		d = parent
+	}
+}
+
+// confirm reports whether git itself vouches that Top is a worktree of this clone. A
+// directory whose .git file merely names another clone's git directory is reported by
+// rev-parse as a worktree of that clone, so rev-parse alone proves nothing. Either Top is the
+// parent of the common directory (the main work tree), or `git worktree list`, run in the
+// common directory, names it: git records each linked worktree there when it creates it.
+// Any failure is "not confirmed".
+func (r *Repo) confirm(ctx context.Context) bool {
+	if filepath.Base(r.CommonDir) == ".git" && samePath(r.Top, filepath.Dir(r.CommonDir)) {
+		return true
+	}
+	out, err := run(ctx, r.CommonDir, r.neutralise, nil, "worktree", "list", "--porcelain")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if p, ok := strings.CutPrefix(strings.TrimRight(line, "\r"), "worktree "); ok && samePath(r.Top, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// samePath reports whether a and b name the same existing directory.
+func samePath(a, b string) bool {
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bi, err := os.Stat(b)
+	return err == nil && os.SameFile(ai, bi)
 }
 
 // driverOverrides lists the overrides that empty every filter and diff driver setting the
@@ -197,23 +264,45 @@ func (r *Repo) ResolveObject(ctx context.Context, id, kind string) (string, erro
 	return full, nil
 }
 
-// headRev resolves rev (a HEAD^{...} expression), or "" when HEAD names nothing yet.
-func (r *Repo) headRev(ctx context.Context, rev string) string {
+// headRev resolves rev (a HEAD^{...} expression). An unborn HEAD, a branch with no commit
+// yet, is the documented empty id with a nil error. Every other failure of git is an error,
+// so two failed reads can never compare equal as "".
+func (r *Repo) headRev(ctx context.Context, rev string) (string, error) {
 	id, err := r.output(ctx, nil, "rev-parse", "-q", "--verify", rev)
-	if err != nil {
-		return ""
+	if err == nil {
+		return id, nil
 	}
-	return id
+	// With -q, git exits 1 with nothing on stderr when the revision does not resolve. That
+	// is an unborn HEAD only if HEAD is a symbolic ref to a branch that does not exist.
+	var ge *Error
+	var ee *exec.ExitError
+	if !(errors.As(err, &ge) && errors.As(err, &ee) && ee.ExitCode() == 1 && ge.Stderr == "") {
+		return "", err
+	}
+	branch, serr := r.output(ctx, nil, "symbolic-ref", "-q", "HEAD")
+	if serr != nil || branch == "" {
+		return "", err
+	}
+	_, werr := r.git(ctx, nil, "show-ref", "--verify", "-q", branch)
+	var we *Error
+	var wee *exec.ExitError
+	if errors.As(werr, &we) && errors.As(werr, &wee) && wee.ExitCode() == 1 && we.Stderr == "" {
+		return "", nil
+	}
+	if werr != nil {
+		return "", werr
+	}
+	return "", err // the branch exists but its commit does not resolve
 }
 
-// HeadCommit is the full HEAD commit id, or "" before the first commit.
+// HeadCommit is the full HEAD commit id, or "" with a nil error before the first commit.
 func (r *Repo) HeadCommit(ctx context.Context) (string, error) {
-	return r.headRev(ctx, "HEAD^{commit}"), nil
+	return r.headRev(ctx, "HEAD^{commit}")
 }
 
-// HeadTree is the HEAD tree id, or "" before the first commit.
+// HeadTree is the HEAD tree id, or "" with a nil error before the first commit.
 func (r *Repo) HeadTree(ctx context.Context) (string, error) {
-	return r.headRev(ctx, "HEAD^{tree}"), nil
+	return r.headRev(ctx, "HEAD^{tree}")
 }
 
 // HeadBlobs maps each path that is a blob at HEAD to its blob id.
@@ -222,7 +311,11 @@ func (r *Repo) HeadBlobs(ctx context.Context, paths []string) (map[string]string
 	if len(paths) == 0 {
 		return res, nil
 	}
-	if head, _ := r.HeadCommit(ctx); head == "" {
+	head, err := r.HeadCommit(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if head == "" {
 		return res, nil
 	}
 	out, err := r.git(ctx, nil, append([]string{"ls-tree", "-z", "--full-tree", "HEAD", "--"}, paths...)...)

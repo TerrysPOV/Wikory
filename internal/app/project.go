@@ -34,6 +34,9 @@ const (
 var (
 	errNotGit         = &UsageError{Msg: "not inside a git repository (Wikory v1 needs git)"}
 	errNotInitialised = errors.New("this repository has no project-memory/config.toml; run wikory init")
+	// errUnconfirmed: git does not vouch that this directory is a worktree of the clone its
+	// .git points at, so Wikory neither serves, captures nor registers it.
+	errUnconfirmed = &UsageError{Msg: "git does not list this directory as a worktree of the repository its .git points at, so Wikory will not use it"}
 )
 
 // ProjectConfig is the committed project-memory/config.toml.
@@ -83,6 +86,48 @@ budget_tokens = %d
 `, c.ProjectID, c.SchemaVersion, budget))
 }
 
+// cloneIDFile holds, inside a clone's git directory, the nonce the private store recorded when
+// the clone was registered. Trust is keyed on the clone's path, and a path can be reused by a
+// different repository; the nonce is what a replacement cannot carry over.
+const cloneIDFile = "wikory-checkout-id"
+
+// readCloneID returns the nonce in commonDir, or "" when the file is absent or unreadable.
+func readCloneID(commonDir string) string {
+	root, err := confine.Open(commonDir)
+	if err != nil {
+		return ""
+	}
+	defer root.Close()
+	data, err := root.ReadFile(cloneIDFile, 256)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// ensureCloneID makes the store and the git directory agree on a nonce for this clone. It
+// reports replaced when the store knew a different nonce, meaning another repository now
+// occupies the path: the caller discards what the store held for it.
+func ensureCloneID(ctx context.Context, st *store.Store, commonDir string) (replaced bool, err error) {
+	want, known, err := st.CloneID(ctx, commonDir)
+	if err != nil {
+		return false, err
+	}
+	if known && want != "" && readCloneID(commonDir) == want {
+		return false, nil
+	}
+	id := "wkc_" + ids.NewULID()
+	root, err := confine.Open(commonDir)
+	if err != nil {
+		return false, err
+	}
+	defer root.Close()
+	if err := root.WriteFileAtomic(cloneIDFile, []byte(id+"\n"), 0o600); err != nil {
+		return false, fmt.Errorf("recording the clone id in %s: %w", commonDir, err)
+	}
+	return known, st.SetCloneID(ctx, commonDir, id)
+}
+
 // project is what a command knows about the current checkout.
 type project struct {
 	Repo       *gitx.Repo
@@ -114,6 +159,9 @@ func discover(ctx context.Context, env *Env) (*gitx.Repo, *confine.Root, error) 
 		(*f)()
 	}
 	repo, err := gitx.Discover(ctx, env.Cwd)
+	if errors.Is(err, gitx.ErrWorktreeRedirected) {
+		return nil, nil, &UsageError{Msg: "this repository's config (core.worktree) puts its work tree outside the current directory; Wikory will not write there"}
+	}
 	if err != nil {
 		return nil, nil, errNotGit
 	}
@@ -168,11 +216,27 @@ func (p *project) load(ctx context.Context, env *Env, createStore bool) error {
 	if err != nil {
 		return err
 	}
+	p.Notices = append(p.Notices, p.Store.Notices...)
 	decision, _, err := p.Store.TrustDecision(ctx, p.Repo.CommonDir)
 	if err != nil {
 		return err
 	}
 	p.Trusted = decision == store.TrustTrusted
+	// The store must have registered this very clone, not just a clone at this path.
+	if want, known, err := p.Store.CloneID(ctx, p.Repo.CommonDir); err != nil {
+		return err
+	} else if !known || want == "" || readCloneID(p.Repo.CommonDir) != want {
+		p.Trusted = false
+		p.Notices = append(p.Notices, "this path was not registered as this repository (it may have been replaced); run wikory init to register it")
+		return nil
+	}
+	if !p.Repo.Confirmed {
+		// Never registered, never trusted, whatever the store says about the common dir the
+		// .git file names. Nothing is served and nothing captured.
+		p.Trusted = false
+		p.Notices = append(p.Notices, errUnconfirmed.Msg)
+		return nil
+	}
 	co, ok, err := p.Store.LookupCheckout(ctx, p.Identity)
 	if err != nil {
 		return err

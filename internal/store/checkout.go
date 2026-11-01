@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"path/filepath"
+	"slices"
 
 	"github.com/TerrysPOV/Wikory/internal/ids"
 )
@@ -27,11 +29,24 @@ func (s *Store) Register(ctx context.Context, id Identity) (Checkout, error) {
 		ON CONFLICT(id) DO NOTHING`, c.ID, c.CommonDir, c.Worktree, now()); err != nil {
 		return Checkout{}, err
 	}
+	var ownErr error
 	err := s.updateRegistry(func(r *registry) bool {
 		addedDir := r.addCommonDir(id.CommonDir)
-		addedOrigin := r.addOrigin(id.Origin)
+		addedOrigin := false
+		if id.Origin != "" && !slices.Contains(r.Origins, id.Origin) {
+			// Never alias an origin another store owns (see Resolve).
+			var owned bool
+			if owned, ownErr = originOwnedElsewhere(filepath.Join(s.DataDir, "stores"), r.ProjectID, s.Key, id.Origin); owned {
+				s.Notices = append(s.Notices, aliasNotice(id.Origin))
+			} else if ownErr == nil {
+				addedOrigin = r.addOrigin(id.Origin)
+			}
+		}
 		return addedDir || addedOrigin
 	})
+	if err == nil {
+		err = ownErr
+	}
 	return c, err
 }
 

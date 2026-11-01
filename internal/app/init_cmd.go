@@ -45,11 +45,15 @@ func runInit(ctx context.Context, env *Env, args []string) (Result, error) {
 	if len(args) != 0 {
 		return Result{}, &UsageError{Msg: "init takes no arguments"}
 	}
+	var notices []string
 	repo, root, err := discover(ctx, env)
 	if err != nil {
 		return Result{}, err
 	}
 	defer root.Close()
+	if !repo.Confirmed {
+		return Result{}, errUnconfirmed
+	}
 	// Judge emptiness before anything is created: a missing or empty project-memory/ is
 	// ours to trust, any entry (a dotfile or a symlink included) came from elsewhere.
 	pmEmpty := true
@@ -63,7 +67,6 @@ func runInit(ctx context.Context, env *Env, args []string) (Result, error) {
 	if err := root.MkdirAll(pmDir, 0o755); err != nil {
 		return Result{}, fmt.Errorf("creating %s: %w", pmDir, describeConfine(err))
 	}
-	var notices []string
 	created := false
 	var cfg ProjectConfig
 	data, err := root.ReadFile(configPath, 1<<16)
@@ -89,10 +92,23 @@ func runInit(ctx context.Context, env *Env, args []string) (Result, error) {
 		return Result{}, err
 	}
 	defer st.Close()
+	replaced, err := ensureCloneID(ctx, st, repo.CommonDir)
+	if err != nil {
+		return Result{}, err
+	}
+	if replaced {
+		// Another repository now sits where a registered clone was: nothing the store holds
+		// for that path, its trust decision included, is this repository's.
+		if err := st.ForgetClone(ctx, repo.CommonDir); err != nil {
+			return Result{}, err
+		}
+		notices = append(notices, "a different repository now occupies the path of a clone registered earlier; its trust decision was discarded")
+	}
 	co, err := st.Register(ctx, id)
 	if err != nil {
 		return Result{}, err
 	}
+	notices = append(notices, st.Notices...)
 	decision, recorded, err := st.TrustDecision(ctx, repo.CommonDir)
 	if err != nil {
 		return Result{}, err
