@@ -15,3 +15,9 @@ TASK-QUEUE.md
 WORKING.md
 hipocampus.config.json
 /memory/
+
+# Build outputs
+/bin/
+/dist/
+/wikory
+/wikory.exe
