@@ -14,6 +14,12 @@ const (
 	bashResult = `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"ok"}]}}`
 	editUse    = `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"/repo/q.go"}}]}}`
 	finalLine  = `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done: all good."}]}}`
+
+	// Lines for the tests of several turns in one transcript.
+	useA     = `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"a1","name":"Bash","input":{"command":"go test ./a"}}]}}`
+	useB     = `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"go test ./b"}}]}}`
+	useC     = `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"Bash","input":{"command":"go test ./c"}}]}}`
+	doneLine = `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}`
 )
 
 func TestSealWaitsForTheFinalMessageThenFillsFacts(t *testing.T) {
@@ -128,15 +134,11 @@ func TestUnobservedCommandIsNotVerified(t *testing.T) {
 func TestTurnSliceStopsAtTheNextTurn(t *testing.T) {
 	ctx := context.Background()
 	r := newRig(t)
-	useA := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"a1","name":"Bash","input":{"command":"go test ./a"}}]}}`
-	useB := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"go test ./b"}}]}}`
-	done := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}`
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn one", "p1", ""))
-	r.appendTranscript(t, useA, done)
+	r.appendTranscript(t, useA, doneLine)
 	id1, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "Done."))
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn two", "p2", ""))
-	useC := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"Bash","input":{"command":"go test ./c"}}]}}`
-	r.appendTranscript(t, useB, done, useC) // useC follows turn 2's own end marker (a continuation)
+	r.appendTranscript(t, useB, doneLine, useC) // useC follows turn 2's own end marker (a continuation)
 	id2, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p2", "Done."))
 	if n, err := r.rec.Seal(ctx, time.Now().Add(time.Second)); err != nil || n != 2 {
 		t.Fatalf("n=%d err=%v", n, err)
@@ -153,12 +155,10 @@ func TestTurnSliceStopsAtTheNextTurn(t *testing.T) {
 func TestRepeatedFinalTextDoesNotCompleteTheWrongTurn(t *testing.T) {
 	ctx := context.Background()
 	r := newRig(t)
-	useB := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"go test ./b"}}]}}`
-	done := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}`
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn one", "p1", ""))
 	id1, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "Done."))
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn two", "p2", ""))
-	r.appendTranscript(t, useB, done)
+	r.appendTranscript(t, useB, doneLine)
 	_, _, _ = r.rec.Stop(ctx, r.ev(decode.Stop, "", "p2", "Done."))
 	_, _ = r.rec.Seal(ctx, time.Now().Add(time.Second))
 	if v := r.versions(t, id1); len(v) != 1 {
@@ -216,11 +216,11 @@ func TestDelayedFlushWithPromptIdentityAttributesEachTurn(t *testing.T) {
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn two", "p2", "")) // still offset 0
 	r.appendTranscript(t,
 		`{"type":"user","promptId":"p1","message":{"role":"user","content":"turn one"}}`,
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"a1","name":"Bash","input":{"command":"go test ./a"}}]}}`,
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}`,
+		useA,
+		doneLine,
 		`{"type":"user","promptId":"p2","message":{"role":"user","content":"turn two"}}`,
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"go test ./b"}}]}}`,
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}`)
+		useB,
+		doneLine)
 	id2, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p2", "Done."))
 	if n, err := r.rec.Seal(ctx, time.Now().Add(time.Second)); err != nil || n != 2 {
 		t.Fatalf("n=%d err=%v", n, err)
@@ -241,10 +241,10 @@ func TestDelayedFlushWithoutIdentityAttachesNothing(t *testing.T) {
 	id1, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "Done."))
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn two", "p2", ""))
 	r.appendTranscript(t,
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"a1","name":"Bash","input":{"command":"go test ./a"}}]}}`,
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}`,
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"go test ./b"}}]}}`,
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}`)
+		useA,
+		doneLine,
+		useB,
+		doneLine)
 	id2, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p2", "Done."))
 	if n, _ := r.rec.Seal(ctx, time.Now().Add(time.Second)); n != 0 {
 		t.Fatalf("an ambiguous turn was completed: n=%d", n)
@@ -267,14 +267,11 @@ func TestDelayedFlushWithoutIdentityAttachesNothing(t *testing.T) {
 func TestRepeatedFinalTextAcrossDistinctOffsetsDoesNotCompleteTheWrongTurn(t *testing.T) {
 	ctx := context.Background()
 	r := newRig(t)
-	useA := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"a1","name":"Bash","input":{"command":"go test ./a"}}]}}`
-	useB := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"go test ./b"}}]}}`
-	done := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}`
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn one", "p1", ""))
 	r.appendTranscript(t, useA) // turn 1's own final message is never written
 	id1, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "Done."))
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn two", "p2", "")) // a later offset
-	r.appendTranscript(t, useB, done)
+	r.appendTranscript(t, useB, doneLine)
 	_, _, _ = r.rec.Stop(ctx, r.ev(decode.Stop, "", "p2", "Done."))
 	_, _ = r.rec.Seal(ctx, time.Now().Add(time.Second))
 	if v := r.versions(t, id1); len(v) != 1 {

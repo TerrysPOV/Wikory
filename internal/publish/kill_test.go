@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/TerrysPOV/Wikory/internal/confine"
 )
 
 var appliedSteps = []string{"manifest", "applied-0", "marked-0", "dbmarked-0", "moved-1", "compared-1", "installed-1", "applied-1", "marked-1", "dbmarked-1", "appended", "logged", "committed"}
@@ -35,7 +37,7 @@ func noTemps(t *testing.T, f *fixture) {
 	t.Helper()
 	ents, _ := os.ReadDir(filepath.Join(f.repoDir, "project-memory", "wiki"))
 	for _, e := range ents {
-		if strings.HasPrefix(e.Name(), ".wikory-tmp-") || strings.HasPrefix(e.Name(), ".wikory-backup-") {
+		if strings.HasPrefix(e.Name(), confine.TempPrefix) || strings.HasPrefix(e.Name(), confine.BackupPrefix) {
 			t.Fatalf("temp or backup file left behind: %s", e.Name())
 		}
 	}

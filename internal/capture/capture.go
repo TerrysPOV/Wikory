@@ -217,15 +217,19 @@ func (r *Recorder) Stop(ctx context.Context, ev decode.Event) (string, bool, err
 	return r.createOrComplete(ctx, rec)
 }
 
+func (r *Recorder) turnDir(turnID string) string {
+	return fmt.Sprintf("turns/%s/%s", r.CheckoutID, turnID)
+}
+
 func (r *Recorder) versionPath(turnID string, v int) string {
-	return fmt.Sprintf("turns/%s/%s/v%04d.json", r.CheckoutID, turnID, v)
+	return fmt.Sprintf("%s/v%04d.json", r.turnDir(turnID), v)
 }
 
 // writeVersion cleans every text field, then creates one immutable version file.
 // ErrExist means that version is already on disk.
 func (r *Recorder) writeVersion(rec *Record) error {
 	redactRecord(rec)
-	if err := r.Store.Root.MkdirAll(fmt.Sprintf("turns/%s/%s", r.CheckoutID, rec.TurnID), 0o700); err != nil {
+	if err := r.Store.Root.MkdirAll(r.turnDir(rec.TurnID), 0o700); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(rec, "", "  ")

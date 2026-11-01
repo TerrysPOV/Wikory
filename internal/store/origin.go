@@ -16,6 +16,7 @@ func CanonicalOrigin(raw string) (string, bool) {
 		return "", false
 	}
 	var host, p string
+	at, colon := strings.Index(s, "@"), strings.Index(s, ":")
 	switch {
 	case strings.Contains(s, "://"):
 		u, err := url.Parse(s)
@@ -23,13 +24,14 @@ func CanonicalOrigin(raw string) (string, bool) {
 			return "", false
 		}
 		host, p = u.Hostname(), u.Path
-	case strings.Contains(s, "@") && strings.Contains(s[strings.Index(s, "@"):], ":"):
-		rest := s[strings.Index(s, "@")+1:]
+	case at >= 0 && strings.Contains(s[at:], ":"):
+		// scp-like form, user@host:owner/repo
+		rest := s[at+1:]
 		c := strings.Index(rest, ":")
 		host, p = rest[:c], rest[c+1:]
-	case strings.Index(s, ":") > 1 && !strings.Contains(s[:strings.Index(s, ":")], "/"):
-		c := strings.Index(s, ":")
-		host, p = s[:c], s[c+1:]
+	case colon > 1 && !strings.Contains(s[:colon], "/"):
+		// scp-like form without a user, host:owner/repo
+		host, p = s[:colon], s[colon+1:]
 	default:
 		return "", false
 	}

@@ -9,6 +9,10 @@ import (
 	"path/filepath"
 )
 
+// maxJudged bounds the bytes read back from a file whose content is judged (a moved-aside
+// backup, or a target examined during recovery).
+const maxJudged = 1 << 26
+
 // Root is an authorised directory, held open as a directory handle.
 //
 // Threat model. Root paths come from Wikory itself (the git top level, the private store,
@@ -21,7 +25,7 @@ import (
 // at any depth, including one swapped in after any earlier check, is refused by the kernel
 // rather than followed. Identity comparisons supplement this; they never substitute for it.
 // Windows uses os.Root with reparse-point checks before and after each open; its residual
-// race is stated in dir_windows.go.
+// race is stated in root_windows.go.
 type Root struct {
 	dir string // resolved path, for display and relative-path computation only; never opened
 	h   *dirH
@@ -212,7 +216,7 @@ func (r *Root) ReplaceIfUnchanged(rel string, data []byte, perm fs.FileMode, wan
 	cur, rerr := dir.openFile(bak, os.O_RDONLY, 0)
 	var current []byte
 	if rerr == nil {
-		current, rerr = readLimited(cur, 1<<26)
+		current, rerr = readLimited(cur, maxJudged)
 		cur.Close()
 	}
 	if rerr != nil || !want(current) {
@@ -270,7 +274,7 @@ func (r *Root) RestoreBackups(rel string, done func(target string, current []byt
 		}
 		f, err := dir.openFile(target, os.O_RDONLY, 0)
 		if err == nil {
-			cur, rerr := readLimited(f, 1<<26)
+			cur, rerr := readLimited(f, maxJudged)
 			f.Close()
 			if rerr == nil && done(target, cur) {
 				dir.remove(e.Name())

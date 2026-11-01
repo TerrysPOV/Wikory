@@ -105,16 +105,25 @@ func (p *Publisher) Recover(ctx context.Context) (Report, error) {
 		}
 		rep.Completed = append(rep.Completed, m.JobID)
 	}
+	if err := p.abandonStale(ctx, withManifest, &rep); err != nil {
+		return rep, err
+	}
+	return rep, nil
+}
+
+// abandonStale marks as abandoned every begun job of this checkout that has no manifest and
+// is older than AbandonAfter: the process stopped before it staged anything.
+func (p *Publisher) abandonStale(ctx context.Context, withManifest map[string]bool, rep *Report) error {
 	rows, err := p.DB.QueryContext(ctx, `SELECT job_id, created_at FROM jobs WHERE checkout_id = ? AND state = 'begun'`, p.CheckoutID)
 	if err != nil {
-		return rep, err
+		return err
 	}
 	var stale []string
 	for rows.Next() {
 		var id, created string
 		if err := rows.Scan(&id, &created); err != nil {
 			rows.Close()
-			return rep, err
+			return err
 		}
 		t, _ := time.Parse(time.RFC3339Nano, created)
 		if !withManifest[id] && p.Now().Sub(t) >= p.AbandonAfter {
@@ -124,11 +133,11 @@ func (p *Publisher) Recover(ctx context.Context) (Report, error) {
 	rows.Close()
 	for _, id := range stale {
 		if err := p.setJob(ctx, id, "abandoned", "no manifest written before the process stopped"); err != nil {
-			return rep, err
+			return err
 		}
 		rep.Abandoned = append(rep.Abandoned, id)
 	}
-	return rep, nil
+	return nil
 }
 
 // cleanTargets undoes what an interrupted write left beside the targets: a backup whose

@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"slices"
 
 	"github.com/TerrysPOV/Wikory/internal/ids"
 )
@@ -29,16 +28,9 @@ func (s *Store) Register(ctx context.Context, id Identity) (Checkout, error) {
 		return Checkout{}, err
 	}
 	err := s.updateRegistry(func(r *registry) bool {
-		changed := false
-		if !slices.Contains(r.CommonDirs, id.CommonDir) {
-			r.CommonDirs = append(r.CommonDirs, id.CommonDir)
-			changed = true
-		}
-		if id.Origin != "" && !slices.Contains(r.Origins, id.Origin) {
-			r.Origins = append(r.Origins, id.Origin)
-			changed = true
-		}
-		return changed
+		addedDir := r.addCommonDir(id.CommonDir)
+		addedOrigin := r.addOrigin(id.Origin)
+		return addedDir || addedOrigin
 	})
 	return c, err
 }

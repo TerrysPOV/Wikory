@@ -48,6 +48,33 @@ type Store struct {
 
 var storeSubdirs = []string{"turns", "jobs", "locks", "logs"}
 
+const (
+	registryLockWait = 5 * time.Second
+	maxRegistryFile  = 1 << 16
+)
+
+// addOrigin records origin when it is non-empty and new, and reports whether it changed r.
+func (r *registry) addOrigin(origin string) bool {
+	if origin == "" || slices.Contains(r.Origins, origin) {
+		return false
+	}
+	r.Origins = append(r.Origins, origin)
+	return true
+}
+
+// addCommonDir records commonDir when it is new, and reports whether it changed r.
+func (r *registry) addCommonDir(commonDir string) bool {
+	if slices.Contains(r.CommonDirs, commonDir) {
+		return false
+	}
+	r.CommonDirs = append(r.CommonDirs, commonDir)
+	return true
+}
+
+func lockRegistry(dataDir string) (func(), error) {
+	return Lock(filepath.Join(dataDir, "registry.lock"), registryLockWait)
+}
+
 // Resolve finds the store for id, creating it when create is true. It never registers a checkout.
 func Resolve(ctx context.Context, dataDir string, id Identity, create bool) (*Store, error) {
 	RestrictUmask()
@@ -57,7 +84,7 @@ func Resolve(ctx context.Context, dataDir string, id Identity, create bool) (*St
 			return nil, err
 		}
 	}
-	unlock, err := Lock(filepath.Join(dataDir, "registry.lock"), 5*time.Second)
+	unlock, err := lockRegistry(dataDir)
 	if err != nil {
 		return nil, err
 	}
@@ -66,20 +93,17 @@ func Resolve(ctx context.Context, dataDir string, id Identity, create bool) (*St
 	if err != nil {
 		return nil, err
 	}
-	dirty := false
-	if !found {
+	var dirty bool
+	if found {
+		// A new origin is reachable only when found through a registered common directory.
+		dirty = reg.addOrigin(id.Origin)
+	} else {
 		if !create {
 			return nil, ErrNoStore
 		}
 		key = StoreKey(id.ProjectID, id.Origin, id.CommonDir)
 		reg = registry{ProjectID: id.ProjectID}
-		if id.Origin != "" {
-			reg.Origins = []string{id.Origin}
-		}
-		dirty = true
-	} else if id.Origin != "" && !slices.Contains(reg.Origins, id.Origin) {
-		// Reachable only when found through a registered common directory.
-		reg.Origins = append(reg.Origins, id.Origin)
+		reg.addOrigin(id.Origin)
 		dirty = true
 	}
 	dir := filepath.Join(stores, key)
@@ -124,7 +148,7 @@ func findStore(stores string, id Identity) (string, registry, bool, error) {
 		if !e.IsDir() {
 			continue
 		}
-		data, err := root.ReadFile(e.Name()+"/store.toml", 1<<16)
+		data, err := root.ReadFile(e.Name()+"/store.toml", maxRegistryFile)
 		if err != nil {
 			continue // a half-created store without a registry is not a match
 		}
@@ -149,12 +173,12 @@ func (s *Store) writeRegistry() error {
 
 // updateRegistry re-reads store.toml under the registry lock, applies change, and writes it.
 func (s *Store) updateRegistry(change func(*registry) bool) error {
-	unlock, err := Lock(filepath.Join(s.DataDir, "registry.lock"), 5*time.Second)
+	unlock, err := lockRegistry(s.DataDir)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	data, err := s.Root.ReadFile("store.toml", 1<<16)
+	data, err := s.Root.ReadFile("store.toml", maxRegistryFile)
 	if err != nil {
 		return err
 	}

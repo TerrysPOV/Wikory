@@ -90,6 +90,7 @@ func standardOps() []Op {
 		{Target: "project-memory/wiki/b.md", OldHash: HashContent([]byte("B0")), Content: []byte("B1")},
 	}
 }
+
 func symlinksAvailable() bool {
 	d, err := os.MkdirTemp("", "wikory-symlink-probe")
 	if err != nil {

@@ -201,10 +201,8 @@ func TestMetadataIsRedactedAndNoAbsolutePathIsStored(t *testing.T) {
 	ctx := context.Background()
 	r := newRig(t)
 	tok := "ghp_" + strings.Repeat("A1b2", 9)
-	for _, args := range [][]string{{"checkout", "-q", "-b", "fix-" + tok}} {
-		if out, err := exec.Command("git", append([]string{"-C", r.repoDir}, args...)...).CombinedOutput(); err != nil {
-			t.Fatalf("%v %s", err, out)
-		}
+	if out, err := exec.Command("git", "-C", r.repoDir, "checkout", "-q", "-b", "fix-"+tok).CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
 	}
 	if err := os.WriteFile(filepath.Join(r.repoDir, "notes-"+tok+".txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)

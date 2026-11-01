@@ -179,7 +179,28 @@ func (p *Publisher) Publish(ctx context.Context, j Job, ops []Op, logLine string
 	}
 	defer unlock()
 	killHook("locked")
-	// Step 1: fencing and revalidation.
+	if err := p.revalidate(ctx, j, ops); err != nil {
+		return err
+	}
+	m, err := p.stageOps(j, ops, logLine)
+	if err != nil {
+		return err
+	}
+	killHook("staged")
+	if err := p.writeManifest(m); err != nil {
+		return err
+	}
+	if err := p.recordOps(ctx, m); err != nil {
+		return err
+	}
+	killHook("manifest")
+	return p.apply(ctx, m)
+}
+
+// revalidate is step 1 of the protocol: fencing and revalidation. The job must still be
+// begun at this epoch for this checkout, the tree fingerprint must be unchanged, and every
+// target must still hold its base content. A refusal that is final is recorded on the job.
+func (p *Publisher) revalidate(ctx context.Context, j Job, ops []Op) error {
 	var state, checkout string
 	var epoch int64
 	if err := p.DB.QueryRowContext(ctx, `SELECT state, checkout_id, epoch FROM jobs WHERE job_id = ?`, j.ID).Scan(&state, &checkout, &epoch); err != nil {
@@ -213,16 +234,21 @@ func (p *Publisher) Publish(ctx context.Context, j Job, ops []Op, logLine string
 			return fmt.Errorf("%w: %s", ErrConflict, op.Target)
 		}
 	}
-	// Step 2: stage every new version, write the manifest, record the ops in the database.
+	return nil
+}
+
+// stageOps is the staging half of step 2: it writes every new version into the job's stage
+// directory and returns the manifest that describes them.
+func (p *Publisher) stageOps(j Job, ops []Op, logLine string) (*manifest, error) {
 	if err := p.Store.MkdirAll(jobDir(j.ID)+"/stage", 0o700); err != nil {
-		return err
+		return nil, err
 	}
-	m := manifest{Schema: "wikory.manifest/v1", JobID: j.ID, CheckoutID: j.CheckoutID, Fingerprint: j.Fingerprint,
+	m := &manifest{Schema: "wikory.manifest/v1", JobID: j.ID, CheckoutID: j.CheckoutID, Fingerprint: j.Fingerprint,
 		Epoch: j.Epoch, State: "applying", LogLine: logLine}
 	for i, op := range ops {
 		staged := fmt.Sprintf("%s/stage/%d", jobDir(j.ID), i)
 		if err := p.Store.WriteFileAtomic(staged, op.Content, 0o600); err != nil {
-			return err
+			return nil, err
 		}
 		perm := op.Perm
 		if perm == 0 {
@@ -230,15 +256,15 @@ func (p *Publisher) Publish(ctx context.Context, j Job, ops []Op, logLine string
 		}
 		m.Ops = append(m.Ops, manifestOp{Target: op.Target, Old: op.OldHash, New: HashContent(op.Content), Staged: staged, Perm: uint32(perm), State: "pending"})
 	}
-	killHook("staged")
-	if err := p.writeManifest(&m); err != nil {
-		return err
+	return m, nil
+}
+
+// fencedOneRow turns an epoch-guarded update that matched no row into ErrStaleEpoch.
+func fencedOneRow(res sql.Result) error {
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrStaleEpoch
 	}
-	if err := p.recordOps(ctx, &m); err != nil {
-		return err
-	}
-	killHook("manifest")
-	return p.apply(ctx, &m)
+	return nil
 }
 
 // recordOps marks the job applying and records each operation as pending, in one transaction.
@@ -252,8 +278,8 @@ func (p *Publisher) recordOps(ctx context.Context, m *manifest) error {
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return ErrStaleEpoch
+	if err := fencedOneRow(res); err != nil {
+		return err
 	}
 	for i, op := range m.Ops {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO job_ops(job_id, idx, target, old_hash, new_hash, state) VALUES(?, ?, ?, ?, ?, 'pending')
@@ -279,10 +305,7 @@ func (p *Publisher) markDone(ctx context.Context, m *manifest, i int) error {
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return ErrStaleEpoch
-	}
-	return nil
+	return fencedOneRow(res)
 }
 
 // apply runs steps 3 to 5 from whatever state the manifest records. Recovery calls it too.
@@ -361,8 +384,8 @@ func (p *Publisher) apply(ctx context.Context, m *manifest) error {
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return ErrStaleEpoch
+	if err := fencedOneRow(res); err != nil {
+		return err
 	}
 	killHook("committed")
 	m.State = "done"
