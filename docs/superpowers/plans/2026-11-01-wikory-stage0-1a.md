@@ -6,7 +6,7 @@
 
 **Architecture:** One Go binary (`cmd/wikory`) over one internal application layer (`internal/app`). Deterministic packages underneath: `confine` (rooted, no-follow file access), `store` (private store, key, registration, SQLite), `gitx` (git facts), `claim` (metadata grammar and page parsing), `validate` (spec 5.5 rules), `publish` (manifest protocol), `decode` (Claude Code payloads and transcripts), `capture` (turn records), `retrieve` (FTS5 index, search, briefing), `redact`. No model work and no MCP in 1a.
 
-**Tech Stack:** Go (go directive 1.25, local toolchain 1.27.3), `modernc.org/sqlite` (pure Go, FTS5), `github.com/pelletier/go-toml/v2`, `golang.org/x/sys`, `golang.org/x/text`, git CLI, GitHub Actions matrix (ubuntu, macos, windows).
+**Tech Stack:** Go (go directive 1.26.0, local toolchain 1.27.3), `modernc.org/sqlite` (pure Go, FTS5), `github.com/pelletier/go-toml/v2`, `golang.org/x/sys`, `golang.org/x/text`, git CLI, GitHub Actions matrix (ubuntu, macos, windows).
 
 **Module path:** `github.com/TerrysPOV/Wikory`. If the repository later moves to the POVIEW-AI organisation (G5), the module path changes with a mechanical rename (`go mod edit -module` plus an import rewrite); nothing in this plan depends on the owner name.
 
@@ -19,7 +19,7 @@
 - Stage specific files only (`git add <paths>`). Never `git add -A` or `git add .`: the working tree holds untracked scaffolding that is not ours (`.serena/`, `SCRATCHPAD.md`, `TASK-QUEUE.md`, `WORKING.md`, `hipocampus.config.json`, `memory/`). The pending `.gitignore` change is committed in Task S0.
 - Commit per task. The orchestrator pushes the branch `feat/stage0-1a-skeleton` after review, which starts CI, including the Windows job. Do not open a PR.
 - PATH for every command: `export PATH=/opt/homebrew/bin:$PATH` (Go 1.27.3 lives there).
-- `go.mod` go directive is `go 1.25` (the floor that provides `os.Root` with `Rename` and `Link`, confirmed in Task S2). Do not raise it without a recorded reason.
+- `go.mod` go directive is `go 1.26.0`. The API floor for `os.Root` with `Rename` and `Link` is Go 1.25 (confirmed in Task S2), but the latest `modernc.org/sqlite`, `golang.org/x/sys` and `golang.org/x/text` each declare `go 1.26.0`, so `go mod tidy` raises the directive. Orchestrator decision 2026-11-01: accept 1.26.0 (a currently supported Go release; 1.25 is out of support). Do not raise it further without a recorded reason.
 - Dependencies, and only these: `modernc.org/sqlite`, `github.com/pelletier/go-toml/v2`, `golang.org/x/sys`, `golang.org/x/text`. All are pinned in `go.sum` in Task S0 and justified in `internal/deps/deps.go`. No MCP SDK in 1a (spec 12 places MCP with the recorder, see spec question Q15).
 - The binary opens no network connection. It may run `git`. Tests may run `git`.
 - Never print a credential. Tests that need secret-shaped strings build them at runtime by concatenation (for example `"AK" + "IA" + strings.Repeat("Q", 16)`), so no literal secret shape lands in source and the user's `block-secrets-in-code.sh` hook does not fire.
@@ -497,7 +497,7 @@ echo "assembled $out from $(ls docs/spikes/results/V*.md 2>/dev/null | wc -l | t
 ```markdown
 # Verified capabilities (stage 0)
 
-Products: Claude Code 2.1.316, Codex CLI 0.165.0, Go 1.27.3 (go directive 1.25), macOS arm64 host.
+Products: Claude Code 2.1.316, Codex CLI 0.165.0, Go 1.27.3 (go directive 1.26.0), macOS arm64 host.
 Status values: verified, refuted, partial, pending-ci, not-verifiable-here.
 Assembled by docs/spikes/assemble.sh from docs/spikes/results/. Do not edit by hand.
 ```
