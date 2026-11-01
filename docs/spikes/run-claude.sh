@@ -12,10 +12,10 @@ mkdir -p "$out"
 mcp_args=(--strict-mcp-config --mcp-config "$SPIKE_S/empty-mcp.json")
 if [ "${SPIKE_STRICT_MCP:-1}" = 0 ]; then mcp_args=(); fi
 settings=${SPIKE_SETTINGS:-$SPIKE_S/settings.json}
-envs=(); while IFS= read -r line; do envs+=("$line"); done < <(spike_env) # bash 3.2 has no mapfile
+spike_load_env
 cd "$SPIKE_S/proj"
 set +e
-env -i "${envs[@]}" SPIKE_OUT="$out" SPIKE_COPY_TRANSCRIPT=1 \
+env -i "${SPIKE_ENVS[@]}" SPIKE_OUT="$out" SPIKE_COPY_TRANSCRIPT=1 \
   claude -p "$prompt" --model haiku --setting-sources project --settings "$settings" \
   ${mcp_args[@]+"${mcp_args[@]}"} --output-format json "$@" > "$out/result.json" 2> "$out/stderr.txt"
 rc=$?

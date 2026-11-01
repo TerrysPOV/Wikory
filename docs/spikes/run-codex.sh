@@ -10,10 +10,10 @@ shift 2
 n=$(ledger_take codex "$label" exec)
 out=$SPIKE_S/out/$label
 mkdir -p "$out" "$SPIKE_S/codex-home"
-envs=(); while IFS= read -r line; do envs+=("$line"); done < <(spike_env) # bash 3.2 has no mapfile
+spike_load_env
 cd "$SPIKE_S/proj"
 set +e
-env -i "${envs[@]}" CODEX_HOME="$SPIKE_S/codex-home" SPIKE_OUT="$out" \
+env -i "${SPIKE_ENVS[@]}" CODEX_HOME="$SPIKE_S/codex-home" SPIKE_OUT="$out" \
   codex exec --skip-git-repo-check "$@" "$prompt" > "$out/result.txt" 2>&1
 rc=$?
 set -e

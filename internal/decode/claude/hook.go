@@ -30,6 +30,8 @@ func KindFromArg(arg string) (decode.Kind, bool) {
 	return k, ok
 }
 
+// payload follows the committed 2.1.316 fixtures (V06). Unknown keys (effort,
+// permission_mode, session_crons, tool_* and any later additions) are ignored.
 type payload struct {
 	SessionID            string            `json:"session_id"`
 	PromptID             string            `json:"prompt_id"`
@@ -45,9 +47,6 @@ type payload struct {
 	AgentTranscriptPath  string            `json:"agent_transcript_path"`
 	BackgroundTasks      []json.RawMessage `json:"background_tasks"`
 }
-
-// payload follows the committed 2.1.316 fixtures (V06). Unknown keys (effort,
-// permission_mode, session_crons, tool_* and any later additions) are ignored.
 
 var winAbs = regexp.MustCompile(`^([A-Za-z]:[\\/]|\\\\)`)
 

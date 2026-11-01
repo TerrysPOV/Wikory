@@ -30,13 +30,6 @@ func spikeTree(t *testing.T) (root, outside string) {
 	return root, outside
 }
 
-func must(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestOSRootRefusesEscape(t *testing.T) {
 	root, _ := spikeTree(t)
 	r, err := os.OpenRoot(root)

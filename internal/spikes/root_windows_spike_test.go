@@ -14,15 +14,9 @@ func TestWindowsJunctionUnderOSRoot(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "root")
 	outside := filepath.Join(base, "outside")
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(outside, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("OUTSIDE"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	must(t, os.MkdirAll(root, 0o755))
+	must(t, os.MkdirAll(outside, 0o755))
+	must(t, os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("OUTSIDE"), 0o644))
 	junc := filepath.Join(root, "junc")
 	if out, err := exec.Command("cmd", "/c", "mklink", "/J", junc, outside).CombinedOutput(); err != nil {
 		t.Fatalf("mklink /J failed: %v %s", err, out)
@@ -49,12 +43,8 @@ func TestWindowsJunctionUnderOSRoot(t *testing.T) {
 // recorded as verified results here rather than assumed.
 func TestWindowsSameFileAndOpenDirectoryRename(t *testing.T) {
 	base := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(base, "d"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(base, "d", "f.txt"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	must(t, os.MkdirAll(filepath.Join(base, "d"), 0o755))
+	must(t, os.WriteFile(filepath.Join(base, "d", "f.txt"), []byte("x"), 0o644))
 	r, err := os.OpenRoot(base)
 	if err != nil {
 		t.Fatal(err)

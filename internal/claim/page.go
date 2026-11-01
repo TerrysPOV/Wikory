@@ -40,8 +40,7 @@ type Page struct {
 
 // ParsePage parses a page. It never fails: problems become findings.
 func ParsePage(rel string, data []byte) Page {
-	text := strings.ReplaceAll(strings.ReplaceAll(string(data), "\r\n", "\n"), "\r", "\n")
-	lines := strings.Split(text, "\n")
+	lines := strings.Split(normaliseNewlines(string(data)), "\n")
 	p := Page{RelPath: rel, Type: "concept"}
 	start := p.parseFrontmatter(lines)
 	var body []string

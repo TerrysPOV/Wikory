@@ -4,6 +4,7 @@
 #   ledger_take PRODUCT LABEL KIND   reserve one launch in the shared ledger, or refuse the 13th
 #   ledger_usage N RESULT_JSON       log the usage a launch reported (internal calls are logged, not counted)
 #   spike_env                print the env -i arguments every launch uses
+#   spike_load_env           load those arguments into the SPIKE_ENVS array
 # The budget unit is a CLI launch: 12 across all of stage 0, Claude Code and Codex together,
 # interactive or not. Retries count. Nothing resets the ledger.
 : "${WIKORY_SPIKE_SCRATCH:?set WIKORY_SPIKE_SCRATCH to a scratch directory outside the repository}"
@@ -43,6 +44,10 @@ spike_env() {
   printf '%s\n' "HOME=$HOME" "USER=$USER" "LOGNAME=$USER" "PATH=$SPIKE_S/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin" \
     "TERM=xterm-256color" "LANG=en_GB.UTF-8"
   if [ -e "$SPIKE_S/config-dir-ok" ]; then printf '%s\n' "CLAUDE_CONFIG_DIR=$SPIKE_S/claude-config"; fi
+}
+
+spike_load_env() {
+  SPIKE_ENVS=(); while IFS= read -r line; do SPIKE_ENVS+=("$line"); done < <(spike_env) # bash 3.2 has no mapfile
 }
 
 # Moves the session logs Claude Code wrote for the scratch project out of the real projects

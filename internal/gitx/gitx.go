@@ -104,6 +104,15 @@ func (r *Repo) git(ctx context.Context, stdin []byte, args ...string) ([]byte, e
 	return run(ctx, r.Top, r.neutralise, stdin, args...)
 }
 
+// output runs git and returns its standard output without surrounding whitespace.
+func (r *Repo) output(ctx context.Context, stdin []byte, args ...string) (string, error) {
+	out, err := r.git(ctx, stdin, args...)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // Discover finds the worktree containing dir and prepares the driver overrides.
 func Discover(ctx context.Context, dir string) (*Repo, error) {
 	out, err := run(ctx, dir, nil, nil, "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir", "--absolute-git-dir")
@@ -150,14 +159,15 @@ func driverOverrides(ctx context.Context, top string) ([][2]string, error) {
 		if m == nil {
 			continue
 		}
-		for _, key := range []string{m[1] + "." + m[2] + ".clean", m[1] + "." + m[2] + ".smudge", m[1] + "." + m[2] + ".process",
-			m[1] + "." + m[2] + ".textconv", m[1] + "." + m[2] + ".command"} {
+		base := m[1] + "." + m[2]
+		for _, setting := range []string{"clean", "smudge", "process", "textconv", "command"} {
+			key := base + "." + setting
 			if !seen[key] {
 				seen[key] = true
 				out = append(out, [2]string{key, ""})
 			}
 		}
-		if req := m[1] + "." + m[2] + ".required"; !seen[req] {
+		if req := base + ".required"; !seen[req] {
 			seen[req] = true
 			out = append(out, [2]string{req, "false"})
 		}
@@ -167,11 +177,7 @@ func driverOverrides(ctx context.Context, top string) ([][2]string, error) {
 
 // ObjectFormat is the repository's hash algorithm: "sha1" or "sha256".
 func (r *Repo) ObjectFormat(ctx context.Context) (string, error) {
-	out, err := r.git(ctx, nil, "rev-parse", "--show-object-format")
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
+	return r.output(ctx, nil, "rev-parse", "--show-object-format")
 }
 
 // ResolveObject turns a full or short object id into the unique full id of an object of
@@ -180,7 +186,7 @@ func (r *Repo) ResolveObject(ctx context.Context, id, kind string) (string, erro
 	if !shaRe.MatchString(id) || (kind != "blob" && kind != "commit") {
 		return "", fmt.Errorf("gitx: %q is not an object id", id)
 	}
-	out, err := r.git(ctx, nil, "rev-parse", "--verify", "--end-of-options", id+"^{"+kind+"}")
+	full, err := r.output(ctx, nil, "rev-parse", "--verify", "--end-of-options", id+"^{"+kind+"}")
 	if err != nil {
 		var ge *Error
 		if errors.As(err, &ge) && strings.Contains(ge.Stderr, "ambiguous") {
@@ -188,25 +194,26 @@ func (r *Repo) ResolveObject(ctx context.Context, id, kind string) (string, erro
 		}
 		return "", fmt.Errorf("%w: %s", ErrUnknownObject, id)
 	}
-	return strings.TrimSpace(string(out)), nil
+	return full, nil
+}
+
+// headRev resolves rev (a HEAD^{...} expression), or "" when HEAD names nothing yet.
+func (r *Repo) headRev(ctx context.Context, rev string) string {
+	id, err := r.output(ctx, nil, "rev-parse", "-q", "--verify", rev)
+	if err != nil {
+		return ""
+	}
+	return id
 }
 
 // HeadCommit is the full HEAD commit id, or "" before the first commit.
 func (r *Repo) HeadCommit(ctx context.Context) (string, error) {
-	out, err := r.git(ctx, nil, "rev-parse", "-q", "--verify", "HEAD^{commit}")
-	if err != nil {
-		return "", nil
-	}
-	return strings.TrimSpace(string(out)), nil
+	return r.headRev(ctx, "HEAD^{commit}"), nil
 }
 
 // HeadTree is the HEAD tree id, or "" before the first commit.
 func (r *Repo) HeadTree(ctx context.Context) (string, error) {
-	out, err := r.git(ctx, nil, "rev-parse", "-q", "--verify", "HEAD^{tree}")
-	if err != nil {
-		return "", nil
-	}
-	return strings.TrimSpace(string(out)), nil
+	return r.headRev(ctx, "HEAD^{tree}"), nil
 }
 
 // HeadBlobs maps each path that is a blob at HEAD to its blob id.
@@ -238,11 +245,7 @@ func (r *Repo) HeadBlobs(ctx context.Context, paths []string) (map[string]string
 // HashBlob is the blob id of content, hashed raw with no repository filter run.
 func (r *Repo) HashBlob(ctx context.Context, path string, content []byte) (string, error) {
 	_ = path // the path no longer selects filters: blobs are hashed raw (spec 14.6 defers clean-filter comparison)
-	out, err := r.git(ctx, content, "hash-object", "--stdin", "--no-filters")
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
+	return r.output(ctx, content, "hash-object", "--stdin", "--no-filters")
 }
 
 // CommitExists reports whether sha names a commit. Option-shaped input is refused.
@@ -256,17 +259,17 @@ func (r *Repo) CommitExists(ctx context.Context, sha string) (bool, error) {
 
 // Branch is the short branch name, or "" when detached.
 func (r *Repo) Branch(ctx context.Context) string {
-	out, err := r.git(ctx, nil, "symbolic-ref", "-q", "--short", "HEAD")
+	branch, err := r.output(ctx, nil, "symbolic-ref", "-q", "--short", "HEAD")
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(out))
+	return branch
 }
 
 // OriginURL is remote.origin.url, else the first remote's URL, else "".
 func (r *Repo) OriginURL(ctx context.Context) string {
-	if out, err := r.git(ctx, nil, "config", "--get", "remote.origin.url"); err == nil {
-		return strings.TrimSpace(string(out))
+	if origin, err := r.output(ctx, nil, "config", "--get", "remote.origin.url"); err == nil {
+		return origin
 	}
 	out, err := r.git(ctx, nil, "remote")
 	if err != nil {
@@ -276,11 +279,11 @@ func (r *Repo) OriginURL(ctx context.Context) string {
 	if first == "" {
 		return ""
 	}
-	url, err := r.git(ctx, nil, "remote", "get-url", first) // first comes from git itself
+	url, err := r.output(ctx, nil, "remote", "get-url", first) // first comes from git itself
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(url))
+	return url
 }
 
 // Dirty lists changed and untracked paths under pathspec, repository-relative.

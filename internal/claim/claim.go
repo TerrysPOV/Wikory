@@ -184,7 +184,18 @@ func unquote(v string) (string, error) {
 	return v, nil
 }
 
-func splitList(v string) []string { return strings.Split(v, ";") }
+// parseList parses every ";"-separated item of v.
+func parseList[T any](v string, parse func(string) (T, error)) ([]T, error) {
+	var items []T
+	for _, raw := range strings.Split(v, ";") {
+		item, err := parse(raw)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
 
 func checkPath(p string) error {
 	if _, err := confine.Split(p); err != nil {
@@ -193,7 +204,7 @@ func checkPath(p string) error {
 	return nil
 }
 
-func (c *Claim) set(k, v string) error {
+func (c *Claim) set(k, v string) (err error) {
 	switch k {
 	case "c":
 		if !ids.IsULID(v) {
@@ -231,42 +242,19 @@ func (c *Claim) set(k, v string) error {
 		}
 		c.Author = v
 	case "ev":
-		for _, raw := range splitList(v) {
-			e, err := parseEvidence(raw)
-			if err != nil {
-				return err
-			}
-			c.Evidence = append(c.Evidence, e)
-		}
+		c.Evidence, err = parseList(v, parseEvidence)
 	case "dep":
-		for _, raw := range splitList(v) {
-			d, err := parseDep(raw)
-			if err != nil {
-				return err
-			}
-			c.Deps = append(c.Deps, d)
-		}
-	case "aka", "sup", "contra":
-		var items []string
-		for _, raw := range splitList(v) {
-			it, err := decodeItem(raw)
-			if err != nil {
-				return err
-			}
-			items = append(items, it)
-		}
-		switch k {
-		case "aka":
-			c.AKA = items
-		case "sup":
-			c.Supersedes = items
-		default:
-			c.Contradicts = items
-		}
+		c.Deps, err = parseList(v, parseDep)
+	case "aka":
+		c.AKA, err = parseList(v, decodeItem)
+	case "sup":
+		c.Supersedes, err = parseList(v, decodeItem)
+	case "contra":
+		c.Contradicts, err = parseList(v, decodeItem)
 	default:
 		return malformed("unknown field %q", k)
 	}
-	return nil
+	return err
 }
 
 func parseEvidence(raw string) (Evidence, error) {
@@ -345,30 +333,14 @@ func (c Claim) Render() string {
 	add("status", c.Status)
 	add("vrev", c.VRev)
 	add("scope", c.Scope)
-	var evs []string
-	for _, e := range c.Evidence {
-		switch e.Kind {
-		case EvBlob:
-			item := encodeItem(e.Path)
-			if e.OID != "" {
-				item += "@" + renderOID(e.Algo, e.OID)
-			}
-			evs = append(evs, item)
-		case EvCommit:
-			evs = append(evs, EvCommit+":"+renderOID(e.Algo, e.Ref))
-		default:
-			evs = append(evs, e.Kind+":"+encodeItem(e.Ref))
-		}
+	evs := make([]string, len(c.Evidence))
+	for i, e := range c.Evidence {
+		evs[i] = renderEvidence(e)
 	}
 	add("ev", strings.Join(evs, ";"))
-	var deps []string
-	for _, d := range c.Deps {
-		p, sym, hasSym := strings.Cut(d, "#")
-		item := encodeItem(p)
-		if hasSym {
-			item += "#" + encodeItem(sym)
-		}
-		deps = append(deps, item)
+	deps := make([]string, len(c.Deps))
+	for i, d := range c.Deps {
+		deps[i] = renderDep(d)
 	}
 	add("dep", strings.Join(deps, ";"))
 	add("th", c.TH)
@@ -381,11 +353,39 @@ func (c Claim) Render() string {
 	return prefix + strings.Join(parts, " ") + suffix
 }
 
+func renderEvidence(e Evidence) string {
+	switch e.Kind {
+	case EvBlob:
+		item := encodeItem(e.Path)
+		if e.OID != "" {
+			item += "@" + renderOID(e.Algo, e.OID)
+		}
+		return item
+	case EvCommit:
+		return EvCommit + ":" + renderOID(e.Algo, e.Ref)
+	default:
+		return e.Kind + ":" + encodeItem(e.Ref)
+	}
+}
+
+func renderDep(d string) string {
+	p, sym, hasSym := strings.Cut(d, "#")
+	item := encodeItem(p)
+	if hasSym {
+		item += "#" + encodeItem(sym)
+	}
+	return item
+}
+
+// normaliseNewlines turns CRLF and lone CR into LF.
+func normaliseNewlines(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n")
+}
+
 // CanonicalText: LF line endings, Unicode NFC, trailing whitespace trimmed per line,
 // leading and trailing blank lines removed (spec 5.3).
 func CanonicalText(s string) string {
-	s = strings.ReplaceAll(s, "\r\n", "\n")
-	s = strings.ReplaceAll(s, "\r", "\n")
+	s = normaliseNewlines(s)
 	s = norm.NFC.String(s)
 	lines := strings.Split(s, "\n")
 	for i := range lines {

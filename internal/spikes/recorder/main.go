@@ -1,14 +1,15 @@
 //go:build spike && unix
 
 // Command spike-recorder supports the stage 0 spikes. Modes:
-//   record <label>                  save hook stdin to $SPIKE_OUT/<label>-<event>-<nanos>.json
-//   block-once <label> <reason>     record, then block a Stop once (only when stop_hook_active is false)
-//   detach <label> <secs>           record, start a detached child that writes a marker after <secs>, then sleep 5 s
-//   sleepwrite <label> <secs>       (internal) sleep then write <label>-survived.txt
-//   lagcopy <label> <transcript>    (internal) wait 5 s, then copy the transcript again
-//   ttyprobe                        report whether fds 0, 1, 2 are terminals and whether /dev/tty opens
-//   writeprobe <dir>                try to create <dir>/probe.txt and report the result
-//   mcp                             minimal stdio MCP server with one tool, ping
+//
+//	record <label>                  save hook stdin to $SPIKE_OUT/<label>-<event>-<nanos>.json
+//	block-once <label> <reason>     record, then block a Stop once (only when stop_hook_active is false)
+//	detach <label> <secs>           record, start a detached child that writes a marker after <secs>, then sleep 5 s
+//	sleepwrite <label> <secs>       (internal) sleep then write <label>-survived.txt
+//	lagcopy <label> <transcript>    (internal) wait 5 s, then copy the transcript again
+//	ttyprobe                        report whether fds 0, 1, 2 are terminals and whether /dev/tty opens
+//	writeprobe <dir>                try to create <dir>/probe.txt and report the result
+//	mcp                             minimal stdio MCP server with one tool, ping
 package main
 
 import (
