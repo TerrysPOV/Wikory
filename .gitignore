@@ -1,0 +1,6 @@
+# Agent and tool state, never published
+.claude/
+.claude-flow/
+.swarm/
+ruvector.db
+.DS_Store
