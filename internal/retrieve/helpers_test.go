@@ -59,3 +59,14 @@ title: Job queue
 <!-- claim kind=current-impl status=unverified ev=src/queue.go dep=src/queue.go -->
 enqueueJob acknowledges only after the handler returns.
 `
+
+func writeRaw(t *testing.T, repoDir, rel, content string) {
+	t.Helper()
+	p := filepath.Join(repoDir, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
