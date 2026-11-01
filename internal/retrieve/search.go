@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/TerrysPOV/Wikory/internal/claim"
 	"github.com/TerrysPOV/Wikory/internal/confine"
@@ -101,14 +102,38 @@ func Search(ctx context.Context, db *sql.DB, checkoutID string, repo *confine.Ro
 	return out, nil
 }
 
+// singleLine makes s safe for a single-line field: every control character and line separator
+// becomes a space (so no field can start a new line), then Sanitize removes the markup.
+func singleLine(s string) string {
+	return Sanitize(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			return ' '
+		}
+		return r
+	}, s))
+}
+
+// lineBreaks turns every line separator a terminal or reader might honour into a newline.
+var lineBreaks = strings.NewReplacer("\r\n", "\n", "\r", "\n", "\u2028", "\n", "\u2029", "\n", "\u0085", "\n", "\v", "\n", "\f", "\n", "\x1c", "\n", "\x1d", "\n", "\x1e", "\n")
+
+// continuation marks every line of a multi-line text after the first, so no line of retrieved
+// text can begin with "- [" and pass for a result row.
+const continuation = "  | "
+
+func markedLines(s string) string {
+	return strings.ReplaceAll(Sanitize(lineBreaks.Replace(s)), "\n", "\n"+continuation)
+}
+
 // RenderHits formats hits for people and agents, inside the delimited block. notices are
 // the index's own warnings (RefreshStats.Notices, for example that the index is partial); they
-// go before the block, sanitised, so an incomplete index is never presented as complete.
+// go before the block, so an incomplete index is never presented as complete. Every value is
+// sanitised here, whatever the caller did: markup is removed, and only Text may span lines
+// (each continuation line is marked).
 func RenderHits(hits []Hit, notices ...string) string {
 	var b strings.Builder
 	b.WriteString(Preface + "\n")
 	for _, n := range notices {
-		b.WriteString(Sanitize(n) + "\n")
+		b.WriteString(singleLine(n) + "\n")
 	}
 	b.WriteString("<wikory-memory>\n")
 	if len(hits) == 0 {
@@ -116,17 +141,17 @@ func RenderHits(hits []Hit, notices ...string) string {
 	}
 	for _, h := range hits {
 		if h.PageOnly {
-			fmt.Fprintf(&b, "- [page] %s (%s): %s\n", h.PageTitle, h.RelPath, h.Text)
+			fmt.Fprintf(&b, "- [page] %s (%s): %s\n", singleLine(h.PageTitle), singleLine(h.RelPath), markedLines(h.Text))
 			continue
 		}
-		label := h.Display.Status
+		label := singleLine(h.Display.Status)
 		if h.Display.Freshness != "" {
-			label += " | " + h.Display.Freshness
+			label += " | " + singleLine(h.Display.Freshness)
 		}
 		for _, n := range h.Display.Notes {
-			label += " | " + n
+			label += " | " + singleLine(n)
 		}
-		fmt.Fprintf(&b, "- [%s] %s (%s#%s)\n", label, h.Text, h.RelPath, h.ClaimID)
+		fmt.Fprintf(&b, "- [%s] %s (%s#%s)\n", label, markedLines(h.Text), singleLine(h.RelPath), singleLine(h.ClaimID))
 	}
 	b.WriteString("</wikory-memory>\n")
 	return b.String()
