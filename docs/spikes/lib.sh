@@ -40,7 +40,7 @@ ledger_usage() { # n result.json
 # is used and the scratch-path session logs land in ~/.claude/projects/<scratch slug>/, which
 # spike_relocate_transcripts moves out afterwards. Settings files are never edited.
 spike_env() {
-  printf '%s\n' "HOME=$HOME" "USER=$USER" "LOGNAME=$USER" "PATH=$SPIKE_S/bin:/opt/homebrew/bin:/usr/bin:/bin" \
+  printf '%s\n' "HOME=$HOME" "USER=$USER" "LOGNAME=$USER" "PATH=$SPIKE_S/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin" \
     "TERM=xterm-256color" "LANG=en_GB.UTF-8"
   if [ -e "$SPIKE_S/config-dir-ok" ]; then printf '%s\n' "CLAUDE_CONFIG_DIR=$SPIKE_S/claude-config"; fi
 }
