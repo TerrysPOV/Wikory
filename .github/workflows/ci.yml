@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      WIKORY_LATENCY_SLACK: "3"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -count=1 ./...
+      - name: Race (unix)
+        if: runner.os != 'Windows'
+        run: go test -race -count=1 ./...
+      - name: Self-tests of the fault-injection runner and the fixture scrubber (unix)
+        if: runner.os != 'Windows'
+        run: scripts/inject_selftest.sh && scripts/scrub_selftest.sh
+      - name: Stage 0 spikes that need this platform
+        run: go test -tags spike -count=1 -v -run "TestFTS5Available|TestWALParallelProcesses|TestOSRoot|TestOpenat|TestRootHas|TestWindowsJunctionUnderOSRoot|TestWindowsSameFileAndOpenDirectoryRename|TestDenyHookCorpus" ./internal/spikes/
+      - name: Build
+        run: go build -o bin/ ./cmd/wikory
+      - name: Hook smoke test with a real executable (Windows exec form)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          go build -o wikory.exe ./cmd/wikory
+          '{"hook_event_name":"Stop","session_id":"s","cwd":"C:\\nonexistent"}' | .\wikory.exe hook stop
+          if ($LASTEXITCODE -ne 0) { exit 1 }
