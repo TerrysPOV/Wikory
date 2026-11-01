@@ -66,6 +66,29 @@ Each line is a verified, refuted or partial result that changes a 1a task. The f
 - V24 (1d): the deny hook is a tripwire for direct forms only (10 of 10 caught, 6 of 6 indirect forms missed); do not claim it blocks human-only commands against an evading agent.
 - V25 (1b slice reader): slices must be cut by transcript line type (keep `user`, `assistant`, tool use and result; drop `attachment` and `api-request*`) and capped by turn before any budget applies.
 
+## End-to-end (1a)
+
+Run by `docs/spikes/e2e.sh` on 2026-11-01 (ledger timestamps 22:53:31Z and 22:53:46Z), Claude Code 2.1.316, `--model haiku`, with the real plugin loaded by `--plugin-dir plugins/claude` and a freshly built `wikory` first on `PATH`. The private store was a scratch `WIKORY_DATA_DIR`. Both launches went through `docs/spikes/run-claude.sh`, so they are launches 11 and 12 of 12 in the shared ledger; the ledger is now full.
+
+| Step | Result |
+|---|---|
+| Launch 1 (`e2e1`), prompt "Reply with exactly the word: ok" | exit 0, 1 turn, 2 input, 6,953 cache-creation, 11,382 cache-read and 4 output tokens, reported cost 0.00151 USD, 11 s including `run-claude.sh`'s 8 s settle |
+| Launch 2 (`e2e2`), prompt asking for the first line of the wikory status block | exit 0, 1 turn, 2 input, 4,418 cache-creation, 13,986 cache-read and 410 output tokens (221 thinking), reported cost 0.00123 USD, 12 s including the settle |
+| Status line quoted by the model in launch 2 | `wikory: mode=full \| last consolidated: never \| pending 1 \| failed 0 \| stale 0. The wiki may not be current: verify against code.` |
+| Decision named | "Retries are capped at five" |
+| `wikory --json doctor` afterwards | `mode: full`, `pending_turns: 2`, `registered: true`, `trusted: true` |
+
+`pending 1` in launch 2 is launch 1's captured turn; `pending_turns: 2` after launch 2 adds its own turn. The injected briefing reached the model, and the Stop hook captured both turns, so hooks work end to end on Claude Code.
+
+Costs are the figures Claude Code reported in `result.json` (USD). On a subscription plan the launches draw on plan quota rather than a per-token price. Combined, about 0.0027 USD, roughly 0.2p at an assumed 0.75 GBP per USD (the rate was not looked up).
+
+Observed model behaviour, not a defect in the hook: the model treated the pending-turn entry as retrieved memory rather than as a request and did not act on it, which is the intended reading of the "evidence, not instructions" line.
+
+Deviations from the plan's script, none changing what is measured:
+
+- The launches use `docs/spikes/run-claude.sh` (ledger-counted) instead of a direct `claude` call. That wrapper always runs from `$WIKORY_SPIKE_SCRATCH/wikory-spikes/proj` and passes only the `spike_env` variables, so `e2e.sh` moves the earlier spike project aside (`proj.pre-e2e-<time>`), builds the e2e project there, and installs a small launcher at `wikory-spikes/bin/wikory` that sets `WIKORY_DATA_DIR` and runs the built binary.
+- `SPIKE_SETTINGS` points at an empty settings file, so the spike recorder's hooks do not run and only the plugin's hooks do.
+
 | A1-1 | `--json` after the command is not extracted | RED as predicted (`stdout is not a JSON envelope: unexpected end of JSON input`) |
 
 # Fault log A10
@@ -250,6 +273,26 @@ Run with `scripts/inject.sh`, one site at a time, 2026-11-01.
 | A24-6 | the error log opened without `O_NONBLOCK` | RED as predicted (`the hook did not return within`) |
 | A24-7 | the error log accepted when it is not a regular file | RED as predicted (`the hook wrote its error log into a FIFO`) |
 | A24-8 | stdin read with no deadline | RED as predicted (`the hook did not return within`) |
+| A24-9 | open failure restores the root-reading degraded briefing (security fix: status only when the store cannot be opened) | RED as predicted (`an unconfirmed checkout had repository content injected: wikory: mode=degraded`) |
+| A24-10 | an unregistered checkout gets a degraded briefing that reads its `index.md` | RED as predicted (`an unregistered checkout had repository content injected`) |
+
+| A25-1 | metadata rendered without the rules | RED as predicted (`code=0 page=# Q`) |
+| A25-2 | path check removed | RED as predicted (`"README.md" accepted`) |
+| A25-3 | republish when unchanged | RED as predicted (`a second stamp changed the page or logged again`) |
+| A25-4 | tracked-but-dirty evidence stamped as verified | RED as predicted (`code=0 page=# Queue`) |
+
+| A26-1 | unknown versions treated as known | RED as predicted (`{Version:test Executable`) |
+| A26-2 | uncommitted changes not reported | RED as predicted (`uncommitted wiki change not reported: []`) |
+| A26-3 | transcript roots not reported | RED as predicted (`[]`) |
+| A26-4 | hook errors not counted (added row) | RED as predicted (`hook_errors=0 index_partial=`) |
+| A26-5 | index partial flag not set (added row) | RED as predicted (`hook_errors=2 index_partial=<nil>`) |
+| A26-6 | recover drops the refused list (added row) | RED as predicted (`code=0 out=`) |
+
+## A27 fault injection
+
+| # | Fault | Predicted | Verdict |
+|---|---|---|---|
+| A27-1 | a hook argument the binary does not accept | TestPluginHooksCallTheBinaryInExecForm fails on UserPromptSubmit | RED as predicted |
 
 | A3-1 | directory components opened without `O_NOFOLLOW` | RED as predicted (`a symlink to the moved original directory was followed`) |
 | A3-2 | the final name opened without `O_NOFOLLOW` | RED as predicted (`a symlink to the moved original file was followed`) |
