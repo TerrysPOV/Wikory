@@ -1,0 +1,20 @@
+V25 transcript sizes (measured 2026-11-01, no model call; sizes only, no content)
+
+Committed fixtures (filtered to conversational line types):
+docs/spikes/evidence/S5/transcript.jsonl bytes=4258 est_tokens=1064 lines=11
+internal/decode/testdata/claude-2.1.316/transcript-tool-use.jsonl bytes=7858 est_tokens=1964 lines=15
+
+Raw transcripts as Claude Code wrote them (copied 5 s after Stop, from the scratch out directory,
+not committed). Bytes by line type, summed from per-line JSON length:
+S5 one turn, no tools: file 157329 bytes (est 39332 tokens)
+  attachment 13 lines 98144; api-request-shape 1 line 40298; api-request-blob 2 lines 12178;
+  api-request 1 line 1507; user 1 line 673; assistant 1 line 1593; system 1 line 855; other small
+S6 one turn, one Bash call: file 163787 bytes (est 40946 tokens)
+  attachment 14 lines 98834; api-request-shape 40298; api-request-blob 3 lines 12535;
+  api-request 2 lines 3127; user 2 lines 1855; assistant 2 lines 3571; system 856; tools-used 89
+S7 two turns, one subagent: file 229816 bytes (est 57454 tokens)
+  attachment 17 lines 133227; api-request-shape 40298; api-request-blob 4 lines 29795;
+  api-request 3 lines 4680; user 4 lines 6110; assistant 4 lines 9037; system 2 lines 1880
+
+Conversational content only (user + assistant + system):
+S5 3121 bytes (about 780 tokens); S6 6282 bytes (about 1570 tokens); S7 17027 bytes (about 4260 tokens)
