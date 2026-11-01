@@ -6,7 +6,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/TerrysPOV/Wikory/internal/decode"
 )
@@ -220,5 +222,34 @@ func TestMetadataIsRedactedAndNoAbsolutePathIsStored(t *testing.T) {
 	}
 	if strings.Contains(body, r.transcript) || strings.Contains(stored, r.transcript) || filepath.IsAbs(stored) || !strings.Contains(body, `"rel": "session.jsonl"`) {
 		t.Fatalf("an absolute transcript path was persisted: %q\n%s", stored, body)
+	}
+}
+
+// Sealing (after the timeout) and a late Stop completing the stub race for the same turn,
+// in two store handles held at a barrier. Exactly one wins; the row equals the winning file.
+func TestConcurrentSealAndStubCompletionAgree(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t)
+	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "first", "p1", ""))
+	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "second", "p2", "")) // p1 becomes a stub
+	id := TurnID("sess-1", "p1")
+	r.clk.t = r.clk.t.Add(11 * time.Minute) // the stub may now be sealed incomplete
+	other := r.second(t)
+	var arrived sync.WaitGroup
+	arrived.Add(2)
+	testHookBeforeTransition = func(string) { arrived.Done(); arrived.Wait() }
+	t.Cleanup(func() { testHookBeforeTransition = nil })
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _, _ = r.rec.Seal(ctx, time.Now().Add(5*time.Second)) }()
+	go func() { defer wg.Done(); _, _, _ = other.Stop(ctx, r.ev(decode.Stop, "", "p1", "late answer")) }()
+	wg.Wait()
+	state, version, stub, outcome := r.row(t, id)
+	file, err := r.rec.readVersion(id, version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 || len(r.versions(t, id)) != 2 || file.State != state || file.Stub != stub || file.Outcome != outcome {
+		t.Fatalf("row (%s v%d stub=%v %s) disagrees with file %+v; versions %v", state, version, stub, outcome, file, r.versions(t, id))
 	}
 }
