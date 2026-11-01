@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/TerrysPOV/Wikory/internal/claim"
 	"github.com/TerrysPOV/Wikory/internal/gitx"
@@ -179,5 +180,20 @@ func TestRenderHitsSaysWhenIndexIsPartial(t *testing.T) {
 	}
 	if out := RenderHits(hits, full.Notices...); strings.Contains(out, "partial") {
 		t.Fatalf("a complete index was reported as partial:\n%s", out)
+	}
+}
+
+// A page-only hit is a teaser, capped at 200 runes plus "...". The input is far over the cap
+// and made of multi-byte runes, so a cap that counts bytes or is missing cannot pass.
+func TestSearchPageOnlySnippetIsCappedAtTwoHundredRunes(t *testing.T) {
+	dir := newRepoWithCode(t)
+	writePage(t, dir, "long.md", "# Long\n\nNarwhal "+strings.Repeat("é世", 150)+"\n")
+	hits := searchIn(t, dir, "co-1", "narwhal", SearchOpts{Limit: 5})
+	if len(hits) != 1 || !hits[0].PageOnly {
+		t.Fatalf("want one page-only hit, got %+v", hits)
+	}
+	got := hits[0].Text
+	if n := utf8.RuneCountInString(got); n != 203 || !strings.HasSuffix(got, "...") || !utf8.ValidString(got) {
+		t.Fatalf("the snippet must be 200 runes plus an ellipsis: %d runes, valid=%v, ends %q", n, utf8.ValidString(got), got[max(0, len(got)-12):])
 	}
 }

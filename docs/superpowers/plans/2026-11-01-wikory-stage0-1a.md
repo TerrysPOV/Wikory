@@ -13703,6 +13703,14 @@ scripts/inject.sh internal/retrieve/sanitize.go '	s = angles.Replace(s)' '	_ = a
 
 # A21-9: file names shown unsanitised
 scripts/inject.sh internal/retrieve/search.go '		h.RelPath, h.ClaimID = Sanitize(h.RelPath), Sanitize(h.ClaimID)' '		_ = h.ClaimID' ./internal/retrieve/ 'TestSearchSanitisesFileNames' 'Search returned an unsanitised file name'
+
+# A21-18: the 200-rune cap on a page-only snippet removed
+scripts/inject.sh internal/retrieve/search.go '		if h.PageOnly {
+			h.Text = truncateRunes(h.Text, 200)' '		if false {
+			h.Text = truncateRunes(h.Text, 200)' ./internal/retrieve/ 'TestSearchPageOnlySnippetIsCappedAtTwoHundredRunes' 'the snippet must be 200 runes plus an ellipsis: 316 runes'
+
+# A21-19: the cap cuts at 200 bytes instead of 200 runes
+scripts/inject.sh internal/retrieve/sanitize.go 'return string(rs[:n]) + "..."' 'return s[:n] + "..."' ./internal/retrieve/ 'TestSearchPageOnlySnippetIsCappedAtTwoHundredRunes' 'the snippet must be 200 runes plus an ellipsis'
 ```
 
 Expected: `RED as predicted` (exit 0) for every row except those marked *survives* (`SURVIVED`, exit 1). Append each verdict to `docs/spikes/results/fault-log-A21.section.md`.

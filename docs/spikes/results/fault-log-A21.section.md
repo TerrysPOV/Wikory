@@ -15,3 +15,5 @@
 | A21-15 | continuation lines of Text not marked, so a line can begin `- [` | RED as predicted (`10 lines look like result rows for 3 hits`) |
 | A21-16 | control characters no longer flattened in one-line fields | RED as predicted (`8 lines look like result rows for 3 hits`) |
 | A21-17 | U+2028 no longer treated as a line break in Text | RED as predicted (`a line separator reached the output`) |
+| A21-18 | the 200-rune cap on a page-only snippet removed (`TestSearchPageOnlySnippetIsCappedAtTwoHundredRunes`, input 316 runes, multi-byte) | RED as predicted (`the snippet must be 200 runes plus an ellipsis: 316 runes`). The first run was INCONCLUSIVE: the prediction said 301 runes, miscounting the heading and `Narwhal ` prefix; the count in the prediction was corrected, not the fault |
+| A21-19 | the cap cuts at 200 bytes instead of 200 runes (`s[:n]` for `string(rs[:n])`) | RED as predicted (`94 runes, valid=false`) |
