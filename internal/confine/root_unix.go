@@ -110,6 +110,14 @@ func (d *dirH) openFile(name string, flags int, perm fs.FileMode) (*os.File, err
 		unix.Close(fd)
 		return nil, ErrNotRegular
 	}
+	// A second link to the inode may lead outside the root (an archive that preserves hard
+	// links; macOS has no protected_hardlinks). Reading it leaks, and appending or writing
+	// through it would modify the outside file, so any existing file with Nlink > 1 is refused.
+	// A file created by this call has one link and is unaffected.
+	if st.Nlink > 1 {
+		unix.Close(fd)
+		return nil, ErrHardlink
+	}
 	if err := unix.SetNonblock(fd, false); err != nil {
 		unix.Close(fd)
 		return nil, err

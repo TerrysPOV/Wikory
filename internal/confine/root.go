@@ -220,6 +220,9 @@ func (r *Root) ReplaceIfUnchanged(rel string, data []byte, perm fs.FileMode, wan
 			dir.remove(bak)
 		}
 		dir.sync()
+		if errors.Is(rerr, ErrHardlink) {
+			return fmt.Errorf("%w: %w: %s", ErrChanged, ErrHardlink, rel)
+		}
 		return fmt.Errorf("%w: %s", ErrChanged, rel)
 	}
 	step("compared")

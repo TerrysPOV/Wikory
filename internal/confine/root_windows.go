@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"os"
 	"strings"
+
+	"golang.org/x/sys/windows"
 )
 
 var reserved = map[string]bool{"CON": true, "PRN": true, "AUX": true, "NUL": true,
@@ -122,6 +124,16 @@ func (d *dirH) openFile(name string, flags int, perm fs.FileMode) (*os.File, err
 	if err != nil || !after.Mode().IsRegular() {
 		f.Close()
 		return nil, ErrNotRegular
+	}
+	// A second link to the file may lead outside the root: refuse any file with more than one.
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if info.NumberOfLinks > 1 {
+		f.Close()
+		return nil, ErrHardlink
 	}
 	now, err := d.r.Lstat(name)
 	if err != nil || !plain(now) || !os.SameFile(now, after) || (exists && !os.SameFile(before, after)) {

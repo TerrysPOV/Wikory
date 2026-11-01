@@ -18,6 +18,7 @@ var (
 	ErrTooLarge   = errors.New("confine: file exceeds the size limit")
 	ErrExist      = errors.New("confine: file already exists")
 	ErrChanged    = errors.New("confine: target changed, nothing replaced")
+	ErrHardlink   = errors.New("confine: file has more than one hard link, refused")
 )
 
 // TempPrefix names the temporary files atomic writes create beside their targets.

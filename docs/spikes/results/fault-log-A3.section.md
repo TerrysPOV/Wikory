@@ -13,3 +13,7 @@
 | A3-13 | same fault, edit made after the compare | RED as predicted (`human edit not kept`) |
 | A3-14 | the moved-aside content is not judged | RED as predicted (`content="NEW"`) |
 | A3-15 | recovery does not put back a backup whose target is missing | RED as predicted (`content=""`) |
+| A3-16 | hard-link count check removed from the open path (read of a hard link to an outside file) | RED as predicted (`want ErrHardlink and no bytes`) |
+| A3-17 | same fault, append through the hard link (also modified the outside file before the fix) | RED as predicted (`append through a hard link: want ErrHardlink`) |
+| A3-18 | same fault, replace of a hard-linked target | RED as predicted (`replace of a hard-linked file: want ErrHardlink`) |
+| A3-19 | `ReplaceIfUnchanged` does not propagate `ErrHardlink` from the moved-aside open (returns `ErrChanged` only) | RED as predicted (`replace of a hard-linked file: want ErrHardlink`) |
