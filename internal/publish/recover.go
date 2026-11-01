@@ -133,7 +133,8 @@ func (p *Publisher) Recover(ctx context.Context) (Report, error) {
 
 // cleanTargets undoes what an interrupted write left beside the targets: a backup whose
 // target is missing (a kill after the move-aside) is put back, a backup whose target already
-// holds the new content is removed, and temp files are deleted. Any other backup is kept
+// holds the new content is removed, and temp files are deleted first (a kill after the install
+// leaves the temp as a second hard link to the target, which confine refuses to read). Any other backup is kept
 // beside a human file and reported by the conflict that apply then raises.
 func (p *Publisher) cleanTargets(m *manifest) error {
 	dirs := map[string]bool{}
@@ -141,13 +142,6 @@ func (p *Publisher) cleanTargets(m *manifest) error {
 	for _, op := range m.Ops {
 		dirs[path.Dir(op.Target)] = true
 		newHash[op.Target] = op.New
-	}
-	for d := range dirs {
-		if _, err := p.Repo.RestoreBackups(d, func(target string, cur []byte) bool {
-			return HashContent(cur) == newHash[path.Join(d, target)]
-		}); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
 	}
 	for d := range dirs {
 		ents, err := p.Repo.ReadDir(d)
@@ -158,6 +152,13 @@ func (p *Publisher) cleanTargets(m *manifest) error {
 			if strings.HasPrefix(e.Name(), confine.TempPrefix) {
 				_ = p.Repo.Remove(d + "/" + e.Name())
 			}
+		}
+	}
+	for d := range dirs {
+		if _, err := p.Repo.RestoreBackups(d, func(target string, cur []byte) bool {
+			return HashContent(cur) == newHash[path.Join(d, target)]
+		}); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
 		}
 	}
 	return nil
