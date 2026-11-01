@@ -41,8 +41,11 @@ fi
 jq -r 'select(.Action == "fail" and .Test != null) | .Test' "$work/fault.json" | sort -u > "$work/failed.txt"
 [ -s "$work/failed.txt" ] || inconclusive "the package failed outside any named test (TestMain, init or the binary)"
 jq -r --rawfile f "$work/failed.txt" '($f | split("\n")) as $names | select(.Action == "output" and .Test != null and (.Test as $t | $names | index($t))) | .Output' "$work/fault.json" > "$work/out.txt"
-if grep -q 'panic:' "$work/out.txt" && ! printf '%s' "$expect" | grep -q 'panic'; then
-  inconclusive "a test panicked instead of failing its assertion: $(grep -m1 'panic:' "$work/out.txt")"
+# A panic anywhere in the event stream (any test, package-level, or after a named failure) is never RED,
+# and an EXPECTED text that mentions a panic is not an exception.
+jq -r 'select(.Action == "output") | .Output' "$work/fault.json" > "$work/all-out.txt"
+if grep -q 'panic:' "$work/all-out.txt"; then
+  inconclusive "a panic occurred under the fault, so a failing assertion cannot be attributed: $(grep -m1 'panic:' "$work/all-out.txt")"
 fi
 if ! grep -qF -- "$expect" "$work/out.txt"; then
   inconclusive "the failure text did not contain the prediction '$expect'; first failure line: $(grep -m1 -E '_test\.go:[0-9]+:' "$work/out.txt" | sed 's/^ *//')"

@@ -12,6 +12,7 @@ expect() {
 expect 0 "real assertion fault is RED"        "$f" 'return a + b' 'return a - b'          "$p" '^TestAdd$' 'Add(2, 3) = -1, want 5'
 expect 2 "compile-error fault is INCONCLUSIVE" "$f" 'return a + b' 'return a +'            "$p" '^TestAdd$' 'Add(2, 3)'
 expect 2 "panicking fault is INCONCLUSIVE"     "$f" 'return a + b' 'return a + b + Div(1, a-a)' "$p" '^TestAdd$' 'Add(2, 3)'
+expect 2 "panic is INCONCLUSIVE even if the prediction mentions it" "$f" 'return a + b' 'return a + b + Div(1, a-a)' "$p" '^TestAdd$' 'panic'
 expect 2 "wrong prediction is INCONCLUSIVE"    "$f" 'return a + b' 'return a - b'          "$p" '^TestAdd$' 'something else entirely'
 expect 2 "no matching test is INCONCLUSIVE"    "$f" 'return a + b' 'return a - b'          "$p" '^TestNope$' 'Add(2, 3)'
 expect 1 "harmless change SURVIVES"            "$f" 'return a + b' 'return b + a'          "$p" '^TestAdd$' 'Add(2, 3)'
