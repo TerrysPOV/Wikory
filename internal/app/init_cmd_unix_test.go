@@ -21,3 +21,18 @@ func TestInitRefusesSymlinkedProjectMemory(t *testing.T) {
 		t.Fatalf("code=%d entries=%d stderr=%s", code, len(ents), errOut)
 	}
 }
+
+func TestInitWithLoneSymlinkInProjectMemoryDoesNotGrantTrust(t *testing.T) {
+	dir := newGitRepo(t)
+	pm := filepath.Join(dir, "project-memory")
+	if err := os.MkdirAll(pm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(pm, "link")); err != nil {
+		t.Fatal(err)
+	}
+	d, e := initJSON(t, newCLI(t), dir)
+	if !d.Created || d.Trusted || !strings.Contains(strings.Join(e.Notices, " "), "not trusted") {
+		t.Fatalf("%+v notices=%v", d, e.Notices)
+	}
+}

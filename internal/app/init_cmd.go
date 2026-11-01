@@ -17,6 +17,10 @@ func init() {
 	register(Command{Name: "init", Summary: "set up project-memory/ and the private store for this repository", Run: runInit})
 }
 
+// newProjectID mints a project id. A test replaces it to pre-seed the store of a project that
+// does not exist yet.
+var newProjectID = ids.ProjectID
+
 const logHeader = "# Wikory publish log\n\nOne line per publish, appended by wikory. Merged with merge=union.\n\n"
 
 const schemaDoc = `# Claim format (for people writing pages by hand)
@@ -46,6 +50,16 @@ func runInit(ctx context.Context, env *Env, args []string) (Result, error) {
 		return Result{}, err
 	}
 	defer root.Close()
+	// Judge emptiness before anything is created: a missing or empty project-memory/ is
+	// ours to trust, any entry (a dotfile or a symlink included) came from elsewhere.
+	pmEmpty := true
+	switch ents, err := root.ReadDir(pmDir); {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
+		return Result{}, fmt.Errorf("reading %s: %w", pmDir, describeConfine(err))
+	default:
+		pmEmpty = len(ents) == 0
+	}
 	if err := root.MkdirAll(pmDir, 0o755); err != nil {
 		return Result{}, fmt.Errorf("creating %s: %w", pmDir, describeConfine(err))
 	}
@@ -55,7 +69,7 @@ func runInit(ctx context.Context, env *Env, args []string) (Result, error) {
 	data, err := root.ReadFile(configPath, 1<<16)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		cfg = ProjectConfig{ProjectID: ids.ProjectID(), SchemaVersion: projectSchemaVersion}
+		cfg = ProjectConfig{ProjectID: newProjectID(), SchemaVersion: projectSchemaVersion}
 		cfg.Retrieval.BudgetTokens = defaultBudgetTokens
 		created = true
 	case err != nil:
@@ -79,22 +93,29 @@ func runInit(ctx context.Context, env *Env, args []string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	decision, _, err := st.TrustDecision(ctx, repo.CommonDir)
+	decision, recorded, err := st.TrustDecision(ctx, repo.CommonDir)
 	if err != nil {
 		return Result{}, err
 	}
 	trusted := decision == store.TrustTrusted
-	if created {
+	switch {
+	case recorded:
+		// init never changes a decision that already exists (spec 10.4).
+		notices = append(notices, fmt.Sprintf("trust for this clone is already recorded as %q and init leaves it unchanged", decision))
+		if !trusted {
+			notices = append(notices, "this clone is not trusted, so the committed wiki is withheld until trust is granted")
+		}
+	case created && pmEmpty:
 		if err := st.RecordTrust(ctx, repo.CommonDir, store.TrustTrusted, "created by wikory init"); err != nil {
 			return Result{}, err
 		}
 		trusted = true
-	} else if !trusted {
-		if err := st.RecordTrust(ctx, repo.CommonDir, store.TrustUndecided, "project-memory existed before init on this machine"); err != nil {
+	default:
+		if err := st.RecordTrust(ctx, repo.CommonDir, store.TrustUndecided, "project-memory existed before init"); err != nil {
 			return Result{}, err
 		}
-		notices = append(notices, "project-memory/ already existed, so this checkout is registered but not trusted; "+
-			"Wikory serves nothing from it until trust is granted (the wikory trust command arrives in a later version)")
+		notices = append(notices, "project-memory/ already existed, so this checkout is registered but not trusted yet; "+
+			"the committed wiki is withheld until trust is granted (the wikory trust command arrives in a later version)")
 	}
 	want := []struct {
 		path    string

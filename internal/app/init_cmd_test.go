@@ -1,11 +1,14 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/TerrysPOV/Wikory/internal/store"
 )
 
 type initData struct {
@@ -102,5 +105,95 @@ func TestConfigRejectsUnknownKeysAndBadIDs(t *testing.T) {
 		if _, err := parseConfig([]byte(s)); err == nil {
 			t.Errorf("accepted %q", s)
 		}
+	}
+}
+
+func TestInitWithPreexistingWikiPageDoesNotGrantTrust(t *testing.T) {
+	dir := newGitRepo(t)
+	wiki := filepath.Join(dir, "project-memory", "wiki")
+	if err := os.MkdirAll(wiki, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wiki, "planted.md"), []byte("# planted\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d, e := initJSON(t, newCLI(t), dir)
+	if !d.Created || d.Trusted || !strings.Contains(strings.Join(e.Notices, " "), "not trusted") {
+		t.Fatalf("%+v notices=%v", d, e.Notices)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "project-memory", "config.toml")); err != nil {
+		t.Fatalf("config.toml must still be written: %v", err)
+	}
+}
+
+func TestInitWithEmptyProjectMemoryDirGrantsTrust(t *testing.T) {
+	dir := newGitRepo(t)
+	if err := os.MkdirAll(filepath.Join(dir, "project-memory"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	d, _ := initJSON(t, newCLI(t), dir)
+	if !d.Created || !d.Trusted {
+		t.Fatalf("%+v", d)
+	}
+}
+
+func TestInitWithLoneDotfileInProjectMemoryDoesNotGrantTrust(t *testing.T) {
+	dir := newGitRepo(t)
+	pm := filepath.Join(dir, "project-memory")
+	if err := os.MkdirAll(pm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pm, ".hidden"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d, e := initJSON(t, newCLI(t), dir)
+	if !d.Created || d.Trusted || !strings.Contains(strings.Join(e.Notices, " "), "not trusted") {
+		t.Fatalf("%+v notices=%v", d, e.Notices)
+	}
+}
+
+// A trust decision already recorded for this clone is never changed by init, even when init
+// creates the config in an empty project-memory/ (the case that would otherwise be "trusted").
+func TestInitKeepsRecordedTrustDecision(t *testing.T) {
+	const fixedID = "wkp_01J8Q4ZK8N3X2T5V6W7Y8Z9A0C"
+	old := newProjectID
+	newProjectID = func() string { return fixedID }
+	t.Cleanup(func() { newProjectID = old })
+
+	dir := newGitRepo(t)
+	c := newCLI(t)
+	env := &Env{Getenv: func(k string) string {
+		if k == "WIKORY_DATA_DIR" {
+			return c.dataDir
+		}
+		return os.Getenv(k)
+	}, Cwd: dir}
+	repo, root, err := discover(context.Background(), env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root.Close()
+	id := identityFor(context.Background(), repo, fixedID)
+	st, err := store.Resolve(context.Background(), c.dataDir, id, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordTrust(context.Background(), repo.CommonDir, store.TrustUndecided, "seeded"); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	d, e := initJSON(t, c, dir)
+	if !d.Created || d.Trusted || !strings.Contains(strings.Join(e.Notices, " "), "unchanged") {
+		t.Fatalf("%+v notices=%v", d, e.Notices)
+	}
+	st, err = store.Resolve(context.Background(), c.dataDir, id, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	got, ok, err := st.TrustDecision(context.Background(), repo.CommonDir)
+	if err != nil || !ok || got != store.TrustUndecided {
+		t.Fatalf("decision=%q recorded=%v err=%v", got, ok, err)
 	}
 }
