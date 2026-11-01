@@ -21,3 +21,5 @@ hipocampus.config.json
 /dist/
 /wikory
 /wikory.exe
+agentdb.rvf
+agentdb.rvf.lock
