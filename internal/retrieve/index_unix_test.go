@@ -74,6 +74,12 @@ func TestSearchSanitisesFileNames(t *testing.T) {
 	if len(hits) == 0 {
 		t.Fatal("the page with the hostile name should match")
 	}
+	// The hits themselves, not only the rendering: `wikory search --json` copies RelPath as it is.
+	for _, h := range hits {
+		if strings.ContainsAny(h.RelPath, "<>") {
+			t.Fatalf("Search returned an unsanitised file name: %q", h.RelPath)
+		}
+	}
 	out := RenderHits(hits)
 	if strings.Count(out, "</wikory-memory>") != 1 || strings.Contains(out, "<system>") {
 		t.Fatalf("a file name carried markup into the output:\n%s", out)

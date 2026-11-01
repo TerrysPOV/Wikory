@@ -1,5 +1,5 @@
 | A20-1 | removed pages kept | RED as predicted (`a removed page stayed in the index: {Pages:1 Changed:0 Removed:0 Refused:0 Malformed:0}`) |
-| A20-2 | walk collects non-regular `.md` entries | SURVIVED (predicted): the confined read in `Refresh` still refuses the symlink, so `Refused` stays 2; the read guard is proven to fail in A3 |
+| A20-2 | walk collects non-regular `.md` entries | SURVIVED (predicted): the confined read in `Refresh` still refuses the symlink, so `Refused` stays 2; the read guard is proven to fail in A3. Re-run on clean HEAD after the simplify pass (2026-11-02): SURVIVED, as predicted; this is the one plan row meant to survive, not a gap |
 | A20-3 | joined form not emitted | RED as predicted (`Expand("enqueueJob")=" enqueue job " lacks "enqueuejob"`) |
 | A20-4 | page cap not applied in the walk | RED as predicted (`page cap not enforced or not reported`) |
 | A20-5 | total byte cap not applied | RED as predicted (`byte cap not enforced or not reported`) |
