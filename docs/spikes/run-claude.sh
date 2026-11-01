@@ -17,7 +17,7 @@ cd "$SPIKE_S/proj"
 set +e
 env -i "${envs[@]}" SPIKE_OUT="$out" SPIKE_COPY_TRANSCRIPT=1 \
   claude -p "$prompt" --model haiku --setting-sources project --settings "$settings" \
-  "${mcp_args[@]}" --output-format json "$@" > "$out/result.json" 2> "$out/stderr.txt"
+  ${mcp_args[@]+"${mcp_args[@]}"} --output-format json "$@" > "$out/result.json" 2> "$out/stderr.txt"
 rc=$?
 set -e
 ledger_usage "$n" "$out/result.json"
