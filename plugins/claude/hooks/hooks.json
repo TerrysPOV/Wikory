@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "wikory", "args": ["hook", "session-start"], "timeout": 5 } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "wikory", "args": ["hook", "user-prompt-submit"], "timeout": 3 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "wikory", "args": ["hook", "stop"], "timeout": 5 } ] }
+    ]
+  }
+}

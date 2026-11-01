@@ -1,0 +1,7 @@
+{
+  "name": "wikory",
+  "version": "0.1.0",
+  "description": "Evidence-backed project memory for coding agents. Needs the wikory binary on PATH.",
+  "author": { "name": "Terry Yodaiken" },
+  "license": "Apache-2.0"
+}
