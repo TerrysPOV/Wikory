@@ -4,3 +4,6 @@
 .swarm/
 ruvector.db
 .DS_Store
+
+# Working notes, kept local
+docs/notes/
