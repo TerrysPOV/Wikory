@@ -103,16 +103,37 @@ func ParsePage(rel string, data []byte) Page {
 // rendered). It returns the cleaned lines and which lines vanish entirely. Lines keep their
 // positions so claim line numbers still point into the file.
 //
-//   - A claim comment line is kept as it is, unless it sits inside an open comment.
+//   - A complete claim comment line (see isCompleteClaimComment) is kept as it is, unless it
+//     sits inside an open comment. A line that only starts like one goes through the scan.
 //   - Text after a closing marker on the same line survives.
 //   - A comment that is never closed hides everything after its opener.
+//   - CommonMark link reference definitions of the form "[//]: # (text)" and "[//]: <> (text)"
+//     render nothing, so they are removed too (a title may run over several lines).
 func stripComments(lines []string, start int) (clean []string, dropped []bool) {
 	clean = append([]string(nil), lines...)
 	dropped = make([]bool, len(lines))
 	inComment := false
+	closer := byte(0) // the closing delimiter of an open [//]: title, or 0
 	for i := start; i < len(lines); i++ {
-		if !inComment && IsClaimComment(lines[i]) {
+		if closer != 0 {
+			if strings.TrimSpace(lines[i]) == "" { // a blank line ends the definition
+				closer = 0
+			} else {
+				clean[i], dropped[i] = "", true
+				if strings.IndexByte(lines[i], closer) >= 0 {
+					closer = 0
+				}
+				continue
+			}
+		}
+		if !inComment && isCompleteClaimComment(lines[i]) {
 			continue
+		}
+		if !inComment {
+			if isHidden, open := commentRefDef(lines[i]); isHidden {
+				clean[i], dropped[i], closer = "", true, open
+				continue
+			}
 		}
 		var out strings.Builder
 		rest, touched := lines[i], inComment
@@ -139,6 +160,60 @@ func stripComments(lines []string, start int) (clean []string, dropped []bool) {
 		}
 	}
 	return clean, dropped
+}
+
+// isCompleteClaimComment reports whether a line is one whole claim comment: the claim prefix,
+// one closing marker as the last thing on the line, and no other comment marker. Anything else
+// that merely starts like a claim comment must go through the comment scan, or an unclosed
+// opener would hide nothing from the index while Markdown hides everything after it.
+func isCompleteClaimComment(line string) bool {
+	s := strings.TrimSpace(line)
+	return IsClaimComment(s) && strings.HasSuffix(s, "-->") &&
+		strings.Count(s, "<!--") == 1 && strings.Count(s, "-->") == 1
+}
+
+// commentRefDef recognises a link reference definition used as an invisible comment:
+// "[//]: # (text)" or "[//]: <> (text)" (also with "text" or 'text'), indented at most three
+// spaces. If its title is opened but not closed on this line, open is the closing delimiter
+// to look for on the following lines.
+func commentRefDef(line string) (hidden bool, open byte) {
+	if len(line)-len(strings.TrimLeft(line, " ")) > 3 {
+		return false, 0
+	}
+	s := strings.TrimSpace(line)
+	rest, ok := strings.CutPrefix(s, "[//]:")
+	if !ok {
+		return false, 0
+	}
+	rest = strings.TrimLeft(rest, " \t")
+	switch {
+	case strings.HasPrefix(rest, "<>"):
+		rest = rest[2:]
+	case strings.HasPrefix(rest, "#"):
+		rest = rest[1:]
+	default:
+		return false, 0
+	}
+	if rest != "" && rest[0] != ' ' && rest[0] != '\t' {
+		return false, 0 // "[//]: #foo" is a real destination, not the comment idiom
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return true, 0
+	}
+	var end byte
+	switch rest[0] {
+	case '(':
+		end = ')'
+	case '"', '\'':
+		end = rest[0]
+	default:
+		return false, 0
+	}
+	if strings.IndexByte(rest[1:], end) >= 0 {
+		return true, 0
+	}
+	return true, end
 }
 
 func isHeading(s string) bool {
