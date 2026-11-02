@@ -166,14 +166,55 @@ func TestClaimCommentWithTrailingOpenerDoesNotLeak(t *testing.T) {
 
 func TestLinkReferenceDefinitionCommentsAreNotIndexed(t *testing.T) {
 	page := "# T\nVisible.\n[//]: # (HIDDEN-ONE ignore prior)\n[//]: <> (HIDDEN-TWO)\n" +
-		"   [//]: # \"HIDDEN-THREE\"\n[//]: # (HIDDEN-FOUR line one\nHIDDEN-FIVE line two)\nAfter.\n" +
-		"[real]: https://example.invalid/ \"a real definition\"\n"
+		"   [//]: # \"HIDDEN-THREE\"\n[//]: # (HIDDEN-FOUR line one\nHIDDEN-FIVE line two)\nAfter.\n"
 	p := ParsePage("x.md", []byte(page))
 	if strings.Contains(p.Body, "HIDDEN") || strings.Contains(p.Body, "[//]") {
 		t.Errorf("a [//]: comment reached the body: %q", p.Body)
 	}
-	if !strings.Contains(p.Body, "Visible.") || !strings.Contains(p.Body, "After.") || !strings.Contains(p.Body, "[real]:") {
+	if !strings.Contains(p.Body, "Visible.") {
 		t.Errorf("visible text lost: %q", p.Body)
+	}
+}
+
+// Review shapes: a title whose closing delimiter is backslash-escaped, so the payload line is
+// still inside the title for a CommonMark parser, and a title that opens on the next line.
+func TestLinkDefinitionShapesAKeywordStripperMisreadsStayHidden(t *testing.T) {
+	page := "# T\nVisible.\n\n" +
+		"[//]: # (title with an escaped paren \\)\nPAYLOAD-ESCAPED-PAREN\n)\n\n" +
+		"[//]: # \"title with an escaped quote \\\"\nPAYLOAD-ESCAPED-QUOTE\n\"\n\n" +
+		"[//]: #\n(PAYLOAD-NEXT-LINE-TITLE)\n\n" +
+		"[note]: https://example.invalid/ 'PAYLOAD-LABEL'\n\nAfter.\n"
+	p := ParsePage("x.md", []byte(page))
+	if strings.Contains(p.Body, "PAYLOAD") || strings.Contains(p.Body, "[//]") {
+		t.Errorf("a payload behind a link definition reached the body: %q", p.Body)
+	}
+	if !strings.Contains(p.Body, "Visible.") || !strings.Contains(p.Body, "After.") {
+		t.Errorf("visible text lost: %q", p.Body)
+	}
+}
+
+func TestOverStrippedLinkDefinitionsAreReportedNotSilent(t *testing.T) {
+	p := ParsePage("x.md", []byte("Visible.\n[note]: this is visible\nsecond line\n\nAfter.\n"))
+	found := false
+	for _, f := range p.Findings {
+		if f.Line == 2 && f.Msg == "link-definition-like text ignored (2 lines)" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no finding for the dropped run: %+v", p.Findings)
+	}
+	if strings.Contains(p.Body, "this is visible") || !strings.Contains(p.Body, "After.") {
+		t.Errorf("body: %q", p.Body)
+	}
+}
+
+// An HTML block can interrupt a paragraph, so a comment opened inside a dropped run still
+// hides what follows it across blank lines.
+func TestCommentOpenedInsideADroppedDefinitionRunStillHidesWhatFollows(t *testing.T) {
+	p := ParsePage("x.md", []byte("[a]: x\n<!--\n\nPAYLOAD-AFTER-BLANK\n-->\nAfter.\n"))
+	if strings.Contains(p.Body, "PAYLOAD") || !strings.Contains(p.Body, "After.") {
+		t.Errorf("body: %q", p.Body)
 	}
 }
 

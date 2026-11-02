@@ -3,6 +3,7 @@ package claim
 import (
 	"fmt"
 	"path"
+	"regexp"
 	"strings"
 )
 
@@ -45,7 +46,10 @@ func ParsePage(rel string, data []byte) Page {
 	start := p.parseFrontmatter(lines)
 	var body []string
 	heading := ""
-	clean, dropped := stripComments(lines, start)
+	clean, dropped, defs := stripComments(lines, start)
+	for _, d := range defs {
+		p.Findings = append(p.Findings, Finding{d.line, fmt.Sprintf("link-definition-like text ignored (%d lines)", d.n)})
+	}
 	for i := start; i < len(lines); i++ {
 		if dropped[i] {
 			continue
@@ -98,68 +102,90 @@ func ParsePage(rel string, data []byte) Page {
 	return p
 }
 
+// defGroup is a run of lines dropped because it starts like a link reference definition.
+type defGroup struct{ line, n int }
+
+// defLikeRe matches the start of a link reference definition: up to three spaces, a
+// bracketed label, a colon. Nothing after the colon is looked at.
+var defLikeRe = regexp.MustCompile(`^ {0,3}\[[^\]]+\]:`)
+
 // stripComments removes HTML comments from lines[start:] with one scan that carries the
 // "inside a comment" state across lines (spec 7.4: comments are not indexed and never
-// rendered). It returns the cleaned lines and which lines vanish entirely. Lines keep their
-// positions so claim line numbers still point into the file.
+// rendered). It returns the cleaned lines, which lines vanish entirely, and the runs of
+// link-definition-like lines it dropped. Lines keep their positions so claim line numbers
+// still point into the file.
 //
 //   - A complete claim comment line (see isCompleteClaimComment) is kept as it is, unless it
 //     sits inside an open comment. A line that only starts like one goes through the scan.
 //   - Text after a closing marker on the same line survives.
 //   - A comment that is never closed hides everything after its opener.
-//   - CommonMark link reference definitions of the form "[//]: # (text)" and "[//]: <> (text)"
-//     render nothing, so they are removed too (a title may run over several lines).
-func stripComments(lines []string, start int) (clean []string, dropped []bool) {
+//   - A line that starts like a link reference definition ("[label]: ...") is dropped together
+//     with every following non-blank line. CommonMark lets such a definition render nothing
+//     ("[//]: # (text)"), with a title that may run over several lines or sit on the next one,
+//     and parsing titles exactly is a parser-differential risk. Over-stripping can only hide
+//     visible text from the index, never reveal hidden text, and each run is reported.
+//     Comment markers inside a dropped run are still scanned, because an HTML block can
+//     interrupt a paragraph and run across blank lines.
+func stripComments(lines []string, start int) (clean []string, dropped []bool, defs []defGroup) {
 	clean = append([]string(nil), lines...)
 	dropped = make([]bool, len(lines))
 	inComment := false
-	closer := byte(0) // the closing delimiter of an open [//]: title, or 0
+	inDef := false
 	for i := start; i < len(lines); i++ {
-		if closer != 0 {
-			if strings.TrimSpace(lines[i]) == "" { // a blank line ends the definition
-				closer = 0
-			} else {
-				clean[i], dropped[i] = "", true
-				if strings.IndexByte(lines[i], closer) >= 0 {
-					closer = 0
-				}
-				continue
-			}
+		if inComment {
+			inDef = false
+		} else if inDef && strings.TrimSpace(lines[i]) == "" {
+			inDef = false
+		}
+		if !inComment && !inDef && defLikeRe.MatchString(lines[i]) {
+			inDef = true
+			defs = append(defs, defGroup{line: i + 1})
+		}
+		if inDef {
+			defs[len(defs)-1].n++
+			inComment = scanComments(lines[i], inComment, nil)
+			clean[i], dropped[i] = "", true
+			continue
 		}
 		if !inComment && isCompleteClaimComment(lines[i]) {
 			continue
 		}
-		if !inComment {
-			if isHidden, open := commentRefDef(lines[i]); isHidden {
-				clean[i], dropped[i], closer = "", true, open
-				continue
-			}
-		}
 		var out strings.Builder
-		rest, touched := lines[i], inComment
-		for {
-			if inComment {
-				j := strings.Index(rest, "-->")
-				if j < 0 {
-					break
-				}
-				rest, inComment = rest[j+len("-->"):], false
-				continue
-			}
-			j := strings.Index(rest, "<!--")
-			if j < 0 {
-				out.WriteString(rest)
-				break
-			}
-			out.WriteString(rest[:j])
-			rest, inComment, touched = rest[j+len("<!--"):], true, true
-		}
-		if touched {
+		was := inComment
+		inComment = scanComments(lines[i], inComment, &out)
+		if was || inComment || out.String() != lines[i] {
 			clean[i] = out.String()
 			dropped[i] = strings.TrimSpace(clean[i]) == ""
 		}
 	}
-	return clean, dropped
+	return clean, dropped, defs
+}
+
+// scanComments walks one line from the given comment state, writing the text outside comments
+// to out (if not nil), and returns the state at the end of the line.
+func scanComments(line string, inComment bool, out *strings.Builder) bool {
+	rest := line
+	for {
+		if inComment {
+			j := strings.Index(rest, "-->")
+			if j < 0 {
+				return true
+			}
+			rest, inComment = rest[j+len("-->"):], false
+			continue
+		}
+		j := strings.Index(rest, "<!--")
+		if j < 0 {
+			if out != nil {
+				out.WriteString(rest)
+			}
+			return false
+		}
+		if out != nil {
+			out.WriteString(rest[:j])
+		}
+		rest, inComment = rest[j+len("<!--"):], true
+	}
 }
 
 // isCompleteClaimComment reports whether a line is one whole claim comment: the claim prefix,
@@ -170,50 +196,6 @@ func isCompleteClaimComment(line string) bool {
 	s := strings.TrimSpace(line)
 	return IsClaimComment(s) && strings.HasSuffix(s, "-->") &&
 		strings.Count(s, "<!--") == 1 && strings.Count(s, "-->") == 1
-}
-
-// commentRefDef recognises a link reference definition used as an invisible comment:
-// "[//]: # (text)" or "[//]: <> (text)" (also with "text" or 'text'), indented at most three
-// spaces. If its title is opened but not closed on this line, open is the closing delimiter
-// to look for on the following lines.
-func commentRefDef(line string) (hidden bool, open byte) {
-	if len(line)-len(strings.TrimLeft(line, " ")) > 3 {
-		return false, 0
-	}
-	s := strings.TrimSpace(line)
-	rest, ok := strings.CutPrefix(s, "[//]:")
-	if !ok {
-		return false, 0
-	}
-	rest = strings.TrimLeft(rest, " \t")
-	switch {
-	case strings.HasPrefix(rest, "<>"):
-		rest = rest[2:]
-	case strings.HasPrefix(rest, "#"):
-		rest = rest[1:]
-	default:
-		return false, 0
-	}
-	if rest != "" && rest[0] != ' ' && rest[0] != '\t' {
-		return false, 0 // "[//]: #foo" is a real destination, not the comment idiom
-	}
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
-		return true, 0
-	}
-	var end byte
-	switch rest[0] {
-	case '(':
-		end = ')'
-	case '"', '\'':
-		end = rest[0]
-	default:
-		return false, 0
-	}
-	if strings.IndexByte(rest[1:], end) >= 0 {
-		return true, 0
-	}
-	return true, end
 }
 
 func isHeading(s string) bool {
