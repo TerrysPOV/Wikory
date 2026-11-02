@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/TerrysPOV/Wikory/internal/decode/claude"
@@ -11,7 +12,21 @@ import (
 
 const maxSlice = 16 << 20
 
-// Seal completes captured records until deadline. It returns how many it sealed.
+// SealError reports that Seal went on past turns it could not complete: Failed counts them
+// and First is the first error. One bad record never blocks the turns behind it.
+type SealError struct {
+	Failed int
+	First  error
+}
+
+func (e *SealError) Error() string {
+	return fmt.Sprintf("capture: %d turn(s) could not be sealed; first error: %v", e.Failed, e.First)
+}
+func (e *SealError) Unwrap() error { return e.First }
+
+// Seal completes captured records until deadline. It returns how many it sealed. A turn it
+// cannot seal is skipped, not fatal: the error is a *SealError with the failure count and the
+// first error, and the rest of the batch is still tried.
 func (r *Recorder) Seal(ctx context.Context, deadline time.Time) (int, error) {
 	rows, err := r.Store.DB.QueryContext(ctx, `SELECT turn_id, version FROM turns WHERE checkout_id = ? AND state = 'captured' ORDER BY created_at LIMIT 50`, r.CheckoutID)
 	if err != nil {
@@ -32,17 +47,26 @@ func (r *Recorder) Seal(ctx context.Context, deadline time.Time) (int, error) {
 	}
 	rows.Close()
 	sealed := 0
+	var failed int
+	var first error
 	for _, p := range todo {
-		if time.Now().After(deadline) {
+		if time.Now().After(deadline) || ctx.Err() != nil {
 			break
 		}
 		ok, err := r.sealOne(ctx, p.id, p.version)
 		if err != nil {
-			return sealed, err
+			failed++
+			if first == nil {
+				first = err
+			}
+			continue
 		}
 		if ok {
 			sealed++
 		}
+	}
+	if failed > 0 {
+		return sealed, &SealError{Failed: failed, First: first}
 	}
 	return sealed, nil
 }
@@ -106,8 +130,15 @@ func (r *Recorder) sealOne(ctx context.Context, id string, version int) (bool, e
 	}
 	captured, _ := time.Parse(time.RFC3339Nano, rec.CapturedAt)
 	timedOut := r.Now().Sub(captured) >= r.SealTimeout
-	slice, readErr := r.readSlice(rec.Transcript, maxSlice)
+	slice, oversize, readErr := r.readSlice(rec.Transcript, maxSlice)
 	end, complete := int64(0), false
+	reason := ""
+	switch {
+	case errors.Is(readErr, errOutsideRoots):
+		reason = ReasonOutsideRoot
+	case readErr != nil:
+		reason = ReasonUnreadable
+	}
 	if readErr == nil && rec.FinalMessageHash != "" {
 		own, ok, err := r.bound(ctx, rec, slice)
 		if err != nil {
@@ -116,6 +147,8 @@ func (r *Recorder) sealOne(ctx context.Context, id string, version int) (bool, e
 		if ok {
 			slice = own
 			end, complete = endMarker(slice, rec.FinalMessageHash)
+		} else {
+			reason = ReasonAmbiguous
 		}
 	}
 	if !complete && !timedOut {
@@ -124,6 +157,16 @@ func (r *Recorder) sealOne(ctx context.Context, id string, version int) (bool, e
 	next := rec
 	next.State = "sealed"
 	next.Incomplete = !complete
+	if !complete {
+		switch {
+		case reason != "":
+			next.IncompleteReason = reason
+		case oversize:
+			next.IncompleteReason = ReasonOversize
+		default:
+			next.IncompleteReason = ReasonNoFinal
+		}
+	}
 	next.SealedAt = r.stamp()
 	if complete {
 		fillFromSlice(&next, slice, end)
@@ -132,14 +175,72 @@ func (r *Recorder) sealOne(ctx context.Context, id string, version int) (bool, e
 	return ok && published.State == "sealed", err // an adopted captured version is not a seal
 }
 
-func (r *Recorder) readSlice(p Pointer, limit int64) (claude.Slice, error) {
+// readSlice reads at most limit bytes of the turn's slice. oversize is true when the
+// transcript holds more than that, so a final message beyond the limit is never seen.
+func (r *Recorder) readSlice(p Pointer, limit int64) (s claude.Slice, oversize bool, err error) {
 	f, root, err := r.openPointer(p)
 	if err != nil {
-		return claude.Slice{}, err
+		return claude.Slice{}, false, err
 	}
 	defer root.Close()
 	defer f.Close()
-	return claude.ReadSlice(f, p.StartOffset, limit)
+	if fi, serr := f.Stat(); serr == nil && fi.Size()-p.StartOffset > limit {
+		oversize = true
+	}
+	s, err = claude.ReadSlice(f, p.StartOffset, limit)
+	return s, oversize, err
+}
+
+// Why a sealed record is incomplete (Record.IncompleteReason).
+const (
+	ReasonOutsideRoot = "outside-root" // the transcript is not below an approved root
+	ReasonUnreadable  = "unreadable"   // it could not be opened or read (missing, symlink, I/O)
+	ReasonOversize    = "oversize"     // it holds more than the slice limit, so the end was not seen
+	ReasonAmbiguous   = "ambiguous"    // two turns share a start offset with no prompt identity
+	ReasonNoFinal     = "no-final"     // the final message never appeared before the seal timeout
+)
+
+// IncompleteSealed counts how many of the newest limit sealed turns of this checkout were
+// sealed incomplete, and why. It reads at most limit small record files.
+func (r *Recorder) IncompleteSealed(ctx context.Context, limit int) (int, map[string]int, error) {
+	rows, err := r.Store.DB.QueryContext(ctx, `SELECT turn_id, version FROM turns WHERE checkout_id = ? AND state = 'sealed' ORDER BY updated_at DESC LIMIT ?`, r.CheckoutID, limit)
+	if err != nil {
+		return 0, nil, err
+	}
+	type row struct {
+		id string
+		v  int
+	}
+	var list []row
+	for rows.Next() {
+		var x row
+		if err := rows.Scan(&x.id, &x.v); err != nil {
+			rows.Close()
+			return 0, nil, err
+		}
+		list = append(list, x)
+	}
+	rows.Close()
+	total, by := 0, map[string]int{}
+	var first error
+	for _, x := range list {
+		rec, err := r.readVersion(x.id, x.v)
+		if err != nil {
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		if rec.Incomplete {
+			total++
+			reason := rec.IncompleteReason
+			if reason == "" {
+				reason = "unspecified"
+			}
+			by[reason]++
+		}
+	}
+	return total, by, first
 }
 
 // endMarker finds this turn's own final message: the first assistant message in the slice

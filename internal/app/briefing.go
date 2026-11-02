@@ -11,8 +11,11 @@ import (
 	"github.com/TerrysPOV/Wikory/internal/validate"
 )
 
-// servable is the one gate for private data: a store exists, and this checkout is
-// registered and trusted (spec 4.3, 10.4; spec question Q9).
+// servable is the gate for serving private data: a store exists, and this checkout is
+// registered and trusted (spec 4.3, 10.4; plan adjudication Q9). Search, context, the hooks and
+// the briefing all pass through it. `wikory recover` does not: it requires registration only,
+// because it finishes publish jobs that Wikory itself began in this checkout and reads nothing
+// out to the session.
 func servable(p *project) bool { return p.Store != nil && p.Registered && p.Trusted }
 
 func (p *project) validateEnv() validate.GitEnv {
@@ -38,11 +41,17 @@ func (p *project) refresh(ctx context.Context, prog *Progress) (retrieve.Refresh
 
 type orientRow struct{ rel, typ, title, text, meta string }
 
-// pendingTurns lists this checkout's most recent captured turns.
-func (p *project) pendingTurns(ctx context.Context) ([]retrieve.PendingTurn, error) {
+// pendingTurns lists this checkout's 50 most recent turns, captured or sealed (nothing is
+// consolidated in 1a, so every turn is still pending), and returns the true number of them: the
+// LIMIT bounds what is rendered, never what is counted.
+func (p *project) pendingTurns(ctx context.Context) ([]retrieve.PendingTurn, int, error) {
+	var total int
+	if err := p.Store.DB.QueryRowContext(ctx, `SELECT count(*) FROM turns WHERE checkout_id = ?`, p.Checkout.ID).Scan(&total); err != nil {
+		return nil, 0, err
+	}
 	rows, err := p.Store.DB.QueryContext(ctx, `SELECT turn_id, state, request, created_at FROM turns WHERE checkout_id = ? ORDER BY created_at DESC LIMIT 50`, p.Checkout.ID)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
 	var turns []retrieve.PendingTurn
@@ -50,12 +59,38 @@ func (p *project) pendingTurns(ctx context.Context) ([]retrieve.PendingTurn, err
 		var pt retrieve.PendingTurn
 		var at string
 		if err := rows.Scan(&pt.TurnID, &pt.State, &pt.Request, &at); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		pt.At, _ = time.Parse(time.RFC3339Nano, at)
 		turns = append(turns, pt)
 	}
-	return turns, nil
+	return turns, total, rows.Err()
+}
+
+// stuckJobAge is how long a publish job may sit begun or applying before it counts as stuck.
+// It equals the publisher's AbandonAfter (project.go), after which `wikory recover` abandons it.
+const stuckJobAge = 10 * time.Minute
+
+// stuckJobs counts this checkout's publish jobs that have been begun or applying for longer
+// than stuckJobAge: a process stopped part way, and only `wikory recover` can finish or
+// abandon them. A job begun a moment ago is in flight, not stuck.
+func (p *project) stuckJobs(ctx context.Context, now time.Time) (int, error) {
+	rows, err := p.Store.DB.QueryContext(ctx, `SELECT updated_at FROM jobs WHERE checkout_id = ? AND state IN ('begun','applying')`, p.Checkout.ID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		var at string
+		if err := rows.Scan(&at); err != nil {
+			return 0, err
+		}
+		if t, err := time.Parse(time.RFC3339Nano, at); err != nil || now.Sub(t) >= stuckJobAge {
+			n++ // an unreadable time cannot be shown to be recent
+		}
+	}
+	return n, rows.Err()
 }
 
 // orientRows lists the first claim of each decision, failure-signature and component page.
@@ -83,15 +118,16 @@ func (p *project) orientRows(ctx context.Context) ([]orientRow, error) {
 
 // buildBriefing assembles the briefing for a servable checkout. A partial index is disclosed in
 // the status line and the index's own notices are carried into the briefing.
-func buildBriefing(ctx context.Context, p *project, mode string, deadline time.Time) (string, error) {
+func buildBriefing(ctx context.Context, p *project, env *Env, mode string, deadline time.Time) (string, error) {
 	stats, err := p.refresh(ctx, nil)
 	if err != nil {
 		return "", err
 	}
 	notices := append(append([]string(nil), p.Notices...), stats.Notices...)
 	in := retrieve.BriefInput{Mode: mode, LastConsolidated: "never", BudgetTokens: p.Config.Retrieval.BudgetTokens,
-		HardCharCap: retrieve.DefaultHardCharCap, Notices: notices, IndexPartial: stats.Partial}
-	if in.Pending, err = p.pendingTurns(ctx); err != nil {
+		HardCharCap: retrieve.DefaultHardCharCap, Notices: notices, IndexPartial: stats.Partial,
+		HookErrors: readHookLog(env, time.Now()).Recent}
+	if in.Pending, in.PendingTotal, err = p.pendingTurns(ctx); err != nil {
 		return "", err
 	}
 	if err := p.Store.DB.QueryRowContext(ctx, `SELECT count(*) FROM turns WHERE checkout_id <> ?`, p.Checkout.ID).Scan(&in.OtherCheckoutsPending); err != nil {
@@ -100,17 +136,27 @@ func buildBriefing(ctx context.Context, p *project, mode string, deadline time.T
 	if err := p.Store.DB.QueryRowContext(ctx, `SELECT count(*) FROM jobs WHERE checkout_id = ? AND state IN ('conflict','refused')`, p.Checkout.ID).Scan(&in.Failed); err != nil {
 		return "", err
 	}
+	stuck, err := p.stuckJobs(ctx, time.Now())
+	if err != nil {
+		return "", err
+	}
+	in.Failed += stuck // a job that never finished has failed as far as the reader is concerned
 	items, err := p.orientRows(ctx)
 	if err != nil {
 		return "", err
 	}
-	env := p.validateEnv()
+	venv := p.validateEnv()
 	for _, o := range items {
 		item := retrieve.OrientItem{Type: o.typ, Title: o.title, OneLine: o.text, RelPath: o.rel}
-		if o.meta != "" && time.Now().Before(deadline) {
-			if c, err := claim.ParseComment(o.meta); err == nil {
-				if d, err := validate.Derive(ctx, c, o.text, env); err == nil {
-					item.Stale = d.Stale
+		if o.meta != "" {
+			// A claim that is not checked (the deadline passed, or it did not parse or derive) is
+			// unknown, never counted as not stale.
+			item.Unknown = true
+			if time.Now().Before(deadline) {
+				if c, err := claim.ParseComment(o.meta); err == nil {
+					if d, err := validate.Derive(ctx, c, o.text, venv); err == nil {
+						item.Stale, item.Evaluated, item.Unknown = d.Stale, true, false
+					}
 				}
 			}
 		}

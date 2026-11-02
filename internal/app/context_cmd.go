@@ -22,7 +22,7 @@ func runContext(ctx context.Context, env *Env, args []string) (Result, error) {
 		text := notRegisteredBriefing(p)
 		return Result{Text: text, Data: map[string]any{"briefing": text, "registered": p.Registered, "trusted": p.Trusted}}, nil
 	}
-	text, err := buildBriefing(ctx, p, "full", time.Now().Add(30*time.Second))
+	text, err := buildBriefing(ctx, p, env, briefingMode(ctx), time.Now().Add(30*time.Second))
 	if err != nil {
 		return Result{}, err
 	}

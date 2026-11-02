@@ -21,6 +21,7 @@ type hookRig struct {
 
 func newHookRig(t *testing.T) *hookRig {
 	t.Helper()
+	stubClaudeVersion(t, "2.1.316") // a test that needs another version stubs it after the rig
 	dir, c := initRepoWithPage(t)
 	tdir, _ := filepath.EvalSymlinks(t.TempDir())
 	c.extra["WIKORY_TRANSCRIPT_ROOTS"] = tdir

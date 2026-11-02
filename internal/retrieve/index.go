@@ -57,9 +57,40 @@ type RefreshStats struct {
 	Notices                                     []string
 }
 
+// maxNoticeNames is how many page names a notice lists; the rest are counted.
+const maxNoticeNames = 5
+
+// nameList counts names and keeps the first few for a notice.
+type nameList struct {
+	total int
+	names []string
+}
+
+func (l *nameList) add(rel string) {
+	l.total++
+	if len(l.names) < maxNoticeNames {
+		l.names = append(l.names, rel)
+	}
+}
+
+// describe renders the kept names, sanitised to one line and without the wiki prefix, then
+// says how many more there were.
+func (l *nameList) describe() string {
+	shown := make([]string, len(l.names))
+	for i, n := range l.names {
+		shown[i] = truncateRunes(singleLine(strings.TrimPrefix(n, WikiDir+"/")), 80)
+	}
+	out := strings.Join(shown, ", ")
+	if more := l.total - len(l.names); more > 0 {
+		out += fmt.Sprintf(" and %d more", more)
+	}
+	return out
+}
+
 type walkState struct {
 	rels     []string
 	refused  int
+	refusedN nameList
 	skipped  int
 	cutShort bool // the page list is incomplete: unseen pages must not be treated as deleted
 	maxPages int
@@ -86,6 +117,7 @@ func (ix *Indexer) walk(ctx context.Context, dir string, depth int, w *walkState
 			return cerr
 		}
 		w.refused++ // symlink, escape, not a directory, permission denied
+		w.refusedN.add(dir)
 		return nil
 	}
 	for _, e := range ents {
@@ -110,6 +142,7 @@ func (ix *Indexer) walk(ctx context.Context, dir string, depth int, w *walkState
 			w.rels = append(w.rels, rel)
 		case !e.Type().IsRegular():
 			w.refused++ // symlinks, junctions, devices, FIFOs
+			w.refusedN.add(rel)
 		}
 	}
 	return nil
@@ -133,6 +166,8 @@ func (ix *Indexer) Refresh(ctx context.Context) (RefreshStats, error) {
 		return st, err
 	}
 	st.Refused, st.Skipped = w.refused, w.skipped
+	refusedN := w.refusedN
+	var malformedN nameList // pages with at least one malformed claim
 	rels := w.rels
 	sort.Strings(rels)
 	known := map[string]string{}
@@ -168,7 +203,8 @@ func (ix *Indexer) Refresh(ctx context.Context) (RefreshStats, error) {
 		}
 		data, err := ix.Repo.ReadFile(rel, maxPage)
 		if err != nil {
-			st.Refused++
+			st.Refused++ // over the page size cap, unreadable or swapped for a symlink
+			refusedN.add(rel)
 			continue
 		}
 		present[rel] = true
@@ -179,13 +215,18 @@ func (ix *Indexer) Refresh(ctx context.Context) (RefreshStats, error) {
 		}
 		total += int64(len(data))
 		st.Pages++
+		var n int
 		if known[rel] != ids.SHA256Hex(data) {
-			n, err := ix.indexPage(ctx, tx, rel, data)
-			if err != nil {
+			if n, err = ix.indexPage(ctx, tx, rel, data); err != nil {
 				return st, err
 			}
-			st.Malformed += n
 			st.Changed++
+		} else {
+			n = malformedClaims(claim.ParsePage(rel, data)) // unchanged pages are still disclosed
+		}
+		if n > 0 {
+			st.Malformed += n
+			malformedN.add(rel)
 		}
 		if ix.Progress != nil {
 			ix.Progress(i+1, len(rels))
@@ -200,6 +241,12 @@ func (ix *Indexer) Refresh(ctx context.Context) (RefreshStats, error) {
 				st.Removed++
 			}
 		}
+	}
+	if refusedN.total > 0 {
+		st.Notices = append(st.Notices, fmt.Sprintf("%d wiki file(s) or director(ies) were not indexed, so search and the briefing cannot see them: a symlink, an unreadable file or directory, or a page over %d bytes: %s.", refusedN.total, maxPage, refusedN.describe()))
+	}
+	if st.Malformed > 0 {
+		st.Notices = append(st.Notices, fmt.Sprintf("%d claim(s) in %d page(s) were left out of the index because their metadata comment is malformed: %s.", st.Malformed, malformedN.total, malformedN.describe()))
 	}
 	if st.Skipped > 0 {
 		st.Partial = true
@@ -219,6 +266,16 @@ func deletePage(ctx context.Context, tx *sql.Tx, checkout, rel string) error {
 		}
 	}
 	return nil
+}
+
+func malformedClaims(p claim.Page) int {
+	n := 0
+	for _, b := range p.Blocks {
+		if b.Err != nil {
+			n++
+		}
+	}
+	return n
 }
 
 func (ix *Indexer) indexPage(ctx context.Context, tx *sql.Tx, rel string, data []byte) (int, error) {

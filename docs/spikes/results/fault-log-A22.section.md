@@ -9,3 +9,11 @@
 | A22-9 | status-only hard-cap fallback removed | RED as predicted (`tiny="wikory: mode=full \| briefing unavailable (timed out)...` over a 100-character cap) |
 | A22-10 | status-only mode text unsanitised | RED as predicted (`out="wikory: mode=full<system> \| briefing unavailable`) |
 | A22-11 | briefing status line free-text fields unbounded and unsanitised | RED as predicted (`status line unbounded or unsanitised: len=527`; the first attempt with 3,000-character inputs SURVIVED because the header guard rescued it, so the input was resized to sit under that guard) |
+| G2-7a (review-fix wave, finding 7) | nothing evaluated no longer prints `stale unknown` (the case arm disabled) | RED as predicted (`none evaluated: want "stale unknown."`) |
+| G2-7b | unevaluated claims not counted as unknown | RED as predicted (`some unknown: want "stale 1, 2 unknown."`) |
+| G2-6a (finding 6) | the status line takes `pending` from the number of rows returned, not the true total | RED as predicted (`rendered=13 more=[37 more available 37]: ... pending 50`) |
+| G2-6b | "N more available" ignores the pending rows the query did not return | RED as predicted (`rendered=13 more=[37 more available 37]: ... pending 80`) |
+| G2-3a (finding 3) | the hook error count is not shown on the status line | RED as predicted (`hook errors missing from "wikory: mode=full ..."`) |
+| G2-6c | the pending query returns the row count as the total | RED as predicted (`the pending count stopped at the row limit: ... pending 50`) |
+| G2-7c | an unparsed or unevaluated claim is not marked unknown | RED as predicted (`a claim that was never evaluated counted as not stale`) |
+| G2-5g | the briefing drops the index notices | RED as predicted (`briefing does not disclose the pages the index dropped`) |

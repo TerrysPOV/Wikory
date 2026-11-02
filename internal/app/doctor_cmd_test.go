@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type doctorData struct {
@@ -85,7 +86,7 @@ func TestDoctorOutsideARepoStillReportsTheBinary(t *testing.T) {
 func TestDoctorCountsHookErrorsAndStatesIndexCompleteness(t *testing.T) {
 	dir, c := initRepoWithPage(t)
 	log := filepath.Join(c.dataDir, "hook-errors.log")
-	if err := os.WriteFile(log, []byte("2026-11-02T10:00:00Z stop\n2026-11-02T10:00:01Z start\n"), 0o600); err != nil {
+	if err := os.WriteFile(log, []byte(logLine(time.Now().Add(-time.Minute), "stop")+logLine(time.Now().Add(-time.Second), "start")), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	d := doctorJSON(t, c, dir)

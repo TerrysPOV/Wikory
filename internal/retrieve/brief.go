@@ -29,13 +29,21 @@ type OrientItem struct {
 	OneLine string
 	RelPath string
 	Stale   bool
+	// Evaluated is true when the item's claim was checked against the code (so Stale is an
+	// answer); Unknown is true when it carries a claim that could not be checked. An item with
+	// neither has no claim to check.
+	Evaluated bool
+	Unknown   bool
 }
 
 // BriefInput is everything the briefing shows.
 type BriefInput struct {
-	Mode                  string
-	LastConsolidated      string
-	Pending               []PendingTurn
+	Mode             string
+	LastConsolidated string
+	Pending          []PendingTurn
+	// PendingTotal is the true number of pending turns when Pending holds only the newest few.
+	// Zero means Pending is complete.
+	PendingTotal          int
 	OtherCheckoutsPending int
 	Failed                int
 	Orientation           []OrientItem
@@ -47,6 +55,9 @@ type BriefInput struct {
 	// IndexPartial is RefreshStats.Partial: a size limit cut the index refresh short. The status
 	// line says so, so it never implies the wiki is complete.
 	IndexPartial bool
+	// HookErrors is how many hook failures were logged in the last 24 hours; the status line
+	// shows it when above zero.
+	HookErrors int
 }
 
 var typeRank = map[string]int{"decision": 0, "failure-signature": 1, "component": 2}
@@ -81,11 +92,24 @@ func Brief(in BriefInput) string {
 		}
 		return a.RelPath < b.RelPath
 	})
-	stale := 0
+	stale, unknown, evaluated := 0, 0, 0
 	for _, o := range orient {
-		if o.Stale {
+		switch {
+		case o.Unknown:
+			unknown++
+		case o.Stale:
 			stale++
 		}
+		if o.Evaluated {
+			evaluated++
+		}
+	}
+	staleText := fmt.Sprintf("%d", stale)
+	switch {
+	case unknown > 0 && evaluated == 0:
+		staleText = "unknown" // nothing was checked, so no count is honest
+	case unknown > 0:
+		staleText = fmt.Sprintf("%d, %d unknown", stale, unknown)
 	}
 	lastCons := in.LastConsolidated
 	if lastCons == "" {
@@ -93,11 +117,15 @@ func Brief(in BriefInput) string {
 	}
 	var b strings.Builder
 	partial := ""
-	if in.IndexPartial {
-		partial = " | index partial"
+	if in.HookErrors > 0 {
+		partial = fmt.Sprintf(" | hook errors %d", in.HookErrors)
 	}
-	fmt.Fprintf(&b, "wikory: mode=%s | last consolidated: %s | pending %d | failed %d | stale %d%s. The wiki may not be current: verify against code.\n",
-		oneLine(in.Mode, 40), oneLine(lastCons, 40), len(pending), in.Failed, stale, partial)
+	if in.IndexPartial {
+		partial += " | index partial"
+	}
+	pendingTotal := max(in.PendingTotal, len(pending))
+	fmt.Fprintf(&b, "wikory: mode=%s | last consolidated: %s | pending %d | failed %d | stale %s%s. The wiki may not be current: verify against code.\n",
+		oneLine(in.Mode, 40), oneLine(lastCons, 40), pendingTotal, in.Failed, staleText, partial)
 	b.WriteString(Preface + "\n")
 	if in.Degraded != "" {
 		b.WriteString("wikory is degraded: " + Sanitize(in.Degraded) + "\n")
@@ -139,6 +167,7 @@ func Brief(in BriefInput) string {
 			more += len(pending)
 		}
 	}
+	more += pendingTotal - len(pending) // rows the query did not return are still pending
 	if in.OtherCheckoutsPending > 0 {
 		line := fmt.Sprintf("(%d pending in other checkouts)\n", in.OtherCheckoutsPending)
 		if fits(line, limit) {

@@ -29,6 +29,9 @@ const (
 // testHookBeforeTransition lets a test hold two transitions at a barrier. Nil in production.
 var testHookBeforeTransition func(turnID string)
 
+// UnknownRevision is recorded as GitFacts.Head when HEAD could not be resolved.
+const UnknownRevision = "unknown"
+
 // Recorder captures turns for one registered checkout.
 type Recorder struct {
 	Store            *store.Store
@@ -39,6 +42,9 @@ type Recorder struct {
 	Now              func() time.Time
 	SealTimeout      time.Duration
 	StaleMarkerAfter time.Duration
+	// Warn, when set, is told the kind of a fault the capture survived (for example
+	// "git-status" when the dirty-file facts were lost), so the caller can log it.
+	Warn func(kind string)
 }
 
 // tsFormat is fixed width so stored timestamps compare correctly as strings.
@@ -270,8 +276,9 @@ func boolInt(b bool) int {
 // Inside one immediate transaction (the database write lock) it re-reads the row and yields
 // if the version moved or allowed refuses the state; it then writes the immutable file for
 // version from+1, adopting that file if a crashed earlier attempt already wrote it, and
-// publishes the row from the content of the file actually on disk. The row and the file
-// therefore always agree, and a transition can never rewind a turn to an older version.
+// publishes the row from the content of the file actually on disk. The row therefore never
+// passes the file on disk (a file may briefly run ahead of the row after a crash, and the
+// next transition adopts it), and a transition can never rewind a turn to an older version.
 // It returns the record actually published, which is the adopted file when one was on
 // disk, so a caller never counts a proposal that did not take effect.
 func (r *Recorder) transition(ctx context.Context, turnID string, from int, next Record, allowed func(state string, stub bool) bool) (Record, bool, error) {
@@ -348,12 +355,33 @@ func (r *Recorder) createOrComplete(ctx context.Context, rec Record) (string, bo
 }
 
 // gitFacts records branch, HEAD and fingerprints of uncommitted files, read through the
-// confined repository root.
+// confined repository root. git is given at most half of what is left of ctx, so a git that
+// blocks (a FIFO as .git/info/exclude, a hung filesystem) loses the dirty-file facts but not
+// the turn; Warn("git-status") says so.
 func (r *Recorder) gitFacts(ctx context.Context) GitFacts {
-	g := GitFacts{Branch: r.Repo.Branch(ctx)}
-	g.Head, _ = r.Repo.HeadCommit(ctx)
-	dirty, err := r.Repo.Dirty(ctx, ".")
+	gctx := ctx
+	if dl, ok := ctx.Deadline(); ok {
+		if half := time.Until(dl) / 2; half > 0 {
+			var cancel context.CancelFunc
+			gctx, cancel = context.WithTimeout(ctx, half)
+			defer cancel()
+		}
+	}
+	g := GitFacts{Branch: r.Repo.Branch(gctx)}
+	head, err := r.Repo.HeadCommit(gctx)
 	if err != nil {
+		// "" means an unborn branch and nothing else; a failure is recorded as unknown.
+		head = UnknownRevision
+		if r.Warn != nil {
+			r.Warn("git")
+		}
+	}
+	g.Head = head
+	dirty, err := r.Repo.Dirty(gctx, ".")
+	if err != nil {
+		if r.Warn != nil {
+			r.Warn("git-status")
+		}
 		return g
 	}
 	for i, p := range dirty {

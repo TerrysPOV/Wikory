@@ -59,6 +59,7 @@ type Record struct {
 	Outcome          string         `json:"outcome"`
 	Stub             bool           `json:"stub"`
 	Incomplete       bool           `json:"incomplete,omitempty"`
+	IncompleteReason string         `json:"incomplete_reason,omitempty"`
 	Harness          string         `json:"harness"`
 	SessionID        string         `json:"session_id"`
 	Marker           string         `json:"marker"`

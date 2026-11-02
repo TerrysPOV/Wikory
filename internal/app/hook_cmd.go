@@ -12,7 +12,6 @@ import (
 	"github.com/TerrysPOV/Wikory/internal/decode"
 	"github.com/TerrysPOV/Wikory/internal/decode/claude"
 	"github.com/TerrysPOV/Wikory/internal/retrieve"
-	"github.com/TerrysPOV/Wikory/internal/store"
 )
 
 func init() {
@@ -22,7 +21,10 @@ func init() {
 // testHookSlowBriefing lets a test push the briefing past its budget. Nil in production.
 var testHookSlowBriefing func()
 
-func hookBudget(env *Env) time.Duration {
+// hookBudget is the time one hook may spend, a little under the plugin timeout that would
+// otherwise kill it silently (plugins/claude/hooks/hooks.json: SessionStart 5 s, UserPromptSubmit
+// 3 s, Stop 5 s). WIKORY_HOOK_BUDGET_MS overrides it; WIKORY_LATENCY_SLACK multiplies it.
+func hookBudget(env *Env, kind decode.Kind) time.Duration {
 	if ms, err := strconv.Atoi(env.Getenv("WIKORY_HOOK_BUDGET_MS")); err == nil && ms > 0 {
 		return time.Duration(ms) * time.Millisecond
 	}
@@ -30,25 +32,14 @@ func hookBudget(env *Env) time.Duration {
 	if n, err := strconv.Atoi(env.Getenv("WIKORY_LATENCY_SLACK")); err == nil && n > 0 {
 		s = n
 	}
-	return 2 * time.Second * time.Duration(s)
-}
-
-// logHookError records the kind of a hook failure, never its content.
-func logHookError(env *Env, kind string) {
-	dir, err := store.DataDir(env.Getenv)
-	if err != nil {
-		return
+	base := 2 * time.Second
+	switch kind {
+	case decode.UserPrompt:
+		base = 2500 * time.Millisecond
+	case decode.Stop:
+		base = 4 * time.Second
 	}
-	store.RestrictUmask()
-	if store.EnsurePrivateDir(dir) != nil {
-		return
-	}
-	f, err := openHookLog(filepath.Join(dir, "hook-errors.log")) // never blocks; regular files only
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	fmt.Fprintf(f, "%s %s\n", time.Now().UTC().Format(time.RFC3339), kind)
+	return base * time.Duration(s)
 }
 
 func transcriptRoots(env *Env) []string {
@@ -66,7 +57,8 @@ func transcriptRoots(env *Env) []string {
 
 func newRecorder(p *project, env *Env) *capture.Recorder {
 	return &capture.Recorder{Store: p.Store, CheckoutID: p.Checkout.ID, Repo: p.Repo, RepoRoot: p.RepoRoot,
-		TranscriptRoots: transcriptRoots(env), Now: time.Now, SealTimeout: 10 * time.Minute, StaleMarkerAfter: 6 * time.Hour}
+		TranscriptRoots: transcriptRoots(env), Now: time.Now, SealTimeout: 10 * time.Minute, StaleMarkerAfter: 6 * time.Hour,
+		Warn: func(kind string) { logHookError(env, kind) }}
 }
 
 // timeoutBriefing is the status-only fallback. It is a pure string computation, so it can be
@@ -77,8 +69,6 @@ func timeoutBriefing(reason string) string {
 
 func runHook(ctx context.Context, env *Env, args []string) (res Result, err error) {
 	start := time.Now()
-	budget := hookBudget(env)
-	deadline := start.Add(budget) // the budget starts before stdin is read
 	action := "none"
 	defer func() {
 		if r := recover(); r != nil {
@@ -97,6 +87,13 @@ func runHook(ctx context.Context, env *Env, args []string) (res Result, err erro
 		logHookError(env, "unknown-event")
 		return
 	}
+	budget := hookBudget(env, kind)
+	deadline := start.Add(budget) // the budget starts before stdin is read
+	// One deadline for the whole hook. It reaches every database query and git command through
+	// ctx, and bounded() enforces it on the waits ctx cannot reach (the registry lock, a read
+	// of a file that never answers).
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	type decoded struct {
 		ev  decode.Event
 		err error
@@ -139,22 +136,56 @@ func runHook(ctx context.Context, env *Env, args []string) (res Result, err erro
 			writeSessionStart(env, text)
 		}
 	case decode.UserPrompt:
-		action = userPrompt(ctx, &e2, ev)
+		action = bounded(env, deadline, func() string { return userPrompt(ctx, &e2, ev) })
 	case decode.Stop:
-		action = stopCapture(ctx, &e2, ev)
+		action = bounded(env, deadline, func() string { return stopCapture(ctx, &e2, ev) })
 	}
 	return
 }
 
+// bounded runs fn and gives up on it at the deadline, logging "timeout". The abandoned work
+// is not waited for: the hook returns, the process exits, and its context is already cancelled,
+// so it can start nothing new. A panic in fn is logged, never raised: a hook must exit 0.
+func bounded(env *Env, deadline time.Time, fn func() string) string {
+	done := make(chan string, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logHookError(env, "panic")
+				done <- "panic"
+			}
+		}()
+		done <- fn()
+	}()
+	select {
+	case s := <-done:
+		return s
+	case <-time.After(time.Until(deadline)):
+		logHookError(env, "timeout")
+		return "timeout"
+	}
+}
+
+// writeSessionStart writes the briefing to the harness. A failed write (the harness closed our
+// stdout) is logged as "output"; the hook still exits 0.
 func writeSessionStart(env *Env, text string) {
 	out, _ := json.Marshal(map[string]any{"hookSpecificOutput": map[string]any{
 		"hookEventName": "SessionStart", "additionalContext": text}})
-	fmt.Fprintln(env.IO.Out, string(out))
+	if _, err := fmt.Fprintln(env.IO.Out, string(out)); err != nil {
+		logHookError(env, "output")
+	}
+}
+
+// openFailureIsNews reports whether a failure to open the project should be logged: not for a
+// repository that is not git or has no project-memory (Wikory is not in use there), and not for
+// a failure caused by the hook's own deadline (bounded logs that as "timeout").
+func openFailureIsNews(ctx context.Context, err error) bool {
+	return err != errNotGit && err != errNotInitialised && ctx.Err() == nil
 }
 
 // sessionStart answers within what is left of the hook's budget, which began before stdin.
 func sessionStart(ctx context.Context, env *Env, ev decode.Event, deadline time.Time) string {
-	budget := hookBudget(env)
+	budget := hookBudget(env, decode.SessionStart)
 	slow := testHookSlowBriefing // read here, not in the goroutine, so tests can reset it without a data race
 	done := make(chan string, 1)
 	go func() {
@@ -181,6 +212,7 @@ func sessionStart(ctx context.Context, env *Env, ev decode.Event, deadline time.
 }
 
 func sessionStartBriefing(ctx context.Context, env *Env, ev decode.Event, deadline time.Time) string {
+	mode := startModeProbe(ctx) // overlaps the project open and the index refresh
 	p, err := openProject(ctx, env, false)
 	if err == errNotInitialised || err == errNotGit {
 		return ""
@@ -196,9 +228,13 @@ func sessionStartBriefing(ctx context.Context, env *Env, ev decode.Event, deadli
 		return notRegisteredBriefing(p)
 	}
 	rec := newRecorder(p, env)
-	_ = rec.SweepStale(ctx, ev.SessionID)
-	_, _ = rec.Seal(ctx, deadline.Add(-time.Duration(float64(time.Until(deadline))*0.6)))
-	text, err := buildBriefing(ctx, p, "full", deadline)
+	if err := rec.SweepStale(ctx, ev.SessionID); err != nil {
+		logHookError(env, "sweep")
+	}
+	if _, err := rec.Seal(ctx, deadline.Add(-time.Duration(float64(time.Until(deadline))*0.6))); err != nil {
+		logHookError(env, "seal")
+	}
+	text, err := buildBriefing(ctx, p, env, mode(), deadline)
 	if err != nil {
 		logHookError(env, "briefing")
 		return degradedBriefing(p.RepoRoot, "the index could not be read")
@@ -209,6 +245,9 @@ func sessionStartBriefing(ctx context.Context, env *Env, ev decode.Event, deadli
 func userPrompt(ctx context.Context, env *Env, ev decode.Event) string {
 	p, err := openProject(ctx, env, false)
 	if err != nil {
+		if openFailureIsNews(ctx, err) {
+			logHookError(env, "open")
+		}
 		return "skipped"
 	}
 	defer p.Close()
@@ -220,13 +259,18 @@ func userPrompt(ctx context.Context, env *Env, ev decode.Event) string {
 		logHookError(env, "turn-start")
 		return "error"
 	}
-	_, _ = rec.Seal(ctx, time.Now().Add(100*time.Millisecond))
+	if _, err := rec.Seal(ctx, time.Now().Add(100*time.Millisecond)); err != nil {
+		logHookError(env, "seal")
+	}
 	return "turn-start"
 }
 
 func stopCapture(ctx context.Context, env *Env, ev decode.Event) string {
 	p, err := openProject(ctx, env, false)
 	if err != nil {
+		if openFailureIsNews(ctx, err) {
+			logHookError(env, "open")
+		}
 		return "skipped"
 	}
 	defer p.Close()
