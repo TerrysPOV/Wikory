@@ -29,3 +29,16 @@
 | G5-11b3 | the colon dropped from the forbidden characters | RED as predicted (`"f.txt:stream" (stream or forbidden character) was accepted`) |
 | G5-11b4 | the case fold (`strings.ToUpper`) removed | RED as predicted (`"con" (a reserved device name) was accepted`) |
 | G5-11c | Windows hard-link tests (read, append, replace) added to `confine_windows_test.go`; the `NumberOfLinks > 1` check cannot be faulted from this machine | pending-ci: compiled and vetted with `GOOS=windows`, not run |
+| G5-12a | `recover` reports completed jobs as the abandoned list (`"completed": nz(rep.Abandoned)`), tested with a stamp that stopped after moving the live page aside | RED as predicted (`recover={OK:true Data:{Completed:[] ...}}`) |
+| G5-12b | `Recover` stops appending finished jobs to `Report.Completed`; `apply` skipped in `recoverJob` | RED as predicted both ways (`recover={...Completed:[]...}`; `recovery did not finish the stamp`) |
+| G5-12c | the abandoned count in the text form of `recover` forced to 0 | RED as predicted (`text form: ... 0 abandoned`) |
+| G5-12d | the abandoned list in the JSON form of `recover` replaced by the completed list | RED as predicted (`JSON form: ... Abandoned:[]`) |
+| G5-12e | `search --limit` ignored (`Limit: 10 + 0*(*limit)`) | RED as predicted (`--limit 1 returned 10 hits`) |
+| G5-X1a | `finish` drops the write error of a successful `--json` envelope (`_ = writeEnvelope(...)`) | RED as predicted (`a_successful_command`: the lost JSON output was not logged) |
+| G5-X1b | the same for the failure envelope | RED as predicted (`was not logged as kind output`) |
+| G5-X1c | `logEnvelopeFailure` logs unconditionally (`if true`) | RED as predicted (`an output failure was logged although stdout worked`) |
+| G5-X2a | `-c core.excludesFile=` dropped from the git safety flags (core.excludesFile at a FIFO) | RED as predicted (`Dirty with core.excludesFile at a FIFO ... signal: killed` after the 10 s deadline) |
+| G5-X2b | `GIT_OPTIONAL_LOCKS=0` dropped from the git environment | RED as predicted (`want exactly GIT_OPTIONAL_LOCKS=0`) |
+| G5-X2c | `checkExcludeFile` never refuses (`... && false`) | RED as predicted (`want ErrUnsafeExclude promptly`, git killed by the 10 s deadline) |
+| G5-X2d | `checkExcludeFile` always refuses (`\|\| true`) | RED as predicted (`want only y.txt`) |
+| G5-X2e | `checkExcludeFile` uses `Lstat` instead of `Stat` (refuses a link to an ordinary file) | RED as predicted by `TestSymlinkToARegularInfoExcludeStillWorks`; it SURVIVED the first version of the tests (the FIFO-link test passes either way), so that test was added |
