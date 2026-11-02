@@ -10,7 +10,7 @@ Assembled by docs/spikes/assemble.sh from docs/spikes/results/. Do not edit by h
 | V02 | Minimum Go version for rooted opens; os.Root behaviour (unix) | `go test -tags spike -run 'TestOSRoot\|TestOpenat\|TestRootHas'` on macOS arm64, Go 1.27.3; floor from a scratch module run under GOTOOLCHAIN go1.23.0, go1.24.0, go1.25.0 | (a) os.Root refuses a file symlink and a directory symlink that leave the root. (b) os.Root follows a relative in-root symlink (so it alone does not meet rule 7) but refuses an absolute symlink even when its target is inside the root (`path escapes from parent`); the plan's absolute test link was corrected to a relative one. (c) `openat` with `O_NOFOLLOW` refuses a symlinked directory component (errno ENOTDIR on macOS, not ELOOP) and a symlinked file. (d) `os.OpenRoot` is in Go 1.24, but `Root.Link` and `Root.Rename` first appear in Go 1.25 (1.24.0: `r.Link undefined`, `r.Rename undefined`; 1.25.0 passes). True API floor 1.25; go.mod stays `go 1.26.0` because the dependencies require it. Fault-injected on (a) twice and (c) twice, all RED | `internal/spikes/root_unix_spike_test.go` | A3 uses per-component `openat` with `O_NOFOLLOW` and treats ENOTDIR and ELOOP both as symlink refusal; os.Root is a confinement backstop, not the symlink policy | verified |
 | V03 | os.Root and reparse points on Windows, junctions | S2 (CI) | | | | pending-ci |
 | V04 | SQLite WAL under parallel processes (macOS) | 8 child processes x 200 immediate transactions on one WAL database (busy_timeout 5000, synchronous FULL), run 4 times | verified: no lost rows (1600 of 1600), no busy failure; per-transaction p50 53 to 89 us, worst p99 41.2 ms (one child, one run), other p99 mostly under 4 ms | internal/spikes/wal_spike_test.go | no flock writer lock needed for correctness on macOS; budget Stop writes for a p99 near 40 ms under 8-way contention | verified |
-| V05 | SQLite WAL under parallel processes (Windows) | same test, run by the CI matrix (A28) | not run here | internal/spikes/wal_spike_test.go | if refuted, take the store flock writer lock (A6) around every write transaction | pending-ci |
+| V05 | SQLite WAL under parallel processes (Windows) | the V04 workload (8 child processes x 200 immediate transactions, busy_timeout 5000, synchronous FULL, one WAL database) on the Windows leg of CI run 41368051497, commit cd64e22 | refuted: `REFUTED V04: 3 children failed, rows=1000 want 1600`. Three of eight processes failed and 600 of 1600 writes were lost or never made (the same workload gives 1600 of 1600 on macOS, V04). CI run on commit 0f2d3e4 (Windows): plain WAL failed=1 rows=1469/1600, WAL with the store lock failed=0 rows=1600/1600, WAL with the production helper `store.WithWriteLock` failed=0 rows=1600/1600, journal_mode=DELETE failed=6 rows=400/1600 (an earlier run gave failed=4 rows=800 for plain WAL and failed=7 rows=200 for DELETE). macOS and Linux pass every variant. | internal/spikes/wal_spike_test.go (`TestWALParallelProcesses`, build tag `spike`) | Cross-process writers need a serialising lock on Windows: take the store OS advisory lock (`store.Lock`, `internal/store/lock*.go`, LockFileEx on Windows) around every write transaction, unless the CI variants show a better route. Mitigated in production: every database write transaction runs inside `store.WithWriteLock` (commit 0f2d3e4, lock order registry, publish, db-write). The Windows leg of the spike proves the production helper. | refuted (mitigated) |
 | V06 | Exact Stop payload fields on 2.1.316 | S5 launch (ledger 2; ledger 1 was a wrapper PATH failure, no model call) | Stop keys: `background_tasks, cwd, effort, hook_event_name, last_assistant_message, permission_mode, prompt_id, session_crons, session_id, stop_hook_active, transcript_path`. All seven assumed fields present with the assumed names; `last_assistant_message` was `ok`. Extra keys exist (`effort`, `permission_mode`, `background_tasks`, `session_crons`); A16 must ignore unknown keys. | `internal/decode/testdata/claude-2.1.316/stop.json` | A16 struct tags follow this fixture; no fallback needed for `last_assistant_message` on a normal turn. | verified |
 | V07 | `prompt_id` present and equal in UserPromptSubmit and Stop | S5 launch (ledger 2) | `prompt_id` is present and identical in UserPromptSubmit, Stop and SessionEnd for the one turn; it is absent from SessionStart (no prompt yet). One turn only: equality across several turns and for a session with several prompts is not shown. | `internal/decode/testdata/claude-2.1.316/{user-prompt-submit,stop,session-end}.json` | `turn_id` may use `prompt_id` as the primary key; the stored turn-start marker path stays as the fallback for SessionStart-only and multi-turn edge cases. | verified |
 | V08 | Transcript lag at Stop | S5 launch (ledger 2) | The transcript copied inside the Stop hook was 95,782 bytes with 0 `assistant` lines; the copy taken 5 s later was 157,329 bytes with 1 `assistant` line (the final message) plus a `system` stop_hook_summary and a `cost-state` line. So the transcript at Stop lacked the final assistant message. | `docs/spikes/evidence/S5/transcript.jsonl` (filtered: conversational line types only; `attachment` and `api-request*` lines dropped because they embed prompt text that cannot be scrubbed safely) | Sealing must not read the final message from the transcript at Stop time: take it from `last_assistant_message` (V06) and reconcile with the transcript later; keep the sealing timeout. | verified |
@@ -122,6 +122,22 @@ Run with `scripts/inject.sh`, one site at a time, against the committed A11 code
 | A12-5 | replay of a done job allowed | RED as predicted (`replaying a finished job: want ErrJobState`) |
 | A12-6 | takeover without the publishing lock | RED as predicted (`the publish in progress was fenced mid-way: publish: lease epoch is stale`) |
 | A12-7 | operations not marked in the database | RED as predicted (`db marks: 0 of 2 ops done`) |
+| A12-8 | G4: `ErrConflict` message reverted to "nothing was overwritten" (false when the conflict is raised mid-apply) | RED as predicted (`the conflict message does not warn that earlier operations may be applied`) |
+| A12-9 | G4: Recover does not treat a database-final job as final (`finalState(dbState)` disabled) | RED as predicted (`was not skipped cleanly`, `publish: the job is not open`) |
+| A12-10 | G4: Recover returns on the first per-job error instead of collecting it | RED as predicted (`the good job was not recovered past the corrupt one`) |
+| A12-11 | G4: `conflict()` discards the `setJob` error | RED as predicted (`the failure to record the conflict in the database was discarded`) |
+| A12-12 | G4: `conflict()` discards the `writeManifest` error | RED as predicted (`the failure to record the conflict in the manifest was discarded`) |
+| A12-13 | G4: Recover drops the failure to record a conflict (`errors.As` branch disabled) | RED as predicted (`the unrecorded conflict is not reported`) |
+| A12-14 | G4: Takeover has no checkout filter (`OR 1=1`) | RED as predicted (`co-2 fenced co-1's job: err=<nil> epoch 1 -> 2`) |
+| A12-15 | G4: duplicate targets accepted by revalidate | RED as predicted (`b="B1" state=conflict`) |
+| A12-16 | G4: `AbandonAfter` not required by the lazy config check | RED as predicted (`AbandonAfter 0 abandoned a live job`) |
+| A12-17 | G4: `Begin` does not run the lazy config check | RED as predicted (`a zero-value Publisher panicked`; the test turns the panic into a named failure) |
+| A12-18 | G4: an oversize log is not rotated (`maxFile` comparison disabled) | RED as predicted (`a full log failed the publish`, `rotated=0 bytes`) |
+| A12-19 | G4: the log search keeps no overlap between chunks (`carry = 0`). The first version of the test put the token after the chunk boundary and SURVIVED; the offset was fixed and the row re-run | RED as predicted (`the job's line was not found in an oversize log`) |
+| A12-20 | G4: recovery discards the kept-backup list (`rep.Kept` not filled) | RED as predicted (`the kept backup is not reported`) |
+| A12-21 | G4: an abandoned job's stage directory is not removed | RED as predicted (`stage directory survived recovery`) |
+
+G4 comment-only fixes (publish.go and recover.go comments, root.go and confine.go comments, `BackupTarget`, `SetStepHook` doc, hook_test.go, deps.go) have no fault row: a comment cannot be made to fail a test.
 
 | A13-1 | recovery overwrites unexpected content | SURVIVED as predicted (second guard: the re-hash before the rename, A13-9) |
 | A13-2 | log append not idempotent | RED as predicted (`a="A1" b="B1" log=2 state=done`) |
@@ -200,6 +216,10 @@ Run with `scripts/inject.sh`, one site at a time, 2026-11-01.
 | A18-10 | RED as predicted | |
 | A18-11 | RED as predicted | |
 | A18-12 | RED as predicted | |
+| G2-1a (review-fix wave, finding 1) | RED as predicted | git gets 100 times the time left instead of half, so a blocked `git status` eats the whole Stop deadline: `TestStopSurvivesGitStatusBlockedOnAFifoExclude`: `the turn was not captured` |
+| G2-1b | RED as predicted | the lost git facts are reported under a different kind: `the lost git facts were not reported: [x]` |
+| G2-HEAD (orchestrator item, capture.go HeadCommit error) | RED as predicted | an unresolvable HEAD stored as an empty revision (`head = ""` for `head = UnknownRevision`): `TestStopRecordsAnUnresolvableHeadAsUnknown`: `warned=[git git-status] record={` (head empty) |
+| G2-HEAD-b | RED as predicted | the failure is warned under another kind (`r.Warn("gitx")`): `warned=[gitx` |
 
 # Fault log, A19 (sealing)
 
@@ -215,6 +235,9 @@ Run with `scripts/inject.sh`, one site at a time, 2026-11-01.
 | A19-8 | RED as predicted | |
 | A19-9 | RED as predicted | |
 | A18-8 (re-run after A19) | RED as predicted | `TestSealedRecordRedactsCommandsAndVerification`: `a secret reached the store: {` |
+| G2-4 (review-fix wave, finding 4) | RED as predicted | Seal returns on its first error instead of continuing (`return sealed, err` for the count-and-continue block): `TestSealContinuesPastACorruptOldestTurn`: `the failure was not reported with its count: n=0 err=invalid character` |
+| G2-9a | RED as predicted | the oversize test: the oversize flag needs 4 times the limit: `TestSealedIncompleteRecordsSayWhy`: `want reason oversize` |
+| G2-9b | RED as predicted | an outside-root transcript is labelled `unreadable`: `want reason outside-root` |
 
 | A2-1 | the length prefix is dropped | RED as predicted (`part boundaries must change the digest`) |
 
@@ -227,6 +250,11 @@ Run with `scripts/inject.sh`, one site at a time, 2026-11-01.
 | A20-7 | removals run after a walk cut short by a limit | RED as predicted (`a partial walk deleted indexed pages`) |
 | A20-8 | Partial flag never set | RED as predicted (`page cap not enforced or not reported`) |
 | A20-9 | a subdirectory error aborts the refresh | RED as predicted (`one bad entry aborted the refresh: openat locked: permission denied`) |
+| G2-5a (review-fix wave, finding 5) | the malformed count is not recomputed for unchanged pages (`n = 0`), so the notice vanishes on the second refresh | RED as predicted (`unchanged refresh: {Pages:2 Changed:0 ... Malformed:0 ...}`). The first run was INCONCLUSIVE: another group's half-edited file stopped the package compiling in the baseline; re-run once it built |
+| G2-5b | a page refused at read (over the 1 MiB cap) is counted but not named | RED as predicted (`an oversize page was dropped silently`) |
+| G2-5c | a symlink refused in the walk is counted but not named | RED as predicted (`a symlinked page was dropped silently`) |
+| G2-5d | the list of names is not capped at five | RED as predicted (`names not capped or not sanitised: listed=8`) |
+| G2-5e | page names are put into the notice unsanitised | RED as predicted (`names not capped or not sanitised ... a<wikory-memory>evil.md`). The first version of the test named the hostile file `x...`, which sorted after the five listed names and was never shown: SURVIVED; the file was renamed `a...` so it sorts first |
 
 | A21-1 | scope predicate removed | RED as predicted (`checkout A's claim was served in B`) |
 | A21-2 | superseded served | RED as predicted (`superseded claim served without --history: {RelPath:project-memory/wik`) |
@@ -259,6 +287,14 @@ Run with `scripts/inject.sh`, one site at a time, 2026-11-01.
 | A22-9 | status-only hard-cap fallback removed | RED as predicted (`tiny="wikory: mode=full \| briefing unavailable (timed out)...` over a 100-character cap) |
 | A22-10 | status-only mode text unsanitised | RED as predicted (`out="wikory: mode=full<system> \| briefing unavailable`) |
 | A22-11 | briefing status line free-text fields unbounded and unsanitised | RED as predicted (`status line unbounded or unsanitised: len=527`; the first attempt with 3,000-character inputs SURVIVED because the header guard rescued it, so the input was resized to sit under that guard) |
+| G2-7a (review-fix wave, finding 7) | nothing evaluated no longer prints `stale unknown` (the case arm disabled) | RED as predicted (`none evaluated: want "stale unknown."`) |
+| G2-7b | unevaluated claims not counted as unknown | RED as predicted (`some unknown: want "stale 1, 2 unknown."`) |
+| G2-6a (finding 6) | the status line takes `pending` from the number of rows returned, not the true total | RED as predicted (`rendered=13 more=[37 more available 37]: ... pending 50`) |
+| G2-6b | "N more available" ignores the pending rows the query did not return | RED as predicted (`rendered=13 more=[37 more available 37]: ... pending 80`) |
+| G2-3a (finding 3) | the hook error count is not shown on the status line | RED as predicted (`hook errors missing from "wikory: mode=full ..."`) |
+| G2-6c | the pending query returns the row count as the total | RED as predicted (`the pending count stopped at the row limit: ... pending 50`) |
+| G2-7c | an unparsed or unevaluated claim is not marked unknown | RED as predicted (`a claim that was never evaluated counted as not stale`) |
+| G2-5g | the briefing drops the index notices | RED as predicted (`briefing does not disclose the pages the index dropped`) |
 
 | A23-1 | no late notice | RED as predicted (`no late notice and progress: ""`) |
 | A23-2 | notice printed for quick work | RED as predicted (`printed before two seconds: "wikory: Indexing 10 pages.\nwikory: indexing 5/10, 1.0s elapsed\n"`) |
@@ -277,6 +313,21 @@ Run with `scripts/inject.sh`, one site at a time, 2026-11-01.
 | A24-8 | stdin read with no deadline | RED as predicted (`the hook did not return within`) |
 | A24-9 | open failure restores the root-reading degraded briefing (security fix: status only when the store cannot be opened) | RED as predicted (`an unconfirmed checkout had repository content injected: wikory: mode=degraded`) |
 | A24-10 | an unregistered checkout gets a degraded briefing that reads its `index.md` | RED as predicted (`an unregistered checkout had repository content injected`) |
+| G2-1c (review-fix wave, finding 1) | UserPromptSubmit default budget set to 2 s instead of 2.5 s | RED as predicted (`kind user-prompt: budget 2s, want 2.5s`) |
+| G2-1d | Stop not bounded by the hook deadline (registry.lock held: the store waits 5 s) | RED as predicted (`code=0 elapsed=5.046s: the hook outlived its 400ms budget`) |
+| G2-1e | UserPromptSubmit not bounded by the hook deadline | RED as predicted (`elapsed=5.045s: the hook outlived its 400ms budget`) |
+| G2-2a (finding 2) | UserPromptSubmit does not log an open failure | RED as predicted (`a corrupt config.toml was not logged by both hooks: "... open\n"`) |
+| G2-2b | Stop does not log an open failure | RED as predicted (same text) |
+| G2-2c | a repository without project-memory is no longer silent | RED as predicted (`a repository without Wikory logged hook errors`) |
+| G2-4a (finding 4) | SessionStart discards the Seal error | RED as predicted (`the seal failure was not logged: ""`) |
+| G2-4b | UserPromptSubmit discards the Seal error | RED as predicted (`UserPromptSubmit did not log its seal failure`) |
+| G2-4c | SessionStart discards the SweepStale error | RED as predicted (`the sweep failure was not logged: ""`) |
+| G2-10 (finding 10) | a failed write of the briefing to stdout is not logged | RED as predicted (`the failed write was not logged: ""`) |
+| G2-3b (finding 3) | the 24-hour window removed from the hook error count | RED as predicted (`hook_errors=3`) |
+| G2-3c | the log is never trimmed | RED as predicted (`size=2097199 ... the log was not capped to its newest part`) |
+| G2-3d | the trimmed log does not start at a line boundary | RED as predicted (`the trimmed log starts mid-line`) |
+| G2-3e | an unwritable log not reported by doctor | RED as predicted (`an unusable hook error log went unreported`) |
+| G2-3f | the Lstat regular-file check removed from `readHookLog` | SURVIVED as predicted: a second guard, `openHookLogRead` (O_NOFOLLOW, O_NONBLOCK, fstat), refuses a symlink and a FIFO and the same notice is raised. The Lstat check stays because it names the kind of file in the message and covers Windows, where links are followed |
 
 | A25-1 | metadata rendered without the rules | RED as predicted (`code=0 page=# Q`) |
 | A25-2 | path check removed | RED as predicted (`"README.md" accepted`) |
@@ -289,6 +340,16 @@ Run with `scripts/inject.sh`, one site at a time, 2026-11-01.
 | A26-4 | hook errors not counted (added row) | RED as predicted (`hook_errors=0 index_partial=`) |
 | A26-5 | index partial flag not set (added row) | RED as predicted (`hook_errors=2 index_partial=<nil>`) |
 | A26-6 | recover drops the refused list (added row) | RED as predicted (`code=0 out=`) |
+| G2-8a (review-fix wave, finding 8) | the briefing's mode ignores the probed version | RED as predicted (`claude "9.9.9": want mode=reduced: wikory: mode=full`). The first attempt did not compile (unused variable) and was INCONCLUSIVE; the fault was rewritten to keep the variable in use |
+| G2-8b | the probed mode is not cached for the process | RED as predicted (`the probe ran 2 times in one process, want once`) |
+| G2-9a (finding 9) | doctor drops the notice for a failed count query | RED as predicted (`doctor read a failing query as all clear`; the first run SURVIVED because the stuck-jobs notice also said `could not count`, so the test was tightened to require both messages) |
+| G2-9b | doctor drops the notice for a failed stuck-jobs query | RED as predicted (same text) |
+| G2-9c | incomplete sealed turns not reported | RED as predicted (`captured=1 sealed=2 incomplete=0`) |
+| G2-9d | stuck-job age raised 1000-fold | RED as predicted (`a stuck publish job went unreported: stuck=0`) |
+| G2-9e | stuck-job age zero | RED as predicted (`a job begun a moment ago was called stuck`) |
+| G2-9f | a stuck job left out of the briefing's failed count | RED as predicted (`a stuck job is not in the briefing's failed count`) |
+| G2-5f (finding 5) | doctor drops the index notices | RED as predicted (`doctor does not disclose the pages the index dropped`) |
+| G2-9g | a failing `git status` in doctor swallowed | RED as predicted (`a failed git status was read as no uncommitted changes`) |
 
 ## A27 fault injection
 
@@ -315,6 +376,11 @@ Run with `scripts/inject.sh`, one site at a time, 2026-11-01.
 | A3-17 | same fault, append through the hard link (also modified the outside file before the fix) | RED as predicted (`append through a hard link: want ErrHardlink`) |
 | A3-18 | same fault, replace of a hard-linked target | RED as predicted (`replace of a hard-linked file: want ErrHardlink`) |
 | A3-19 | `ReplaceIfUnchanged` does not propagate `ErrHardlink` from the moved-aside open (returns `ErrChanged` only) | RED as predicted (`replace of a hard-linked file: want ErrHardlink`) |
+| A3-20 | G4: a directory target is not refused before the move-aside (`ErrNotRegular` pre-check disabled), so the directory is renamed to a backup it cannot be linked back from | RED as predicted (`a directory target was not refused untouched`) |
+| A3-21 | G4: a failed restore link does not name the stranded backup in the error | RED as predicted (`does not name the stranded backup`) |
+| A3-22 | G4: `AppendFile` does not chmod a file it creates, so the umask decides the mode | RED as predicted (`mode=-rw-------`) |
+| A3-23 | G4: `AppendFile` chmods a file that already existed (`created` always true) | RED as predicted (`an existing file's mode was changed`) |
+| A3-24 | G4: `Rename` accepts a multi-component new name (length check disabled; first attempt without `&& false` left `parts` unused and was INCONCLUSIVE) | RED as predicted (`new name "x/y.txt": want ErrEscape`) |
 
 ## Fault log: Task A5
 
@@ -369,6 +435,37 @@ A9-4 rc=0: RED as predicted
 A9-5 rc=0: RED as predicted
 A9-6 rc=0: RED as predicted
 
+# Fault log: G3 review-fix wave (sanitiser, redactor, page comments, claim encoding, validator status)
+
+Run with `scripts/inject.sh`, one site at a time, against the committed G3 code. Each row was predicted RED.
+
+| # | Fault | Verdict |
+|---|---|---|
+| G3-1a | sanitiser no longer strips Unicode category Cf (tag characters, U+061C, U+180E) | RED as predicted (`hidden tag characters survived`) |
+| G3-1b | variation selector range U+FE00 starts at U+FE01 | RED as predicted (`variation selector 1 (U+FE00) survived`) |
+| G3-1c | NFKC replaced by NFC | RED as predicted (fullwidth and mathematical spellings of `system` left as `&lt;...&gt;` text instead of being stripped) |
+| G3-1d | angle-bracket look-alike mapping (mathematical and CJK brackets) removed | RED as predicted (`<system>` written with U+3008 and U+3009 survives as text) |
+| G3-2a | key rule loses the identifier tail (`AWS_SECRET_ACCESS_KEY=`) | RED as predicted (`AWS_SECRET_ACCESS_KEY: out=` unredacted) |
+| G3-2b | key rule gets its leading word boundary back (`DB_PASSWORD=`) | RED as predicted (`DB_PASSWORD: out=` unredacted) |
+| G3-2c | URL userinfo password group can no longer match | RED as predicted (`counts=map[]`, password still in the URL) |
+| G3-2d | Basic-scheme rule never matches | RED as predicted (`the scheme name should stay`) |
+| G3-2e | double-quoted values with spaces no longer match | RED as predicted (`correct horse battery` survives) |
+| G3-2f | separator made optional (false-positive control) | RED as predicted (`prose mangled: "This token bucket refills; see the api-key rotation runbook...`) |
+| G3-2g | quoted value runs to the last quote on the line (the first version of the test SURVIVED because the line held one quote pair; a second quoted phrase was added) | RED as predicted (`text after the closing quote was swallowed`) |
+| G3-3a | text after a closing marker on the same line dropped | RED as predicted (`body: "next line"`) |
+| G3-3b | an unterminated comment no longer stays open (the first prediction text was wrong; the opener's trailing text comes first) | RED as predicted (`body: "Visible.\n never closed\nHIDDEN: ...`) |
+| G3-3c | a comment inside a claim paragraph ends the paragraph | RED as predicted (`leaked into it, or split it`) |
+| G3-3d | claim comment lines are no longer protected from comment removal | RED as predicted (`blocks: []`) |
+| G3-3e | comment state not carried into the next line | RED as predicted (`"HIDDEN" survived in body`) |
+| G3-4a | comma left raw by `encodeItem` | RED as predicted (`",": rendered line does not parse`) |
+| G3-4b | `%` left raw by `encodeItem` | RED as predicted (`"%2C": round trip changed the claim`) |
+| G3-4c | `@` left raw by `encodeItem` | RED as predicted (`"@": rendered line does not parse`) |
+| G3-4d | `;` left raw by `encodeItem` | RED as predicted (`";": rendered line does not parse`) |
+| G3-4e | `renderChecked` stops refusing a line that does not re-parse | RED as predicted (`line="<!-- claim kind=intent status=unverified aka=\"\" -->" err=<nil>`) |
+| G3-5 | `Derive` shows `hypothesis` as a status again | RED as predicted (`Status:hypothesis`) |
+
+Not injectable: the call from `stampPage` to `renderChecked`. No claim that `ParseComment` accepts can render to a line it rejects once `encodeItem` is fixed, so no test can reach the refusal branch through the command. `renderChecked` itself is covered by G3-4e; the wiring is defensive.
+
 # Fault log S4 (launch ledger)
 
 | Row | Fault | Verdict |
@@ -377,6 +474,148 @@ A9-6 rc=0: RED as predicted
 | S4-2 | the ledger lock removed (`until mkdir "$lock" ...` to `:`) | RED as predicted (`parallel takes recorded 18 launches, want 12`, `TestLedgerHoldsUnderParallelTakes`) |
 
 Both tests existed only in the plan until 2026-11-02; they now live in `internal/spikes/ledger_spike_test.go` (build tags `spike && unix`) and run against a throwaway ledger under `t.TempDir()`, never the real one.
+
+| G1-1 | a hostile `.git` file (absolute or relative gitdir) inherits the trusted clone's trust: the Confirmed gate in `load` removed | RED as predicted (`was served its memory`) |
+| G1-1b | `Discover` reports every worktree as confirmed | RED as predicted (`hostile main: Confirmed=true, want false`) |
+| G1-1c | `wikory init` registers an unconfirmed worktree | RED as predicted (`init in a hostile directory: code=0`) |
+| G1-2 | `core.worktree` outside the current directory is followed | RED as predicted (`want ErrWorktreeRedirected`) |
+| G1-2b | the redirect error is not surfaced by `discover`, so init reports "not inside a git repository" | RED as predicted (`init with core.worktree: code=2 err=wikory init: not inside a git repository`) |
+| G1-3 | `findStore` matches origin and common dir in one pass, so a late-added remote flips a clone onto another store | RED as predicted (`round 8: the clone was flipped onto another clone's store`) |
+| G1-3b | `Resolve` copies an origin another store owns into this store's registry | RED as predicted (`origins=[github.com/o/r] notices=[]`) |
+| G1-3c | `Register` copies an origin another store owns | RED as predicted (`Register aliased an origin another store owns`) |
+| G1-4 | a git failure in `headRev` is returned as an unborn HEAD (`"", nil`) | RED as predicted (`HeadTree swallowed a git failure`; `a HEAD whose commit is missing read as "" with no error`) |
+| G1-4b | `HeadBlobs` ignores the error from `HeadCommit` | RED as predicted (`HeadBlobs swallowed a git failure`) |
+| G1-5 | the clone-id check in `load` removed | RED as predicted (`a different repository at a trusted clone's path was served its memory`) |
+| G1-5b | `init` keeps the trust decision of the clone that was replaced | RED as predicted (`init handed the replaced clone's trust to the new repository`) |
+| G1-5c | the clone id file is written 0644 | RED as predicted (`clone id file mode -rw-r--r--`) |
+| G1-5d | `ensureCloneID` mints a new id on every init | RED as predicted (`a second init rewrote the clone id`) |
+| G1-6 | the schema statements run before the version check | RED as predicted (`the schema ran against a refused store: counters table present=1`) |
+| G1-6b | the registry is written before the database is opened | RED as predicted (`a refused store's registry was rewritten`) |
+| G1-7a | the lock file is opened without `O_NOFOLLOW` | RED as predicted (`Lock followed a symlink and locked its target`) |
+| G1-7b | the regular-file check removed (a device is accepted) | RED as predicted (`Lock accepted a device as its lock file`) |
+| G1-7c | the lock file is opened without `O_NONBLOCK` | SURVIVED: no portable test can observe it, because the lock is opened `O_RDWR`, which never blocks on a FIFO on Linux or macOS. The flag is defence in depth for devices that block on open |
+| G1-8 | a clone with no recorded nonce is bound without revoking (taken to be the same clone) | RED as predicted (`init kept a trusted decision it could not verify`) |
+| G1-9 | the nonce is bound without revoking the old trust | RED as predicted (`a failure at after-file left the path trusted`) |
+| G1-9b | revocation commits, then the nonce is bound in a separate step (not one transaction) | RED as predicted (`a failed rebind changed the trust decision: "undecided" true`) |
+| G1-10a | `pages` rows of the replaced clone are not deleted | RED as predicted (`2 row(s) of the old clone survive in pages`) |
+| G1-10b | `job_ops` rows of the replaced clone are not deleted | RED as predicted (`5 job_ops row(s) of the old clone survive`) |
+| G1-10c | the checkout id ignores the clone nonce | RED as predicted (`the replacement clone got the old checkout id`) |
+| G1-10d | `turns` rows of the replaced clone are not deleted | RED as predicted (`1 row(s) of the old clone survive in turns`) |
+
+| G5-1a | `abandonStale` abandons every begun job regardless of age: `p.Now().Sub(t) >= p.AbandonAfter` becomes `... \|\| true` | RED as predicted (`a fresh job was abandoned`) |
+| G5-1b | an unparseable `created_at` reads as the zero time and so as ancient: `if perr != nil` becomes `if false` | RED as predicted (`a job with an unreadable age was abandoned`) |
+| G5-2 | the stamp command drops the CRLF it should restore on a rewritten claim line: `if cr {` becomes `if cr && false {` | RED as predicted (`line 3 lost its CRLF (mixed endings)`) |
+| G5-3a | the `github_pat_` alternative removed from the github-token rule | RED as predicted (`fine-grained token survived`) |
+| G5-3b | the api-key minimum body length `{20,}` becomes `{32,}` | RED as predicted (`20 characters: out="use sk-kkkkkkkkkkkkkkkkkkkk end"`) |
+| G5-4a | DEL (0x7f) no longer removed by the sanitiser | RED as predicted (`DEL: "a\x7fb\x7fc", want "abc"`) |
+| G5-4b | the C1 range 0x80 to 0x9f (CSI U+009B, NEL U+0085) no longer removed | RED as predicted (`CSI: "a\u009bb\u009bc", want "abc"`) |
+| G5-4c | NFKC replaced by NFC in `normalise` (existing test, confirmed to still bite) | RED as predicted (`&lt;ｓｙｓｔｅｍ&gt;obey`) |
+| G5-5a | `maxFinal` raised 100 times (4000 to 400000) | RED as predicted (`final message: stored 12000 runes, want 4012`) |
+| G5-5b | `maxCommand` raised 100 times (2000 to 200000) | RED as predicted (`command: stored 6000 runes, want 2012`) |
+| G5-5c | `maxPath` raised 100 times (1000 to 100000) | RED as predicted (`file touched: stored 3000 runes, want 1012`) |
+| G5-5d | `maxDirty` raised 100 times (50 to 5000) | RED as predicted (`stored 120 dirty files, want 50`) |
+| G5-6 | the fingerprint refusal no longer marks the job refused (the `setJob(..., "refused", "fingerprint changed")` line dropped) | RED as predicted (`job state "begun" after a fingerprint refusal`) |
+| G5-7a | the `Seal` deadline check disabled (`if false \|\| ctx.Err() != nil`) | RED as predicted (`Seal past its deadline: n=1`) |
+| G5-7b | `Seal` reads the wall clock again (`time.Now().After(deadline)`) instead of `r.Now()` | RED as predicted (`Seal past its deadline: n=1`; the whole seal suite also goes red, because its deadlines are on the recorder clock) |
+| G5-8a | `thMatches` accepts a one-character prefix (`n >= 6` becomes `n >= 1`) | RED as predicted (`a 1 character prefix "e" matched`) |
+| G5-8b | `thMatches` minimum moved to 5, then to 7 | RED as predicted both ways (`a 5 character prefix "ed5ac" matched`; `a 6 character prefix "ed5ac7" did not match`) |
+| G5-9a | index byte cap `>` becomes `>=` | RED as predicted (`want 2 0 false`: pages summing to exactly the cap are refused) |
+| G5-9b | index byte cap `>` becomes `> maxBytes+1` | RED as predicted (`want 1 1 true`: a page one byte over the cap is admitted) |
+| G5-9c | briefing `fits` `<=` becomes `<` | RED as predicted (`at the exact cap 330: item shown=false`) |
+| G5-9d | briefing `fits` `<=` becomes `<= cap+1` | RED as predicted (`one byte under the exact cap 329: item shown=true`) |
+| G5-10a | `Takeover` no longer takes the publishing lock (now a handshake test, not a 300 ms sleep against a 200 ms floor) | RED as predicted (`takeover returned while the publish still held the lock`) |
+| G5-10b | the SessionStart timeout waits an extra 2 s before giving up (the two hook budget tests now scale by `WIKORY_LATENCY_SLACK`, skip the strict budget under `-race`, and wait for the abandoned work by handshake) | RED as predicted (`elapsed=902ms out=`) |
+| G5-11a | the gitx hostile-config tests (clean filter, key names, submodule, fsmonitor) now run on every platform using the test binary as the marker command; driver neutralisation dropped in `Repo.git` (`run(ctx, r.Top, nil, ...)`) | RED as predicted (`the repository's clean filter command ran`; `a driver named with '=' ran`). Found while doing this: `TestRepositoryCleanFilterIsNeverRun` SURVIVED the same fault before the fix, because its working copy differed in size so git never needed the filter; it now uses same-size content and a later mtime |
+| G5-11a2 | `core.fsmonitor=false` dropped from the git safety flags | RED as predicted (`the repository's core.fsmonitor command ran`) |
+| G5-11a3 | `--ignore-submodules=all` dropped from `status` | RED as predicted (`a filter defined in a submodule's own config ran`). Dropping `submodule.recurse`/`diff.ignoreSubmodules` from `baseConfig` SURVIVES: the `--ignore-submodules=all` flag is what stops the descent |
+| G5-11b1 | `LPT9` removed from the reserved device names | RED as predicted (`"LPT9" (a reserved device name) was accepted`) |
+| G5-11b2 | the trailing-space refusal removed | RED as predicted (`"trailing " (trailing dot or space) was accepted`) |
+| G5-11b3 | the colon dropped from the forbidden characters | RED as predicted (`"f.txt:stream" (stream or forbidden character) was accepted`) |
+| G5-11b4 | the case fold (`strings.ToUpper`) removed | RED as predicted (`"con" (a reserved device name) was accepted`) |
+| G5-11c | Windows hard-link tests (read, append, replace) added to `confine_windows_test.go`, since moved with their helpers into the shared `confine_test.go` (they skip on Windows when hard links are unavailable); the `NumberOfLinks > 1` check cannot be faulted from this machine | pending-ci: compiled and vetted with `GOOS=windows`, not run |
+| G5-12a | `recover` reports completed jobs as the abandoned list (`"completed": nz(rep.Abandoned)`), tested with a stamp that stopped after moving the live page aside | RED as predicted (`recover={OK:true Data:{Completed:[] ...}}`) |
+| G5-12b | `Recover` stops appending finished jobs to `Report.Completed`; `apply` skipped in `recoverJob` | RED as predicted both ways (`recover={...Completed:[]...}`; `recovery did not finish the stamp`) |
+| G5-12c | the abandoned count in the text form of `recover` forced to 0 | RED as predicted (`text form: ... 0 abandoned`) |
+| G5-12d | the abandoned list in the JSON form of `recover` replaced by the completed list | RED as predicted (`JSON form: ... Abandoned:[]`) |
+| G5-12e | `search --limit` ignored (`Limit: 10 + 0*(*limit)`) | RED as predicted (`--limit 1 returned 10 hits`) |
+| G5-X1a | `finish` drops the write error of a successful `--json` envelope (`_ = writeEnvelope(...)`) | RED as predicted (`a_successful_command`: the lost JSON output was not logged) |
+| G5-X1b | the same for the failure envelope | RED as predicted (`was not logged as kind output`) |
+| G5-X1c | `logEnvelopeFailure` logs unconditionally (`if true`) | RED as predicted (`an output failure was logged although stdout worked`) |
+| G5-X2a | `-c core.excludesFile=` dropped from the git safety flags (core.excludesFile at a FIFO) | RED as predicted (`Dirty with core.excludesFile at a FIFO ... signal: killed` after the 10 s deadline) |
+| G5-X2b | `GIT_OPTIONAL_LOCKS=0` dropped from the git environment | RED as predicted (`want exactly GIT_OPTIONAL_LOCKS=0`) |
+| G5-X2c | `checkExcludeFile` never refuses (`... && false`) | RED as predicted (`want ErrUnsafeExclude promptly`, git killed by the 10 s deadline) |
+| G5-X2d | `checkExcludeFile` always refuses (`\|\| true`) | RED as predicted (`want only y.txt`) |
+| G5-X2e | `checkExcludeFile` uses `Lstat` instead of `Stat` (refuses a link to an ordinary file) | RED as predicted by `TestSymlinkToARegularInfoExcludeStillWorks`; it SURVIVED the first version of the tests (the FIFO-link test passes either way), so that test was added |
+
+| G6-1a | `isCompleteClaimComment` reverts to the old prefix-only test (`return IsClaimComment(s)`), so an unclosed `<!-- claim broken` line skips the comment scan | RED as predicted (`"PAYLOAD" reached the indexed body`) |
+| G6-1b | the `Count(s, "<!--") == 1` term dropped from `isCompleteClaimComment` (a first run with the trailing-opener input SURVIVED, because that line fails the suffix test anyway; `TestClaimLookingLineWithNestedOpenerMakesNoBlock` was added) | RED as predicted (`a line with a nested opener made a claim block`) |
+| G6-1c | the `HasSuffix(s, "-->")` term dropped | RED as predicted (`a claim comment with trailing text made a block`) |
+| G6-1d | the over-strip of link-definition-like lines disabled (`defLikeRe.MatchString(lines[i]) && false`); replaces the earlier `[//]:`-only recogniser, which the orchestrator ruled out as a parser-differential risk (escaped title delimiters, a title opening on the next line) | RED as predicted (`a payload behind a link definition reached the body`; `a [//]: comment reached the body`) |
+| G6-1e | the dropped run ends after one line (`else if inDef` without the blank-line test), so a payload line after an escaped title delimiter is indexed | RED as predicted (`a payload behind a link definition reached the body`) |
+| G6-1f | comment markers inside a dropped run are no longer scanned (`_ = scanComments(...)`) | RED as predicted (`body: "PAYLOAD-AFTER-BLANK ...`) |
+| G6-1g | the finding for a dropped run is not recorded | RED as predicted (`no finding for the dropped run`) |
+| G6-2a | `git worktree list` run without `-z` (newline-separated porcelain), so a worktree directory name holding a newline can forge an entry | RED as predicted (`want exactly 2 entries (main and the newline-named one), got 1`). The Discover-level forged-line test alone SURVIVES this fault, because the binding check (G6-2c to G6-2f) also refuses the forged directory; the parser-level test covers the `-z` layer |
+| G6-2b | prunable entries kept (`!prunable` made unconditional) | RED as predicted (`got ["/a" "/gone" "/b" "/bare-prunable"], want [/a /b]`) |
+| G6-2c | the "entry is directly under `<common>/worktrees`" test disabled | RED as predicted (`a git directory outside <common>/worktrees was accepted`) |
+| G6-2d | the `.git` file is no longer required to name the git directory | RED as predicted (`a .git file naming a different directory was accepted`) |
+| G6-2e | the entry's `gitdir` file is no longer required to name `top/.git` | RED as predicted (`an entry whose gitdir file names another directory was accepted`) |
+| G6-2f | `confirm` returns true for any listed path (no binding check at all) | RED as predicted (`a worktree whose .git file no longer names its own entry was confirmed`) |
+| G6-1* | rows G6-1a to G6-1g above fault the hand-written comment and definition stripper, which was deleted when the body moved to a CommonMark parse (orchestrator ruling); they are kept as history and are SUPERSEDED by rows G6-1h to G6-1q | SUPERSEDED |
+| G6-1h | the body builder replaced by raw page text (`w.add(string(w.src))`) | RED as predicted (`hidden payload reached the body`, for the comment, unterminated comment and half-open claim shapes) |
+| G6-1i | HTML blocks added to the body | RED as predicted (`hidden payload reached the body`) |
+| G6-1j | raw inline HTML added to the body | RED as predicted (`hidden payload reached the body`, inline comment shapes) |
+| G6-1k | image alt text added to the body | RED as predicted (`HIDDEN-16 alt`) |
+| G6-1l | the top-level-only test for a claim dropped | RED as predicted (`in a blockquote: made a claim`). It SURVIVED the first version of the test, whose fixture left the claim text outside the quote; the fixture now keeps it inside |
+| G6-1m | the complete-comment test for a claim line dropped | RED as predicted (`nested opener: made a claim block`, and the two other shapes) |
+| G6-1n | superseded by G6-1t, G6-1v and G6-1u: the character-set budget guard was replaced by a per-line container-depth count | SUPERSEDED |
+| G6-1o | inline comments no longer cut from a claim's paragraph | RED as predicted (`Before <!-- HIDDEN-C --> after,` in the claim text) |
+| G6-1p | claim line numbers ignore the frontmatter offset | RED as predicted (`Line:4`, want 7) |
+| G6-1q | backslash escapes no longer resolved in the body | RED as predicted (`"Escaped * star and & entity." missing from body`) |
+| G6-3a | `RebindClone` no longer purges the old checkouts' files after the commit | RED as predicted (`turns/<id> survived a rebind that told the user the data was discarded`; `jobs/job-old survived ...`) |
+| G6-3b | the `turns/<oldCheckoutID>` removal dropped (jobs still purged) | RED as predicted (`turns/<id> survived ...`) |
+| G6-3c | every job directory with a manifest is removed, not only those naming an old checkout id | RED as predicted (`jobs/job-other belongs to something else and was removed`) |
+| G6-3d | removal failures not reported as a notice | RED as predicted (`no notice about the file that stayed`) |
+| G6-1r | the claim-paragraph exclusion (`hiddenCarrier`) disabled | RED as predicted (`the exclusion was silent`) |
+| G6-1s | claim text taken from the paragraph's raw source instead of its visible text | RED as predicted (`visible text of a plain claim paragraph`) |
+| G6-1t | ordered list markers not counted as container openers (the bypass the nesting guard had) | RED as predicted (`ordered markers: finding=false`); the old character-set guard also failed this test before the fix |
+| G6-1u | the 256 KiB parse cap disabled | RED as predicted (`no finding`) |
+| G6-1v | indentation not counted towards nesting | RED as predicted (`indentation: finding=false`) |
+| G6-1w | inline HTML no longer treated as a hidden-text carrier in a claim paragraph | RED as predicted (`the exclusion was silent`) |
+| G6-1x | the O(n*m) byte-by-byte cut loop in `rawParagraph` | not re-injectable: the loop was deleted, because claim text no longer comes from raw source. Before the fix `TestManyInlineCutsInAClaimParagraphAreBounded` failed on its block assertion after 3.3 s for 20,000 cuts (under its generous 5 s time limit on this machine), so the time bound is a backstop and the structural fix is the deletion |
+| G6-4 | `ensureCloneID` no longer takes the clone-setup lock (`unlock, err := func() {}, error(nil)`) | RED as predicted (`the two setups returned ... but the clone's id is ...`: two ids issued for one clone). Leaving the lock held instead is INCONCLUSIVE by design: the second setup times out after 10 s with `store: lock not acquired in time` |
+| G6-5a | the url-credentials password group back to `[^\s/@]+` (stops at the first `/` or `@`) | RED as predicted (`pw 11 chars: out="dsn postgres://app_user:Ab/cd+ef9Gh@..."`, no redaction) |
+| G6-5b | the multi-word rule takes only the first word (`[^\s]{7,199}`) | RED as predicted (`"horse" survived in ...`) |
+| G6-5c | the 200-character bound raised to 1000 | RED as predicted (`unbounded or missed`) |
+| G6-5d | a value already replaced is replaced and counted again | RED as predicted (`counts=map[assignment:2]`). A first version of the test also asserted a single marker, which cannot fail (the second pass rewrites a marker into the same marker); it was removed |
+| G6-5e | the identifier-tail restriction dropped (any letters allowed in the key tail) | RED as predicted (`prose mangled: "Use a password manager. Passwords: [REDACTED:assignment]"`) |
+| G6-6a | the duplicate check ignores log.1.md | RED as predicted (`a job line that lives in log.1.md was appended again to log.md (1 copies)`) |
+| G6-6b | rotation attempted even though log.1.md is not a regular file | RED as predicted (`a blocked rotation failed the publish: err=renameat log.md log.1.md: is a directory`) |
+| G6-6c | the refusal is not reported as a notice | RED as predicted (`no notice that the log could not be rotated`). `Publisher.Notices` is new; the app does not print it yet (the app's publisher construction is outside this wave's files), so today the notice is available to callers and tests only |
+| G6-5f | the already-redacted skip goes back to a prefix test (`value starts with [REDACTED:`) | RED as predicted (`the real value survived behind a forged marker`). The multi-word rule no longer excludes a leading `[`, and a bounded remainder glued to a marker is now absorbed by the single-word rule, so the bound test separates its tail with spaces |
+| G6-5g | the already-redacted skip disabled entirely (G6-5d re-run against the exact-marker version) | RED as predicted (`counts=map[assignment:2]`) |
+| G6-5h | the pre-escape of input markers (`[REDACTED:` to `[REDACTED-IN:`) removed | RED as predicted (`an input marker was not neutralised`). Supersedes the forged-marker half of G6-5f: with the pre-escape in place, restoring the prefix-based skip alone SURVIVES (verified), because an input marker can no longer reach a rule. The exact-marker skip is kept only so a marker emitted by an earlier rule in the same call is not rewritten by a later one; G6-5g still goes RED for it |
+
+| G7-C1 | capture `TurnStart` insert bypasses the write lock (the `WithWriteLock` call replaced by a direct call of its callback) | RED as predicted (`TurnStart with db-write.lock held: want ErrWriteLockTimeout, got <nil>`) |
+| G7-C2 | capture `insertRow` (turn row from Stop, repair, stubs) bypasses the write lock | RED as predicted (`Stop with db-write.lock held: want ErrWriteLockTimeout, got <nil>`; `SweepStale ...` likewise) |
+| G7-C3 | capture `transition` (version reservation, CAS, seal) bypasses the write lock | RED as predicted (`Seal with db-write.lock held: want ErrWriteLockTimeout and 0 sealed, got n=1 err=<nil>`) |
+| G7-S1 | `Store.Bump` bypasses the write lock | RED as predicted (`Bump did not take db-write.lock: want ErrWriteLockTimeout, got <nil>`) |
+| G7-S2 | `Store.SetCloneID` bypasses the write lock | RED as predicted (`SetCloneID did not take db-write.lock`) |
+| G7-S3 | `Store.RecordTrust` bypasses the write lock | RED as predicted (`RecordTrust did not take db-write.lock`) |
+| G7-S4 | `Store.Register` insert bypasses the write lock | RED as predicted (`Register did not take db-write.lock`) |
+| G7-S5 | `Store.RebindClone` transaction bypasses the write lock | RED as predicted (`RebindClone did not take db-write.lock`) |
+| G7-S6 | the schema upgrade in `openDB` bypasses the write lock | RED as predicted (`upgrading an old schema with db-write.lock held: want ErrWriteLockTimeout, got <nil>`) |
+| G7-S7 | `openDB` takes the write lock even when the schema is current (`if false && ...`), so every open queues behind another process's write | RED as predicted (`opening an up-to-date store while db-write.lock is held: store: database write lock not acquired in time`) |
+| G7-H1 | the re-entrancy guard in `WithWriteLockAt` disabled (`if false`), so a nested call waits for its own lock | RED as predicted (`nested WithWriteLock: want ErrWriteLockReentered, got store: database write lock not acquired in time`) |
+| G7-H2 | the lock timeout is returned as the raw `ErrLockTimeout` instead of the typed `ErrWriteLockTimeout` | RED as predicted (`want ErrWriteLockTimeout, got store: lock not acquired in time`), in the test that holds the lock from another process |
+| G7-H3 | the lock is released after `fn` returns instead of by `defer`, so a panicking callback leaves it held | RED as predicted (`the lock was still held after the callback panicked`) |
+| G7-H4 | the wait may use the whole time left before the caller's deadline (`writeLockDeadlineShare` 0.6 to 1.0), leaving none to report the failure | RED as predicted (`the wait ran to the context deadline (1.01s) instead of leaving time to report`) |
+| G7-H5 | 30 ms of work added to every acquisition | RED as predicted (`uncontended acquire+release took 31.8ms on average, want under 20ms`) |
+| G7-P1 to P6 | the publisher's `Begin`, `Takeover`, `setJob`, `recordOps`, `markDone` and `finishJob` each bypass the write lock, one site at a time | RED as predicted, six times (`<site> did not take db-write.lock: want ErrWriteLockTimeout, got <nil>`; for `markDone` and `finishJob` the fault surfaces as `publish: lease epoch is stale`, because the unlocked write proceeded against a job that is not applying, which is still not the predicted timeout) |
+| G7-R1 | the indexer's refresh transaction bypasses the write lock | RED as predicted (`Refresh with db-write.lock held: want ErrWriteLockTimeout, got <nil>`) |
+| G7-A1 | the briefing's indexer is built without `WriteLockPath` (the wiring from the app) | RED as predicted (`no dblock entry in the hook error log`, SessionStart) |
+| G7-A2 | `logHookFailure` no longer maps `ErrWriteLockTimeout` to the kind `dblock` | RED as predicted (`no dblock entry in the hook error log: "... briefing"`, `"... turn-start"`, `"... capture"`) |
+| G7-SP1 | the spike's production-path child does not count its `WithWriteLock` calls (`locks++` removed), so it cannot show it went through the helper | RED as predicted (`variant wal+store.WithWriteLock: child 0 did not take the lock around every transaction`) |
+| G7-M1 | `Store.Bump` bypasses the lock, under six processes bumping one counter | SURVIVED on macOS, as predicted: SQLite's own busy handling is enough on unix, and the loss only reproduces on Windows (CI run 41370903722). `TestParallelProcessesLoseNoCounterWrite` is therefore the Windows leg's check; the unix-reachable proof that each site takes the lock is the hold-the-lock-and-expect-`ErrWriteLockTimeout` family above (C, S, P, R) |
 
 # Spike isolation (Task S4)
 
@@ -387,3 +626,6 @@ Verdict: a scratch `CLAUDE_CONFIG_DIR` does **not** authenticate. Not verified w
 Consequence (the plan's fallback): launches use the real configuration directory. Session logs for the scratch project land in `~/.claude/projects/<slug of the scratch path>/`, and `spike_relocate_transcripts` in `docs/spikes/lib.sh` moves exactly that directory into `$WIKORY_SPIKE_SCRATCH/wikory-spikes/relocated-transcripts/` after each launch. Settings files are never edited. The relocation slug (`sed 's#[/.]#-#g'` over the scratch project path) is unconfirmed until S5 shows which directory Claude Code actually creates.
 
 Plugin validator (V26 evidence): `claude plugin validate` on the scratch spike plugin printed `Validation passed`. It also listed directory-submission findings that do not change the result: README missing, LICENSE missing (both refused by the plugin directory), and no icon (warning).
+
+| G1-L1 | A repository created with `git init --separate-git-dir` (its work tree holds a `.git` file naming a git directory elsewhere) is not confirmed by git as a worktree of that clone: `git worktree list` names the git directory, not the work tree, so Wikory treats such a checkout as unregistered and `wikory init` refuses it. Indistinguishable from a hostile directory whose `.git` file names a trusted clone. Fails closed. |
+| G6-M1 | Page bodies are indexed from a CommonMark parse (goldmark, no extensions), not from hand-written comment stripping. Text a CommonMark renderer shows is indexed; HTML blocks, raw inline HTML tags, comments, image alt text, link destinations and titles and link reference definitions are not. Consequences: (a) Obsidian-specific syntax such as `%% comment %%` is not recognised and is indexed as text, the safe direction because that text is visible in Obsidian too; (b) text between inline HTML tags (`a <span hidden>x</span> b`) and Markdown paragraphs inside a `<details>` element are text to CommonMark, so they are indexed although a browser may hide them; (c) a visible `[note]: text` line inside a paragraph is indexed because a definition cannot interrupt a paragraph, while the same line after a blank line is a definition and is not; (d) a raw HTML line that opens a second comment after closing the first (`<!-- a --> <!--`) ends its HTML block at the first marker per CommonMark, so the following lines are indexed although a browser would treat them as comment text; (e) a page with a line that opens more than 32 nested containers (quote marks, bullet or ordered list markers, indentation at four columns a level) is indexed by its title alone, and a page over 256 KiB by its title and the headings of its first 256 KiB, each with a finding, because the parser's cost grows with the square of a line's depth; (f) a claim paragraph holding an image, a titled link, an autolink or inline HTML is excluded from the claim with a finding, and claim text is the paragraph's visible text, so the claim hash covers what is shown, not the Markdown source (link destinations and markup are not part of it) |

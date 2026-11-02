@@ -1,5 +1,7 @@
 # Wikory Stage 0 and Increment 1a Implementation Plan
 
+> **As-built note (2026-11-02).** This plan was executed task by task, then hardened by review waves (G1 to G7, see `docs/spikes/results/fault-log-fix-*.section.md`). Where the plan text and the repository differ, the repository is the source of truth: the task sections below were not rewritten after the review waves.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Settle every agent-verifiable stage 0 capability with committed real evidence, then build the 1a walking skeleton and safety core: `init`, Claude Code hook capture with a deterministic turn record, `context` and `search` over hand-written pages, and the confinement, validation, permission and recoverable-publish machinery that bootstrap will later depend on.
