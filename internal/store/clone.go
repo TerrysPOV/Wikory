@@ -100,5 +100,11 @@ func (s *Store) RebindClone(ctx context.Context, commonDir, newID string) error 
 	if _, err := tx.ExecContext(ctx, `INSERT INTO meta(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, cloneNonceKey+commonDir, newID); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// The rows are gone and the notice will say the data was discarded, so the files must go
+	// too. This is best effort and never undoes the revocation.
+	s.purgeCheckoutFiles(old)
+	return nil
 }

@@ -22,3 +22,7 @@
 | G6-1o | inline comments no longer cut from a claim's paragraph | RED as predicted (`Before <!-- HIDDEN-C --> after,` in the claim text) |
 | G6-1p | claim line numbers ignore the frontmatter offset | RED as predicted (`Line:4`, want 7) |
 | G6-1q | backslash escapes no longer resolved in the body | RED as predicted (`"Escaped * star and & entity." missing from body`) |
+| G6-3a | `RebindClone` no longer purges the old checkouts' files after the commit | RED as predicted (`turns/<id> survived a rebind that told the user the data was discarded`; `jobs/job-old survived ...`) |
+| G6-3b | the `turns/<oldCheckoutID>` removal dropped (jobs still purged) | RED as predicted (`turns/<id> survived ...`) |
+| G6-3c | every job directory with a manifest is removed, not only those naming an old checkout id | RED as predicted (`jobs/job-other belongs to something else and was removed`) |
+| G6-3d | removal failures not reported as a notice | RED as predicted (`no notice about the file that stayed`) |
