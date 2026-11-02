@@ -176,8 +176,38 @@ func TestRedactsURLPasswordsContainingSlashPlusAndAt(t *testing.T) {
 	}
 }
 
-// A value that merely starts with a redaction marker is attacker-controlled text, not an
-// already-redacted value: only a value that is exactly one marker is left alone.
+// Redaction markers that arrive in the input are not trusted at all: they are rewritten to a
+// visibly different form before any rule runs, so no input can pose as output of a rule.
+func TestMarkersInTheInputAreNeutralisedAndNeverTrusted(t *testing.T) {
+	kw := strings.ToLower(kwPassword)
+	tail := "real" + "secret" + "value123"
+	b64 := "dXNlcjo" + "6aHVudGVyMg=="
+	for name, in := range map[string]string{
+		"key=value":        kw + "=[REDACTED:x]" + tail,
+		"key: value":       kw + ": [REDACTED:assignment]" + tail,
+		"header after":     "[REDACTED:x]Authorization: Basic " + b64,
+		"url after marker": "[REDACTED:x]postgres://u:" + tail + "@h/db",
+	} {
+		out, counts := String(in)
+		if strings.Contains(out, tail) || strings.Contains(out, b64) {
+			t.Errorf("%s: real secret text survived: %q", name, out)
+		}
+		total := 0
+		for _, n := range counts {
+			total += n
+		}
+		if total != 1 {
+			t.Errorf("%s: counts %v for %q", name, counts, out)
+		}
+	}
+	out, counts := String("see [REDACTED:api-key] in the log")
+	if out != "see [REDACTED-IN:api-key] in the log" || len(counts) != 0 {
+		t.Errorf("an input marker was not neutralised: %q %v", out, counts)
+	}
+}
+
+// A value that merely starts with a redaction marker is attacker-controlled text and is
+// redacted whole (the input marker is neutralised first; see the test above).
 func TestOnlyAWholeMarkerCountsAsAlreadyRedacted(t *testing.T) {
 	kw := strings.ToLower(kwPassword)
 	tail := "real" + "secret" + "value123"
@@ -194,11 +224,6 @@ func TestOnlyAWholeMarkerCountsAsAlreadyRedacted(t *testing.T) {
 		if counts["assignment"] != 1 {
 			t.Errorf("%q: counts %v", in, counts)
 		}
-	}
-	// A genuinely redacted value stays one marker and is not counted twice.
-	in := kw + ": " + "[REDACTED:api-key]"
-	if out, counts := String(in); out != in || counts["assignment"] != 0 {
-		t.Errorf("an already-redacted value was rewritten or recounted: %q %v", out, counts)
 	}
 }
 

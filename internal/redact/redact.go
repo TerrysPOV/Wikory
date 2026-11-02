@@ -2,7 +2,10 @@
 // store (spec 10.2, layer 1). It is a floor, not a guarantee.
 package redact
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // A rule with a named group "secret" replaces only that span and keeps the rest of the
 // match (the key, the separator, the URL host); a rule without one replaces the whole match.
@@ -45,13 +48,18 @@ var rules = []rule{
 	{"assignment", regexp.MustCompile(`(?i)` + keywords + `[A-Za-z0-9_-]*["']?\s*[:=]\s*(?P<secret>"[^"\n]{8,}"|'[^'\n]{8,}'|["']?[^\s"']{8,}["']?)`)},
 }
 
-// markerRe matches a value that is exactly one redaction marker. A value that only starts
-// with one is attacker-controlled text and is redacted whole.
+// markerRe matches a value that is exactly one redaction marker. Markers in the input are
+// rewritten before any rule runs (see String), so a marker seen by a rule was emitted by an
+// earlier rule in the same call, and a value that is exactly one is not redacted again.
 var markerRe = regexp.MustCompile(`^\[REDACTED:[a-z0-9-]+\]$`)
 
 // String redacts s and returns counts of what was replaced, by kind.
+//
+// A redaction marker already present in s is not trusted: it is rewritten to "[REDACTED-IN:"
+// first, so no input can pose as the output of a rule or hide the text beside it.
 func String(s string) (string, map[string]int) {
 	counts := map[string]int{}
+	s = strings.ReplaceAll(s, "[REDACTED:", "[REDACTED-IN:")
 	for _, r := range rules {
 		n := 0
 		secret := r.re.SubexpIndex("secret")
