@@ -1,7 +1,7 @@
 # Wikory: architecture design
 
 Date: 2026-11-01
-Status: draft 3 for review, not yet approved. Incorporates two independent reviews (Appendices C and D).
+Status: draft 3, approved by Terry 2026-11-02. Incorporates two independent reviews (Appendices C and D).
 Source brief: [Project-Wiki-Memory-Proposal.md](../../Project-Wiki-Memory-Proposal.md) (v0.1, 31 October 2026), used as a discovery brief rather than a list of instructions.
 
 ## 1. Purpose and scope
