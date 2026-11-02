@@ -257,3 +257,50 @@ func TestRecoveryReportsAConflictItCouldNotRecord(t *testing.T) {
 		t.Fatalf("the unrecorded conflict is not reported: rep=%+v err=%v", rep, err)
 	}
 }
+
+// Review (minor): rotation moves a full log to log.1.md, so a job line that was already
+// rotated away is not in log.md. The duplicate check must look in both files.
+func TestJobLineAlreadyRotatedAwayIsNotAppendedAgain(t *testing.T) {
+	f := newFixture(t)
+	p := f.publisher("co-1")
+	m := &manifest{JobID: "job_ROTATED", LogLine: "x"}
+	f.writeRepo(t, "project-memory/log.1.md", "- t job=job_ROTATED x\n")
+	f.writeRepo(t, "project-memory/log.md", "- t job=job_OTHER y\n")
+	if err := p.appendLogOnce(m); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.logLines(t, "job_ROTATED"); n != 0 {
+		t.Fatalf("a job line that lives in log.1.md was appended again to log.md (%d copies)", n)
+	}
+}
+
+// Review (minor): a committed log.1.md directory made every rotation fail, so a full log
+// turned each publish into an error for ever. Rotation is refused with a notice and the
+// publish still completes.
+func TestRotatedLogThatIsADirectoryRefusesRotationButNotThePublish(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	old := bigLog(maxFile + 1)
+	f.writeRepo(t, "project-memory/log.md", old)
+	if err := os.MkdirAll(filepath.Join(f.repoDir, "project-memory", "log.1.md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.writeRepo(t, "project-memory/log.1.md/keep.txt", "x")
+	p := f.publisher("co-1")
+	j, _ := p.Begin(ctx, "test")
+	err := p.Publish(ctx, j, standardOps(), "after a full log")
+	after, _ := f.readRepo(t, "project-memory/log.md")
+	if err != nil || f.jobState(t, j.ID) != "done" {
+		t.Fatalf("a blocked rotation failed the publish: err=%v state=%s", err, f.jobState(t, j.ID))
+	}
+	if after != old {
+		t.Fatalf("the full log was changed although rotation was refused (%d bytes, was %d)", len(after), len(old))
+	}
+	found := false
+	for _, n := range p.Notices {
+		found = found || strings.Contains(n, "log.1.md")
+	}
+	if !found {
+		t.Fatalf("no notice that the log could not be rotated: %v", p.Notices)
+	}
+}

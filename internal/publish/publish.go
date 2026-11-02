@@ -84,6 +84,9 @@ type Publisher struct {
 	Fingerprint  func(context.Context) (string, error)
 	AbandonAfter time.Duration
 	Now          func() time.Time
+	// Notices collects things the caller should tell the user, such as a log that could not
+	// be rotated. It is appended to by Publish and Recover and never read by this package.
+	Notices []string
 }
 
 type manifestOp struct {
@@ -510,7 +513,13 @@ func rotatedLogName(logPath string) string {
 // scanLog reports the log's size and whether it already holds token, reading it in chunks
 // (never the whole file) and at most maxLogScan bytes. A missing log is empty.
 func (p *Publisher) scanLog(token []byte) (size int64, found bool, err error) {
-	f, err := p.Repo.OpenRead(p.LogPath)
+	return p.scanLogFile(p.LogPath, token)
+}
+
+// scanLogFile is scanLog for any log file under the repository root. A path that is not a
+// regular file is an error, not an empty log.
+func (p *Publisher) scanLogFile(rel string, token []byte) (size int64, found bool, err error) {
+	f, err := p.Repo.OpenRead(rel)
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, false, nil
 	}
@@ -543,17 +552,30 @@ func (p *Publisher) scanLog(token []byte) (size int64, found bool, err error) {
 	return fi.Size(), false, nil
 }
 
-// appendLogOnce adds one log.md line for the job unless one is already there. A log that the
-// line would push past the cap is rotated to log.1.md first, so a full log never turns an
-// applied publish into a permanent error.
+// appendLogOnce adds one log.md line for the job unless one is already there or in the rotated
+// log.1.md. A log that the line would push past the cap is rotated to log.1.md first, so a full
+// log never turns an applied publish into a permanent error. When log.1.md exists and is not a
+// regular file, rotation is refused with a notice and the line is not appended, because the
+// publish itself has already been applied and must still complete.
 func (p *Publisher) appendLogOnce(m *manifest) error {
-	size, found, err := p.scanLog([]byte("job=" + m.JobID))
+	token := []byte("job=" + m.JobID)
+	size, found, err := p.scanLog(token)
 	if err != nil || found {
 		return err
 	}
+	rotated := rotatedLogName(p.LogPath)
+	_, foundOld, rotErr := p.scanLogFile(path.Join(path.Dir(p.LogPath), rotated), token)
+	if rotErr == nil && foundOld {
+		return nil
+	}
 	line := fmt.Sprintf("- %s job=%s %s\n", p.Now().UTC().Format(time.RFC3339), m.JobID, m.LogLine)
 	if size+int64(len(line)) > maxFile {
-		if err := p.Repo.Rename(p.LogPath, rotatedLogName(p.LogPath)); err != nil {
+		if rotErr != nil {
+			p.Notices = append(p.Notices, fmt.Sprintf("%s is full but %s is not a regular file, so the log was not rotated and job %s was not logged: %v",
+				p.LogPath, rotated, m.JobID, rotErr))
+			return nil
+		}
+		if err := p.Repo.Rename(p.LogPath, rotated); err != nil {
 			return err
 		}
 	}

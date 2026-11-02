@@ -39,3 +39,6 @@
 | G6-5c | the 200-character bound raised to 1000 | RED as predicted (`unbounded or missed`) |
 | G6-5d | a value already replaced is replaced and counted again | RED as predicted (`counts=map[assignment:2]`). A first version of the test also asserted a single marker, which cannot fail (the second pass rewrites a marker into the same marker); it was removed |
 | G6-5e | the identifier-tail restriction dropped (any letters allowed in the key tail) | RED as predicted (`prose mangled: "Use a password manager. Passwords: [REDACTED:assignment]"`) |
+| G6-6a | the duplicate check ignores log.1.md | RED as predicted (`a job line that lives in log.1.md was appended again to log.md (1 copies)`) |
+| G6-6b | rotation attempted even though log.1.md is not a regular file | RED as predicted (`a blocked rotation failed the publish: err=renameat log.md log.1.md: is a directory`) |
+| G6-6c | the refusal is not reported as a notice | RED as predicted (`no notice that the log could not be rotated`). `Publisher.Notices` is new; the app does not print it yet (the app's publisher construction is outside this wave's files), so today the notice is available to callers and tests only |
