@@ -239,7 +239,7 @@ func TestConcurrentSealAndStubCompletionAgree(t *testing.T) {
 	t.Cleanup(func() { testHookBeforeTransition = nil })
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); _, _ = r.rec.Seal(ctx, time.Now().Add(5*time.Second)) }()
+	go func() { defer wg.Done(); _, _ = r.rec.Seal(ctx, r.farDeadline()) }()
 	go func() { defer wg.Done(); _, _, _ = other.Stop(ctx, r.ev(decode.Stop, "", "p1", "late answer")) }()
 	wg.Wait()
 	state, version, stub, outcome := r.row(t, id)

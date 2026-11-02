@@ -27,7 +27,7 @@ func TestSealContinuesPastACorruptOldestTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.clk.t = r.clk.t.Add(11 * time.Minute) // both are past the seal timeout
-	n, err := r.rec.Seal(ctx, time.Now().Add(time.Second))
+	n, err := r.rec.Seal(ctx, r.farDeadline())
 	var se *SealError
 	if !errors.As(err, &se) || se.Failed != 1 || se.First == nil {
 		t.Fatalf("the failure was not reported with its count: n=%d err=%v", n, err)
@@ -77,7 +77,7 @@ func TestSealedIncompleteRecordsSayWhy(t *testing.T) {
 				t.Fatal(err)
 			}
 			r.clk.t = r.clk.t.Add(11 * time.Minute)
-			if n, err := r.rec.Seal(ctx, time.Now().Add(5*time.Second)); err != nil || n != 1 {
+			if n, err := r.rec.Seal(ctx, r.farDeadline()); err != nil || n != 1 {
 				t.Fatalf("n=%d err=%v", n, err)
 			}
 			body := r.readVersion(t, id, "v0002.json")

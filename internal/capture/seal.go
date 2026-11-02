@@ -50,7 +50,7 @@ func (r *Recorder) Seal(ctx context.Context, deadline time.Time) (int, error) {
 	var failed int
 	var first error
 	for _, p := range todo {
-		if time.Now().After(deadline) || ctx.Err() != nil {
+		if r.Now().After(deadline) || ctx.Err() != nil {
 			break
 		}
 		ok, err := r.sealOne(ctx, p.id, p.version)

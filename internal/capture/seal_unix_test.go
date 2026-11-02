@@ -26,7 +26,7 @@ func TestSymlinkedTranscriptIsRefused(t *testing.T) {
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "x", "p1", ""))
 	id, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "Done: all good."))
 	r.clk.t = r.clk.t.Add(11 * time.Minute)
-	_, _ = r.rec.Seal(ctx, time.Now().Add(time.Second))
+	_, _ = r.rec.Seal(ctx, r.farDeadline())
 	if body := r.readVersion(t, id, "v0002.json"); strings.Contains(body, "go test") || !strings.Contains(body, `"incomplete": true`) {
 		t.Fatalf("a symlinked transcript was followed: %s", body)
 	}

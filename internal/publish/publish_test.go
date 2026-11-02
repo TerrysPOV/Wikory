@@ -76,6 +76,9 @@ func TestFingerprintChangeRefuses(t *testing.T) {
 	if err := p.Publish(ctx, j, standardOps(), "x"); !errors.Is(err, ErrFingerprint) {
 		t.Fatalf("want ErrFingerprint, got %v", err)
 	}
+	if st := f.jobState(t, j.ID); st != "refused" { // the error alone would leave the job open for recovery to retry
+		t.Fatalf("job state %q after a fingerprint refusal, want refused", st)
+	}
 }
 
 func TestWrongCheckoutRefused(t *testing.T) {

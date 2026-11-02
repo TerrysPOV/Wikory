@@ -117,3 +117,7 @@ func (r *rig) row(t *testing.T, turnID string) (state string, version int, stub 
 	}
 	return state, version, s == 1, outcome
 }
+
+// farDeadline is a Seal deadline an hour past the recorder's own clock, so a slow machine can
+// never run a test out of time: Seal judges the deadline against Recorder.Now, which the test moves.
+func (r *rig) farDeadline() time.Time { return r.rec.Now().Add(time.Hour) }

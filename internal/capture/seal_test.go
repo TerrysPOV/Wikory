@@ -28,11 +28,11 @@ func TestSealWaitsForTheFinalMessageThenFillsFacts(t *testing.T) {
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "fix q", "p1", ""))
 	r.appendTranscript(t, bashUse, bashResult, editUse) // lag: the final message is not written yet
 	id, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "Done: all good."))
-	if n, err := r.rec.Seal(ctx, time.Now().Add(time.Second)); err != nil || n != 0 {
+	if n, err := r.rec.Seal(ctx, r.farDeadline()); err != nil || n != 0 {
 		t.Fatalf("sealed before the transcript held the final message: n=%d err=%v", n, err)
 	}
 	r.appendTranscript(t, finalLine)
-	if n, err := r.rec.Seal(ctx, time.Now().Add(time.Second)); err != nil || n != 1 {
+	if n, err := r.rec.Seal(ctx, r.farDeadline()); err != nil || n != 1 {
 		t.Fatalf("n=%d err=%v", n, err)
 	}
 	state, version, _, _ := r.row(t, id)
@@ -52,7 +52,7 @@ func TestSealTimeoutMarksIncomplete(t *testing.T) {
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "x", "p1", ""))
 	id, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "never written to the transcript"))
 	r.clk.t = r.clk.t.Add(11 * time.Minute) // past the 10 minute timeout
-	if n, _ := r.rec.Seal(ctx, time.Now().Add(time.Second)); n != 1 {
+	if n, _ := r.rec.Seal(ctx, r.farDeadline()); n != 1 {
 		t.Fatalf("n=%d", n)
 	}
 	if !strings.Contains(r.readVersion(t, id, "v0002.json"), `"incomplete": true`) {
@@ -66,8 +66,8 @@ func TestSealedRecordNeverChanges(t *testing.T) {
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "x", "p1", ""))
 	r.appendTranscript(t, finalLine)
 	id, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "Done: all good."))
-	_, _ = r.rec.Seal(ctx, time.Now().Add(time.Second))
-	_, _ = r.rec.Seal(ctx, time.Now().Add(time.Second))
+	_, _ = r.rec.Seal(ctx, r.farDeadline())
+	_, _ = r.rec.Seal(ctx, r.farDeadline())
 	_, _, _ = r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "Done: all good."))
 	if v := r.versions(t, id); len(v) != 2 {
 		t.Fatalf("a sealed record changed: %v", v)
@@ -81,11 +81,11 @@ func TestTranscriptOutsideApprovedRootsIsNeverRead(t *testing.T) {
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "x", "p1", ""))
 	r.appendTranscript(t, bashUse, bashResult, finalLine)
 	id, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "Done: all good."))
-	if n, _ := r.rec.Seal(ctx, time.Now().Add(time.Second)); n != 0 {
+	if n, _ := r.rec.Seal(ctx, r.farDeadline()); n != 0 {
 		t.Fatal("sealed from a transcript outside the approved roots")
 	}
 	r.clk.t = r.clk.t.Add(11 * time.Minute)
-	_, _ = r.rec.Seal(ctx, time.Now().Add(time.Second))
+	_, _ = r.rec.Seal(ctx, r.farDeadline())
 	if body := r.readVersion(t, id, "v0002.json"); strings.Contains(body, "go test") {
 		t.Fatalf("transcript content was read: %s", body)
 	}
@@ -122,7 +122,7 @@ func TestUnobservedCommandIsNotVerified(t *testing.T) {
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "x", "p1", ""))
 	r.appendTranscript(t, bashUse, finalLine) // the command's result never reached the transcript
 	id, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "Done: all good."))
-	_, _ = r.rec.Seal(ctx, time.Now().Add(time.Second))
+	_, _ = r.rec.Seal(ctx, r.farDeadline())
 	body := r.readVersion(t, id, "v0002.json")
 	if !strings.Contains(body, `"observed": false`) || strings.Contains(body, `"passed": true`) {
 		t.Fatalf("an agent's claim is not an observation: %s", body)
@@ -140,7 +140,7 @@ func TestTurnSliceStopsAtTheNextTurn(t *testing.T) {
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn two", "p2", ""))
 	r.appendTranscript(t, useB, doneLine, useC) // useC follows turn 2's own end marker (a continuation)
 	id2, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p2", "Done."))
-	if n, err := r.rec.Seal(ctx, time.Now().Add(time.Second)); err != nil || n != 2 {
+	if n, err := r.rec.Seal(ctx, r.farDeadline()); err != nil || n != 2 {
 		t.Fatalf("n=%d err=%v", n, err)
 	}
 	one, two := r.readVersion(t, id1, "v0002.json"), r.readVersion(t, id2, "v0002.json")
@@ -160,7 +160,7 @@ func TestRepeatedFinalTextDoesNotCompleteTheWrongTurn(t *testing.T) {
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn two", "p2", ""))
 	r.appendTranscript(t, useB, doneLine)
 	_, _, _ = r.rec.Stop(ctx, r.ev(decode.Stop, "", "p2", "Done."))
-	_, _ = r.rec.Seal(ctx, time.Now().Add(time.Second))
+	_, _ = r.rec.Seal(ctx, r.farDeadline())
 	if v := r.versions(t, id1); len(v) != 1 {
 		t.Fatalf("turn 1 was completed from turn 2's lines: %v", v)
 	}
@@ -177,7 +177,7 @@ func TestSealedRecordRedactsCommandsAndVerification(t *testing.T) {
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "call the api", "p1", ""))
 	r.appendTranscript(t, use, result, finalLine)
 	id, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "Done: all good."))
-	_, _ = r.rec.Seal(ctx, time.Now().Add(time.Second))
+	_, _ = r.rec.Seal(ctx, r.farDeadline())
 	body := r.readVersion(t, id, "v0002.json")
 	if strings.Contains(body, strings.Repeat("Z", 32)) || strings.Contains(body, strings.Repeat("Q", 16)) ||
 		!strings.Contains(body, "[REDACTED:bearer]") || !strings.Contains(body, "[REDACTED:aws-access-key]") {
@@ -198,7 +198,7 @@ func TestSealDoesNotCountAnAdoptedCapturedVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.clk.t = r.clk.t.Add(11 * time.Minute)
-	n, err := r.rec.Seal(ctx, time.Now().Add(time.Second))
+	n, err := r.rec.Seal(ctx, r.farDeadline())
 	state, version, _, _ := r.row(t, id)
 	if err != nil || n != 0 || state != "captured" || version != 2 {
 		t.Fatalf("an adopted captured version was counted as sealed: n=%d state=%s v%d err=%v", n, state, version, err)
@@ -222,7 +222,7 @@ func TestDelayedFlushWithPromptIdentityAttributesEachTurn(t *testing.T) {
 		useB,
 		doneLine)
 	id2, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p2", "Done."))
-	if n, err := r.rec.Seal(ctx, time.Now().Add(time.Second)); err != nil || n != 2 {
+	if n, err := r.rec.Seal(ctx, r.farDeadline()); err != nil || n != 2 {
 		t.Fatalf("n=%d err=%v", n, err)
 	}
 	one, two := r.readVersion(t, id1, "v0002.json"), r.readVersion(t, id2, "v0002.json")
@@ -246,11 +246,11 @@ func TestDelayedFlushWithoutIdentityAttachesNothing(t *testing.T) {
 		useB,
 		doneLine)
 	id2, _, _ := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p2", "Done."))
-	if n, _ := r.rec.Seal(ctx, time.Now().Add(time.Second)); n != 0 {
+	if n, _ := r.rec.Seal(ctx, r.farDeadline()); n != 0 {
 		t.Fatalf("an ambiguous turn was completed: n=%d", n)
 	}
 	r.clk.t = r.clk.t.Add(11 * time.Minute)
-	if n, err := r.rec.Seal(ctx, time.Now().Add(time.Second)); err != nil || n != 2 {
+	if n, err := r.rec.Seal(ctx, r.farDeadline()); err != nil || n != 2 {
 		t.Fatalf("n=%d err=%v", n, err)
 	}
 	for _, id := range []string{id1, id2} {
@@ -273,8 +273,34 @@ func TestRepeatedFinalTextAcrossDistinctOffsetsDoesNotCompleteTheWrongTurn(t *te
 	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "turn two", "p2", "")) // a later offset
 	r.appendTranscript(t, useB, doneLine)
 	_, _, _ = r.rec.Stop(ctx, r.ev(decode.Stop, "", "p2", "Done."))
-	_, _ = r.rec.Seal(ctx, time.Now().Add(time.Second))
+	_, _ = r.rec.Seal(ctx, r.farDeadline())
 	if v := r.versions(t, id1); len(v) != 1 {
 		t.Fatalf("turn 1 was completed from turn 2's lines: %v", v)
+	}
+}
+
+// Seal judges its deadline against the recorder's clock (Recorder.Now), like the rest of the
+// package, not the wall clock. The recorder's clock is a day ahead of the wall clock and the
+// deadline is a second behind the recorder's clock: past by one clock, a day in the future by
+// the other. A Seal that read the wall clock, or ignored the deadline, would seal the turn.
+func TestSealStopsAtADeadlineThatHasPassedOnTheRecorderClock(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t)
+	_ = r.rec.TurnStart(ctx, r.ev(decode.UserPrompt, "do A", "p1", ""))
+	id, _, err := r.rec.Stop(ctx, r.ev(decode.Stop, "", "p1", "answer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.clk.t = time.Now().Add(24 * time.Hour) // past the seal timeout, so the turn is sealable
+	n, err := r.rec.Seal(ctx, r.clk.t.Add(-time.Second))
+	if err != nil || n != 0 {
+		t.Fatalf("Seal past its deadline: n=%d err=%v, want 0 and no error", n, err)
+	}
+	if state, _, _, _ := r.row(t, id); state != "captured" {
+		t.Fatalf("a turn was sealed after the deadline: state=%s", state)
+	}
+	// The same turn is sealed once the deadline is in the future by the recorder's clock.
+	if n, err := r.rec.Seal(ctx, r.farDeadline()); err != nil || n != 1 {
+		t.Fatalf("Seal before its deadline: n=%d err=%v, want 1", n, err)
 	}
 }
