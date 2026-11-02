@@ -157,3 +157,49 @@ func TestAPIKeyMinimumLengthIsTwenty(t *testing.T) {
 		t.Errorf("19 characters were redacted: out=%q counts=%v", out, counts)
 	}
 }
+
+// Review L4: a connection URL whose userinfo password holds '/', '+' or '@' used to stop the
+// match at the first of them and leave the rest of the password in the text. The passwords
+// are assembled from fragments at runtime.
+func TestRedactsURLPasswordsContainingSlashPlusAndAt(t *testing.T) {
+	for _, pw := range []string{"Ab/cd" + "+ef9Gh", "pa/ss" + "/wo/rd1", "x+y" + "+z+Q7wq", "p@ss" + "w0rd@x1"} {
+		in := "dsn postgres://app_user:" + pw + "@db.internal:5432/app end"
+		out, counts := String(in)
+		if counts["url-credentials"] != 1 || !strings.HasSuffix(out, "[REDACTED:url-credentials]@db.internal:5432/app end") {
+			t.Errorf("pw %d chars: out=%q counts=%v", len(pw), out, counts)
+		}
+		for _, frag := range strings.FieldsFunc(pw, func(r rune) bool { return r == '/' || r == '+' || r == '@' }) {
+			if len(frag) >= 4 && strings.Contains(out, frag) {
+				t.Errorf("part %q of the password survived: %q", frag, out)
+			}
+		}
+	}
+}
+
+// Review L4: only the first word of an unquoted value used to be tested against the eight
+// character minimum, so a passphrase of short words was left in the text.
+func TestRedactsMultiWordUnquotedValues(t *testing.T) {
+	kw := strings.ToLower(kwPassword)
+	phrase := "correct horse battery staple"
+	for _, in := range []string{
+		kw + ": " + phrase,
+		kw + " = " + phrase,
+		strings.ToUpper(kw) + "_FILE=" + phrase + " and more words",
+		"the " + kw + ": " + phrase,
+	} {
+		out, counts := String(in)
+		for _, w := range []string{"correct", "horse", "battery", "staple"} {
+			if strings.Contains(out, w) {
+				t.Errorf("%q survived in %q", w, out)
+			}
+		}
+		if counts["assignment"] != 1 {
+			t.Errorf("%q: counts %v", out, counts)
+		}
+	}
+	// The redaction is bounded: past 200 characters the line is left alone.
+	long := kw + ": " + strings.Repeat("w", 199) + " " + strings.Repeat("TAIL", 20)
+	if out, _ := String(long); !strings.Contains(out, "TAILTAIL") || !strings.Contains(out, "[REDACTED:assignment]") {
+		t.Errorf("unbounded or missed: %q", out)
+	}
+}

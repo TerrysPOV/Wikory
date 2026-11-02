@@ -34,3 +34,8 @@
 | G6-1w | inline HTML no longer treated as a hidden-text carrier in a claim paragraph | RED as predicted (`the exclusion was silent`) |
 | G6-1x | the O(n*m) byte-by-byte cut loop in `rawParagraph` | not re-injectable: the loop was deleted, because claim text no longer comes from raw source. Before the fix `TestManyInlineCutsInAClaimParagraphAreBounded` failed on its block assertion after 3.3 s for 20,000 cuts (under its generous 5 s time limit on this machine), so the time bound is a backstop and the structural fix is the deletion |
 | G6-4 | `ensureCloneID` no longer takes the clone-setup lock (`unlock, err := func() {}, error(nil)`) | RED as predicted (`the two setups returned ... but the clone's id is ...`: two ids issued for one clone). Leaving the lock held instead is INCONCLUSIVE by design: the second setup times out after 10 s with `store: lock not acquired in time` |
+| G6-5a | the url-credentials password group back to `[^\s/@]+` (stops at the first `/` or `@`) | RED as predicted (`pw 11 chars: out="dsn postgres://app_user:Ab/cd+ef9Gh@..."`, no redaction) |
+| G6-5b | the multi-word rule takes only the first word (`[^\s]{7,199}`) | RED as predicted (`"horse" survived in ...`) |
+| G6-5c | the 200-character bound raised to 1000 | RED as predicted (`unbounded or missed`) |
+| G6-5d | a value already replaced is replaced and counted again | RED as predicted (`counts=map[assignment:2]`). A first version of the test also asserted a single marker, which cannot fail (the second pass rewrites a marker into the same marker); it was removed |
+| G6-5e | the identifier-tail restriction dropped (any letters allowed in the key tail) | RED as predicted (`prose mangled: "Use a password manager. Passwords: [REDACTED:assignment]"`) |

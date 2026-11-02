@@ -2,7 +2,10 @@
 // store (spec 10.2, layer 1). It is a floor, not a guarantee.
 package redact
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // A rule with a named group "secret" replaces only that span and keeps the rest of the
 // match (the key, the separator, the URL host); a rule without one replaces the whole match.
@@ -24,13 +27,24 @@ var rules = []rule{
 	{"slack-token", regexp.MustCompile(`\bxox[abprs]` + `-[A-Za-z0-9-]{10,}`)},
 	{"bearer", regexp.MustCompile(`(?i)\bbear` + `er\s+[A-Za-z0-9._~+/=-]{16,}`)},
 	{"jwt", regexp.MustCompile(`\bey` + `J[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`)},
-	// scheme://user:SECRET@host: the userinfo password of a connection URL.
-	{"url-credentials", regexp.MustCompile(`\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/@:]+:(?P<secret>[^\s/@]+)@`)},
+	// scheme://user:SECRET@host: the userinfo password of a connection URL. The password is
+	// everything up to the last '@' of the token, so a '/', '+' or '@' inside it does not end
+	// the match early; a URL with a later '@' in its path or query is redacted further than
+	// necessary, which is the safe direction.
+	{"url-credentials", regexp.MustCompile(`\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/@:]+:(?P<secret>\S+)@`)},
 	// Authorization: Basic <base64>. The header name is required so that the word "basic"
 	// in prose is left alone.
 	{"basic-auth", regexp.MustCompile(`(?i)\bauthori` + `zation\s*[:=]\s*basic\s+(?P<secret>[A-Za-z0-9+/_-]{8,}={0,2})`)},
 	// KEY=value, key: "value with spaces", "key": "value". Values under 8 characters are
 	// left alone, which keeps prose such as "token: 5" intact.
+	//
+	// First rule: a key written as an identifier (the keyword alone or followed by _ or -, as in
+	// DB_PASSWORD or password) followed by an unquoted value takes the rest of the line, up to
+	// 200 characters, because a passphrase is several short words ("correct horse battery").
+	// The key tail must not be plain letters, so prose such as "Passwords: never reuse them."
+	// is left alone. Second rule: any key tail, a quoted value or one unquoted word of 8 or more.
+	// A value already replaced is not replaced or counted again.
+	{"assignment", regexp.MustCompile(`(?i)` + keywords + `(?:[_-][A-Za-z0-9_-]*)?["']?\s*[:=]\s*(?P<secret>[^\s"'\[][^\n]{7,199})`)},
 	{"assignment", regexp.MustCompile(`(?i)` + keywords + `[A-Za-z0-9_-]*["']?\s*[:=]\s*(?P<secret>"[^"\n]{8,}"|'[^'\n]{8,}'|["']?[^\s"']{8,}["']?)`)},
 }
 
@@ -50,10 +64,14 @@ func String(s string) (string, map[string]int) {
 			if loc == nil || loc[2*secret] < 0 {
 				return mark
 			}
+			if strings.HasPrefix(m[loc[2*secret]:], "[REDACTED:") {
+				n-- // an earlier rule already replaced this value
+				return m
+			}
 			return m[:loc[2*secret]] + mark + m[loc[2*secret+1]:]
 		})
 		if n > 0 {
-			counts[r.kind] = n
+			counts[r.kind] += n
 		}
 	}
 	return s, counts
