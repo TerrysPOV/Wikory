@@ -1,6 +1,7 @@
 package claim
 
 import (
+	"bytes"
 	"fmt"
 	"path"
 	"sort"
@@ -58,16 +59,30 @@ func ParsePage(rel string, data []byte) Page {
 	lines := strings.Split(normaliseNewlines(string(data)), "\n")
 	p := Page{RelPath: rel, Type: "concept"}
 	start := p.parseFrontmatter(lines)
-	if tooNested(lines[start:]) {
-		// goldmark's cost grows with the square of the container depth of a line. A page built
-		// to stall the indexer is not indexed at all; nothing hidden can leak that way.
-		p.Findings = append(p.Findings, Finding{start + 1, "page nests quotes or lists too deeply to index; its body is not indexed"})
-		p.ID = strings.TrimSuffix(path.Base(rel), path.Ext(rel))
-		p.Title = p.ID
+	src := []byte(strings.Join(lines[start:], "\n"))
+	headingsOnly := false
+	if len(src) > maxParseBytes {
+		// Parse a bounded prefix, cut at a line end, and keep only the title and headings.
+		cut := bytes.LastIndexByte(src[:maxParseBytes], '\n')
+		if cut < 0 {
+			cut = 0
+		}
+		src, headingsOnly = src[:cut], true
+		p.Findings = append(p.Findings, Finding{start + 1, "page is larger than 256 KiB; only its title and the headings in its first 256 KiB are indexed"})
+	}
+	if tooNested(strings.Split(string(src), "\n")) {
+		// The parser's cost grows with the square of a line's container depth. A page built to
+		// stall the indexer is indexed by its title alone; nothing hidden can leak that way.
+		p.Findings = append(p.Findings, Finding{start + 1, "page nesting too deep; only its title is indexed"})
+		if p.ID == "" {
+			p.ID = strings.TrimSuffix(path.Base(rel), path.Ext(rel))
+		}
+		if p.Title == "" {
+			p.Title = p.ID
+		}
 		return p
 	}
-	src := []byte(strings.Join(lines[start:], "\n"))
-	w := &pageWalk{src: src, firstLine: start, page: &p, consumed: map[ast.Node]bool{}}
+	w := &pageWalk{src: src, firstLine: start, page: &p, consumed: map[ast.Node]bool{}, headingsOnly: headingsOnly}
 	w.lineStarts = append(w.lineStarts, 0)
 	for i, c := range src {
 		if c == '\n' {
@@ -88,23 +103,64 @@ func ParsePage(rel string, data []byte) Page {
 	return p
 }
 
-// nestingBudget bounds the sum, over the lines of a page, of the square of the length of the
-// leading run of quote, list and indentation characters. Real pages use a few thousand; a
-// line of 8192 quote marks alone costs the parser about 70 ms, and a megabyte of them 9 s.
-const nestingBudget = 20_000_000
+const (
+	// maxParseBytes is the most page text the parser sees. A larger page is indexed by its
+	// title and headings from the first maxParseBytes only.
+	maxParseBytes = 256 << 10
+	// maxNesting is the deepest container nesting a line may open: quote marks, bullet and
+	// ordered list markers, and indentation (four columns count as one level). The parser's cost
+	// grows with the square of this depth on every line, so a page beyond it is not parsed.
+	maxNesting = 32
+)
 
 func tooNested(lines []string) bool {
-	total := 0
 	for _, l := range lines {
-		m := 0
-		for m < len(l) && strings.IndexByte("> \t-*+", l[m]) >= 0 {
-			m++
-		}
-		if total += m * m; total > nestingBudget {
+		if lineDepth(l) > maxNesting {
 			return true
 		}
 	}
 	return false
+}
+
+// lineDepth counts the container openers at the start of a line, stopping as soon as the
+// count passes maxNesting so the scan itself stays short.
+func lineDepth(l string) int {
+	i, col := 0, 0
+	for i < len(l) && (l[i] == ' ' || l[i] == '\t') {
+		if l[i] == '\t' {
+			col += 4
+		} else {
+			col++
+		}
+		i++
+	}
+	d := col / 4
+	for i < len(l) && d <= maxNesting {
+		c := l[i]
+		switch {
+		case c == '>':
+			i++
+		case (c == '-' || c == '*' || c == '+') && (i+1 == len(l) || l[i+1] == ' ' || l[i+1] == '\t'):
+			i++
+		case c >= '0' && c <= '9':
+			j := i
+			for j < len(l) && j-i < 10 && l[j] >= '0' && l[j] <= '9' {
+				j++
+			}
+			if j < len(l) && (l[j] == '.' || l[j] == ')') && (j+1 == len(l) || l[j+1] == ' ' || l[j+1] == '\t') {
+				i = j + 1
+			} else {
+				return d
+			}
+		default:
+			return d
+		}
+		d++
+		for i < len(l) && (l[i] == ' ' || l[i] == '\t') {
+			i++
+		}
+	}
+	return d
 }
 
 // pageWalk carries the state of one walk over a page's CommonMark tree.
@@ -116,6 +172,8 @@ type pageWalk struct {
 	body       []string
 	heading    string
 	consumed   map[ast.Node]bool // paragraphs already taken as claim text
+	// headingsOnly keeps only headings: the page was too large to index in full.
+	headingsOnly bool
 }
 
 func (w *pageWalk) run() (err error) {
@@ -127,6 +185,16 @@ func (w *pageWalk) run() (err error) {
 	doc := goldmark.New().Parser().Parse(text.NewReader(w.src))
 	return ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
 		if !entering {
+			return ast.WalkContinue, nil
+		}
+		if w.headingsOnly {
+			if h, ok := n.(*ast.Heading); ok {
+				t := w.inlineText(h)
+				if w.page.Title == "" && h.Level == 1 {
+					w.page.Title = strings.TrimSpace(t)
+				}
+				w.add(t)
+			}
 			return ast.WalkContinue, nil
 		}
 		switch n := n.(type) {
@@ -229,7 +297,10 @@ func isCompleteClaimComment(line string) bool {
 
 // claimText collects the paragraphs that follow a claim comment with no blank line between
 // them. Other HTML blocks in between (editor notes) are skipped and do not end the claim; a
-// blank line, a claim comment, a heading or anything else does.
+// blank line, a claim comment, a heading or anything else does. The text is the visible text
+// of each paragraph, the same extraction the body uses. A paragraph holding anything whose
+// source differs from what a renderer shows (an image, a titled link, an autolink, raw inline
+// HTML) is left out of the claim and reported, never silently.
 func (w *pageWalk) claimText(claimNode ast.Node, prevEnd int) string {
 	var paras []string
 	for n := claimNode.NextSibling(); n != nil; n = n.NextSibling() {
@@ -240,7 +311,12 @@ func (w *pageWalk) claimText(claimNode ast.Node, prevEnd int) string {
 		switch n := n.(type) {
 		case *ast.Paragraph:
 			w.consumed[n] = true
-			paras = append(paras, w.rawParagraph(n))
+			if what := hiddenCarrier(n); what != "" {
+				w.page.Findings = append(w.page.Findings, Finding{w.firstLine + first + 1,
+					"a paragraph with " + what + " is excluded from the claim"})
+			} else if t := strings.TrimRight(w.inlineText(n), " \t\n"); t != "" {
+				paras = append(paras, t)
+			}
 		case *ast.HTMLBlock:
 			if m := strings.TrimSpace(string(n.Text(w.src))); isCompleteClaimComment(m) && first == last {
 				return strings.Join(paras, "\n")
@@ -253,40 +329,32 @@ func (w *pageWalk) claimText(claimNode ast.Node, prevEnd int) string {
 	return strings.Join(paras, "\n")
 }
 
-// rawParagraph returns a paragraph's source lines, right-trimmed, with any raw inline HTML
-// (comments inside the paragraph) cut out.
-func (w *pageWalk) rawParagraph(p *ast.Paragraph) string {
-	var cut []text.Segment
+// hiddenCarrier names the first inline node in a paragraph that can carry text the visible
+// text omits, or returns "".
+func hiddenCarrier(p *ast.Paragraph) string {
+	what := ""
 	_ = ast.Walk(p, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
-		if r, ok := n.(*ast.RawHTML); ok && entering {
-			for i := 0; i < r.Segments.Len(); i++ {
-				cut = append(cut, r.Segments.At(i))
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		switch n := n.(type) {
+		case *ast.Image:
+			what = "an image"
+		case *ast.AutoLink:
+			what = "an autolink"
+		case *ast.RawHTML:
+			what = "inline HTML"
+		case *ast.Link:
+			if len(n.Title) > 0 {
+				what = "a titled link"
 			}
+		}
+		if what != "" {
+			return ast.WalkStop, nil
 		}
 		return ast.WalkContinue, nil
 	})
-	var out []string
-	ls := p.Lines()
-	for i := 0; i < ls.Len(); i++ {
-		seg := ls.At(i)
-		var sb []byte
-		for off := seg.Start; off < seg.Stop; off++ {
-			inCut := false
-			for _, c := range cut {
-				if off >= c.Start && off < c.Stop {
-					inCut = true
-					break
-				}
-			}
-			if !inCut {
-				sb = append(sb, w.src[off])
-			}
-		}
-		if line := strings.TrimRight(string(sb), " \t\r\n"); strings.TrimSpace(line) != "" {
-			out = append(out, line)
-		}
-	}
-	return strings.Join(out, "\n")
+	return what
 }
 
 // inlineText is the text a renderer shows for a block's inline content: text, code spans and

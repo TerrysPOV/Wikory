@@ -18,7 +18,7 @@
 | G6-1k | image alt text added to the body | RED as predicted (`HIDDEN-16 alt`) |
 | G6-1l | the top-level-only test for a claim dropped | RED as predicted (`in a blockquote: made a claim`). It SURVIVED the first version of the test, whose fixture left the claim text outside the quote; the fixture now keeps it inside |
 | G6-1m | the complete-comment test for a claim line dropped | RED as predicted (`nested opener: made a claim block`, and the two other shapes) |
-| G6-1n | the nesting budget disabled | RED as predicted (`quotes: finding=false`, `list markers: finding=false`); unguarded, a 1 MiB page of quote marks takes 9 s to parse and one of list markers 18 s |
+| G6-1n | superseded by G6-1t, G6-1v and G6-1u: the character-set budget guard was replaced by a per-line container-depth count | SUPERSEDED |
 | G6-1o | inline comments no longer cut from a claim's paragraph | RED as predicted (`Before <!-- HIDDEN-C --> after,` in the claim text) |
 | G6-1p | claim line numbers ignore the frontmatter offset | RED as predicted (`Line:4`, want 7) |
 | G6-1q | backslash escapes no longer resolved in the body | RED as predicted (`"Escaped * star and & entity." missing from body`) |
@@ -26,3 +26,10 @@
 | G6-3b | the `turns/<oldCheckoutID>` removal dropped (jobs still purged) | RED as predicted (`turns/<id> survived ...`) |
 | G6-3c | every job directory with a manifest is removed, not only those naming an old checkout id | RED as predicted (`jobs/job-other belongs to something else and was removed`) |
 | G6-3d | removal failures not reported as a notice | RED as predicted (`no notice about the file that stayed`) |
+| G6-1r | the claim-paragraph exclusion (`hiddenCarrier`) disabled | RED as predicted (`the exclusion was silent`) |
+| G6-1s | claim text taken from the paragraph's raw source instead of its visible text | RED as predicted (`visible text of a plain claim paragraph`) |
+| G6-1t | ordered list markers not counted as container openers (the bypass the nesting guard had) | RED as predicted (`ordered markers: finding=false`); the old character-set guard also failed this test before the fix |
+| G6-1u | the 256 KiB parse cap disabled | RED as predicted (`no finding`) |
+| G6-1v | indentation not counted towards nesting | RED as predicted (`indentation: finding=false`) |
+| G6-1w | inline HTML no longer treated as a hidden-text carrier in a claim paragraph | RED as predicted (`the exclusion was silent`) |
+| G6-1x | the O(n*m) byte-by-byte cut loop in `rawParagraph` | not re-injectable: the loop was deleted, because claim text no longer comes from raw source. Before the fix `TestManyInlineCutsInAClaimParagraphAreBounded` failed on its block assertion after 3.3 s for 20,000 cuts (under its generous 5 s time limit on this machine), so the time bound is a backstop and the structural fix is the deletion |

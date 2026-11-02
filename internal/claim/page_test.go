@@ -2,9 +2,12 @@ package claim
 
 import (
 	"errors"
+	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 const samplePage = "---\r\n" +
@@ -241,11 +244,58 @@ func TestClaimCommentsSurviveCommentRemoval(t *testing.T) {
 	}
 }
 
-func TestInlineCommentInsideAClaimParagraphIsCutOut(t *testing.T) {
-	p := ParsePage("x.md", []byte("<!-- claim kind=intent status=unverified -->\nBefore <!-- HIDDEN-C --> after,\nsecond <!-- HIDDEN-C\nover lines --> line.\n"))
-	if len(p.Blocks) != 1 || strings.Contains(p.Blocks[0].Text, "HIDDEN") {
-		t.Fatalf("blocks: %+v", p.Blocks)
+// Review: the displayed and indexed claim text is the visible text of the paragraph. A link
+// title, image alt text, an autolink destination or inline HTML must not be carried in it.
+func TestClaimTextIsVisibleTextOnly(t *testing.T) {
+	meta := "<!-- claim kind=intent status=unverified -->\n"
+	p := ParsePage("x.md", []byte(meta+"Use the [queue](https://example.invalid/q) and `Ack()` with *care*.\n"))
+	if len(p.Blocks) != 1 || p.Blocks[0].Text != "Use the queue and Ack() with care." {
+		t.Fatalf("visible text of a plain claim paragraph: %+v", p.Blocks)
 	}
+	for name, para := range map[string]string{
+		"titled link":     "Read [the docs](https://example.invalid/ \"HIDDEN-TITLE\") first.",
+		"image alt text":  "See ![HIDDEN-ALT](pic.png) here.",
+		"autolink":        "Go to <https://example.invalid/HIDDEN-AUTO> now.",
+		"inline comment":  "Before <!-- HIDDEN-C --> after.",
+		"inline html tag": "A <span hidden>HIDDEN-SPAN</span> b.",
+	} {
+		q := ParsePage("x.md", []byte(meta+para+"\n"))
+		for _, b := range q.Blocks {
+			if strings.Contains(b.Text, "HIDDEN") {
+				t.Errorf("%s: hidden text reached the claim text: %q", name, b.Text)
+			}
+		}
+		if strings.Contains(q.Body, "HIDDEN") {
+			t.Errorf("%s: hidden text reached the body: %q", name, q.Body)
+		}
+		found := false
+		for _, f := range q.Findings {
+			found = found || strings.Contains(f.Msg, "excluded from the claim")
+		}
+		if !found {
+			t.Errorf("%s: the exclusion was silent: %+v", name, q.Findings)
+		}
+	}
+}
+
+// A paragraph with a hundred thousand inline comments must not cost quadratic time.
+func TestManyInlineCutsInAClaimParagraphAreBounded(t *testing.T) {
+	start := time.Now()
+	p := ParsePage("x.md", []byte("<!-- claim kind=intent status=unverified -->\n"+strings.Repeat("a<!--x-->", 20000)+"\n"))
+	limit := 5 * time.Second * slack()
+	if el := time.Since(start); el > limit {
+		t.Errorf("parsing took %v, limit %v", el, limit)
+	}
+	if len(p.Blocks) != 0 {
+		t.Errorf("a paragraph full of inline HTML made a claim: %d blocks", len(p.Blocks))
+	}
+}
+
+func slack() time.Duration {
+	if n, err := strconv.Atoi(os.Getenv("WIKORY_LATENCY_SLACK")); err == nil && n > 0 {
+		return time.Duration(n)
+	}
+	return 1
 }
 
 // Line numbers stay file lines when a frontmatter block precedes the claim (stamp rewrites by line).
@@ -256,25 +306,60 @@ func TestClaimLineNumbersCountFrontmatter(t *testing.T) {
 	}
 }
 
-// A page built to stall the parser (container depth costs the square of the depth per line)
-// is refused with a finding rather than parsed.
+// A page built to stall the parser (the cost grows with the square of the container depth of
+// a line) is refused with a finding rather than parsed. Quote marks, bullet markers, ordered
+// list markers and indentation all open containers.
 func TestPathologicalNestingIsRefusedNotParsed(t *testing.T) {
 	for name, md := range map[string]string{
-		"quotes":       strings.Repeat(strings.Repeat(">", 8192)+"x\n", 40),
-		"list markers": strings.Repeat(strings.Repeat("- ", 4096)+"x\n", 40),
+		"quotes":          strings.Repeat(strings.Repeat(">", 8192)+"x\n", 20),
+		"bullets":         strings.Repeat(strings.Repeat("- ", 4096)+"x\n", 20),
+		"ordered markers": strings.Repeat(strings.Repeat("1. ", 10000)+"x\n", 8),
+		"ordered parens":  strings.Repeat(strings.Repeat("1) ", 10000)+"x\n", 8),
+		"mixed":           strings.Repeat(strings.Repeat("> 1. - ", 3000)+"x\n", 10),
+		"indentation":     strings.Repeat(strings.Repeat(" ", 4000)+"- x\n", 20),
 	} {
+		start := time.Now()
 		p := ParsePage("x.md", []byte("# T\n\n"+md))
 		found := false
 		for _, f := range p.Findings {
-			found = found || strings.Contains(f.Msg, "nests quotes or lists too deeply")
+			found = found || strings.Contains(f.Msg, "nesting too deep")
 		}
-		if !found || p.Body != "" {
-			t.Errorf("%s: finding=%v body length %d", name, found, len(p.Body))
+		if !found || p.Body != "" || p.Title == "" {
+			t.Errorf("%s: finding=%v body length %d title %q", name, found, len(p.Body), p.Title)
+		}
+		if el := time.Since(start); el > 5*time.Second*slack() {
+			t.Errorf("%s: took %v", name, el)
 		}
 	}
 	// ordinary nesting is untouched
-	p := ParsePage("x.md", []byte("> a\n> > b\n> > > c\n\n- one\n  - two\n    - three\n"))
-	if !strings.Contains(p.Body, "c") || !strings.Contains(p.Body, "three") || p.Findings != nil {
+	p := ParsePage("x.md", []byte("> a\n> > b\n> > > c\n\n- one\n  - two\n    - three\n\n1. first\n   1. inner\n"))
+	if !strings.Contains(p.Body, "c") || !strings.Contains(p.Body, "three") || !strings.Contains(p.Body, "inner") || p.Findings != nil {
 		t.Errorf("ordinary nesting refused: %+v", p)
+	}
+}
+
+// Over 256 KiB the parser is not run over the whole page: its title and headings are indexed
+// from the first 256 KiB, and the page says so.
+func TestOversizePageIsIndexedAsTitleAndHeadingsOnly(t *testing.T) {
+	big := "# Big page\n\n## Early heading\n\nEARLY-PARAGRAPH\n\n<!--\n## HIDDEN-HEADING\n-->\n\n" +
+		strings.Repeat("filler line of ordinary text\n\n", 12000) + "## Late heading\n"
+	p := ParsePage("x.md", []byte(big))
+	if len(big) <= 256<<10 {
+		t.Fatalf("fixture too small: %d", len(big))
+	}
+	found := false
+	for _, f := range p.Findings {
+		found = found || strings.Contains(f.Msg, "larger than 256 KiB")
+	}
+	if !found {
+		t.Errorf("no finding: %+v", p.Findings)
+	}
+	if p.Title != "Big page" || !strings.Contains(p.Body, "Early heading") {
+		t.Errorf("title %q body %q", p.Title, p.Body)
+	}
+	for _, bad := range []string{"EARLY-PARAGRAPH", "filler", "HIDDEN-HEADING"} {
+		if strings.Contains(p.Body, bad) {
+			t.Errorf("%q in a headings-only body", bad)
+		}
 	}
 }
