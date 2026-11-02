@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS claims(
   claim_id TEXT NOT NULL, meta TEXT NOT NULL, text TEXT NOT NULL, heading TEXT NOT NULL,
   status TEXT NOT NULL, kind TEXT NOT NULL,
   PRIMARY KEY(checkout_id, relpath, ordinal));
+CREATE TABLE IF NOT EXISTS page_notes(
+  checkout_id TEXT NOT NULL, relpath TEXT NOT NULL, malformed INTEGER NOT NULL, degraded TEXT NOT NULL,
+  PRIMARY KEY(checkout_id, relpath));
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
   title, heading, claim, body, search_text,
   checkout_id UNINDEXED, relpath UNINDEXED, ordinal UNINDEXED,

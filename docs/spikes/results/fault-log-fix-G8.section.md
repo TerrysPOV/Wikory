@@ -16,3 +16,9 @@
 | G8-4e | a skipped comparison is still counted | RED as predicted (`map[assignment:2]`) |
 | G8-4f | the `:=` operator removed from the multi-word rule | covered by the earlier row of the same name; the test `tk := correct horse battery staple` is unchanged |
 | G8-4g | the comparison alternative consumes the rest of the line again (in BOTH assignment rules; each rule alone is masked by the other, so inject.sh cannot fault one site, and the two sites were changed together by hand and restored) | RED as predicted (`a secret after a comparison survived`) |
+| G8-1f | the read and parse loop runs inside the database write lock again (phase 1 wrapped in `ix.write`) | RED as predicted (`the write lock was held while pages were being parsed`) |
+| G8-1g | an unchanged page is parsed again on every refresh | RED as predicted (`second refresh: ... Changed:3`) |
+| G8-1h | the parse budget never applies | RED as predicted (`budget not applied`) |
+| G8-1i | a title-only page keeps its real hash, so the next refresh never retries it | RED as predicted (`retry refresh: ... Changed:0`) |
+| G8-1j | the malformed count is not persisted | RED as predicted (`the disclosure was lost for unchanged pages`) |
+| G8-1k | the degraded reason is not persisted | RED as predicted (`the disclosure was lost for unchanged pages`) |

@@ -43,6 +43,16 @@ type Page struct {
 	Blocks   []Block
 	Body     string
 	Findings []Finding
+	// Degraded is the first reason part of the page was left out of the index (size, structure,
+	// inline HTML), or "". The indexer stores it so a refresh can disclose it without parsing.
+	Degraded string
+}
+
+// degrade records the first reason the page is indexed in part.
+func (p *Page) degrade(why string) {
+	if p.Degraded == "" {
+		p.Degraded = why
+	}
 }
 
 // ParsePage parses a page. It never fails: problems become findings.
@@ -69,6 +79,7 @@ func ParsePage(rel string, data []byte) Page {
 		}
 		src, headingsOnly = src[:cut], true
 		p.Findings = append(p.Findings, Finding{start + 1, "page is larger than 64 KiB; only its title and the headings in its first 64 KiB are indexed"})
+		p.degrade("larger than 64 KiB: only its title and headings are indexed")
 	}
 	if tooNested(strings.Split(string(src), "\n")) {
 		// The parser's cost grows with the square of a line's container depth. A page built to
@@ -87,6 +98,7 @@ func ParsePage(rel string, data []byte) Page {
 	}
 	if err := w.run(); err != nil {
 		p.Findings = append(p.Findings, Finding{start + 1, "page text could not be parsed; its body is not indexed"})
+		p.degrade("the page text could not be parsed")
 		p.Blocks, w.body = nil, nil
 	}
 	p.Body = strings.TrimSpace(strings.Join(w.body, "\n"))
@@ -102,6 +114,7 @@ func ParsePage(rel string, data []byte) Page {
 // titleOnly finishes a page that is indexed by its title alone, with the reason as a finding.
 func (p Page) titleOnly(rel string, start int, why string) Page {
 	p.Findings = append(p.Findings, Finding{start + 1, why})
+	p.degrade(why)
 	p.Blocks, p.Body = nil, ""
 	if p.ID == "" {
 		p.ID = strings.TrimSuffix(path.Base(rel), path.Ext(rel))
@@ -256,6 +269,7 @@ func (w *pageWalk) run() (err error) {
 			if hasRawHTML(n) {
 				first, _ := w.span(n)
 				w.page.Findings = append(w.page.Findings, Finding{w.firstLine + first + 1, "a paragraph with inline HTML is omitted from the index"})
+				w.page.degrade("a paragraph with inline HTML was omitted")
 				return ast.WalkSkipChildren, nil
 			}
 			w.add(w.inlineText(n))
@@ -275,6 +289,7 @@ func (w *pageWalk) heading_(h *ast.Heading) {
 	if hasRawHTML(h) {
 		first, _ := w.span(h)
 		w.page.Findings = append(w.page.Findings, Finding{w.firstLine + first + 1, "a heading with inline HTML is omitted from the index"})
+		w.page.degrade("a heading with inline HTML was omitted")
 		w.heading = "[heading omitted]"
 		w.add(w.heading)
 		return
@@ -393,6 +408,7 @@ func (w *pageWalk) claimText(claimNode ast.Node, prevEnd int) string {
 			if what := hiddenCarrier(n); what != "" {
 				w.page.Findings = append(w.page.Findings, Finding{w.firstLine + first + 1,
 					"a paragraph with " + what + " is excluded from the claim"})
+				w.page.degrade("a claim paragraph with " + what + " was excluded")
 			} else if t := strings.TrimRight(w.inlineText(n), " \t\n"); t != "" {
 				paras = append(paras, t)
 			}

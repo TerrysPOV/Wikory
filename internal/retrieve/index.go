@@ -9,6 +9,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/TerrysPOV/Wikory/internal/claim"
 	"github.com/TerrysPOV/Wikory/internal/confine"
@@ -49,6 +50,16 @@ type Indexer struct {
 	// refresh transaction runs inside it. Empty means no cross-process lock, which only a
 	// caller with a private database (a test) may want.
 	WriteLockPath string
+	// ParseBudget is the most time a refresh spends parsing changed pages (zero means
+	// DefaultParseBudget). Now is the clock that measures it (zero means time.Now).
+	ParseBudget time.Duration
+	Now         func() time.Time
+
+	// Per-refresh counters filled by collect and read by notices.
+	refusedN, malformedN, degradedN nameList
+	degradedWhy                     string
+	// afterCollect, if set, runs between the two phases. Tests only.
+	afterCollect func()
 }
 
 // RefreshStats reports what a refresh did. Skipped counts pages and directories that a limit
@@ -57,6 +68,7 @@ type Indexer struct {
 // refused individually (symlinks, unreadable directories, unreadable files).
 type RefreshStats struct {
 	Pages, Changed, Removed, Refused, Malformed int
+	Budgeted                                    int // changed pages indexed by title only for want of parse time
 	Skipped                                     int
 	Partial                                     bool
 	Notices                                     []string
@@ -161,7 +173,31 @@ func (ix *Indexer) write(ctx context.Context, fn func(ctx context.Context) error
 	return store.WithWriteLockAt(ctx, ix.WriteLockPath, fn)
 }
 
-// Refresh makes the index match the tree.
+// DefaultParseBudget is the most time one refresh spends parsing pages. Pages beyond it are
+// indexed by title only and retried by the next refresh.
+const DefaultParseBudget = 1500 * time.Millisecond
+
+// known is what the index already holds for one page.
+type known struct {
+	hash      string
+	malformed int // -1: no page_notes row yet (an index from before notes), so reparse
+	degraded  string
+}
+
+// pageWork is one page of a refresh after phase 1. page is nil for an unchanged page, whose
+// malformed count and degraded reason come from the index.
+type pageWork struct {
+	rel, hash string
+	page      *claim.Page
+	malformed int
+	degraded  string
+	retry     bool // indexed by title only for want of parse time: stored with an empty hash
+}
+
+// Refresh makes the index match the tree. It works in two phases. Phase 1, outside any lock,
+// walks the tree, reads and hashes pages and parses the ones that changed, within the limits
+// and the parse time budget. Phase 2 takes the database write lock and only writes what
+// phase 1 collected, so a slow parse never holds up another session's write.
 func (ix *Indexer) Refresh(ctx context.Context) (RefreshStats, error) {
 	var st RefreshStats
 	maxPages, maxBytes, maxDepth := ix.MaxPages, ix.MaxTotalBytes, ix.MaxDepth
@@ -179,77 +215,49 @@ func (ix *Indexer) Refresh(ctx context.Context) (RefreshStats, error) {
 		return st, err
 	}
 	st.Refused, st.Skipped = w.refused, w.skipped
-	refusedN := w.refusedN
-	var malformedN nameList // pages with at least one malformed claim
+	ix.refusedN, ix.malformedN, ix.degradedN, ix.degradedWhy = w.refusedN, nameList{}, nameList{}, ""
 	rels := w.rels
 	sort.Strings(rels)
-	known := map[string]string{}
-	rows, err := ix.DB.QueryContext(ctx, `SELECT relpath, content_hash FROM pages WHERE checkout_id = ?`, ix.CheckoutID)
+	have := map[string]known{}
+	rows, err := ix.DB.QueryContext(ctx, `SELECT p.relpath, p.content_hash, COALESCE(n.malformed, -1), COALESCE(n.degraded, '')
+		FROM pages p LEFT JOIN page_notes n ON n.checkout_id = p.checkout_id AND n.relpath = p.relpath WHERE p.checkout_id = ?`, ix.CheckoutID)
 	if err != nil {
 		return st, err
 	}
 	for rows.Next() {
-		var r, h string
-		if err := rows.Scan(&r, &h); err != nil {
+		var r string
+		var k known
+		if err := rows.Scan(&r, &k.hash, &k.malformed, &k.degraded); err != nil {
 			rows.Close()
 			return st, err
 		}
-		known[r] = h
+		have[r] = k
 	}
 	rows.Close()
-	// The whole transaction, file reads included, runs inside the cross-process database write
-	// lock, so the index is rewritten by one process at a time on every platform.
+
+	work, present, err := ix.collect(ctx, rels, have, maxBytes, &st)
+	if err != nil {
+		return st, err
+	}
+	if ix.afterCollect != nil {
+		ix.afterCollect()
+	}
 	err = ix.write(ctx, func(ctx context.Context) error {
 		tx, err := ix.DB.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
-		present := map[string]bool{}
-		var total int64
-		byteLimit := false
-		for i, rel := range rels {
-			if err := ctx.Err(); err != nil {
+		for _, it := range work {
+			if it.page == nil {
+				continue
+			}
+			if err := ix.indexPage(ctx, tx, it); err != nil {
 				return err
-			}
-			if byteLimit {
-				present[rel] = true // not read, so not deleted either
-				st.Skipped++
-				continue
-			}
-			data, err := ix.Repo.ReadFile(rel, maxPage)
-			if err != nil {
-				st.Refused++ // over the page size cap, unreadable or swapped for a symlink
-				refusedN.add(rel)
-				continue
-			}
-			present[rel] = true
-			if total+int64(len(data)) > maxBytes {
-				byteLimit = true
-				st.Skipped++
-				continue
-			}
-			total += int64(len(data))
-			st.Pages++
-			var n int
-			if known[rel] != ids.SHA256Hex(data) {
-				if n, err = ix.indexPage(ctx, tx, rel, data); err != nil {
-					return err
-				}
-				st.Changed++
-			} else {
-				n = malformedClaims(claim.ParsePage(rel, data)) // unchanged pages are still disclosed
-			}
-			if n > 0 {
-				st.Malformed += n
-				malformedN.add(rel)
-			}
-			if ix.Progress != nil {
-				ix.Progress(i+1, len(rels))
 			}
 		}
 		if !w.cutShort {
-			for rel := range known {
+			for rel := range have {
 				if !present[rel] {
 					if err := deletePage(ctx, tx, ix.CheckoutID, rel); err != nil {
 						return err
@@ -258,25 +266,117 @@ func (ix *Indexer) Refresh(ctx context.Context) (RefreshStats, error) {
 				}
 			}
 		}
-		if refusedN.total > 0 {
-			st.Notices = append(st.Notices, fmt.Sprintf("%d wiki file(s) or director(ies) were not indexed, so search and the briefing cannot see them: a symlink, an unreadable file or directory, or a page over %d bytes: %s.", refusedN.total, maxPage, refusedN.describe()))
-		}
-		if st.Malformed > 0 {
-			st.Notices = append(st.Notices, fmt.Sprintf("%d claim(s) in %d page(s) were left out of the index because their metadata comment is malformed: %s.", st.Malformed, malformedN.total, malformedN.describe()))
-		}
-		if st.Skipped > 0 {
-			st.Partial = true
-			st.Notices = append(st.Notices, fmt.Sprintf("The memory index is partial: %d page(s) or director(ies) were skipped because a size limit was reached (%d pages, %d bytes, depth %d).", st.Skipped, maxPages, maxBytes, maxDepth))
-		}
 		return tx.Commit()
 	})
-	return st, err
+	if err != nil {
+		return st, err
+	}
+	ix.notices(&st, maxPages, maxBytes, maxDepth)
+	return st, nil
+}
+
+// collect is phase 1: it reads every listed page within the byte limit, hashes it, and parses
+// the changed ones until the parse budget is spent. It returns the work for phase 2 and the set
+// of paths present in the tree (including those skipped by a limit, which are not deleted).
+func (ix *Indexer) collect(ctx context.Context, rels []string, have map[string]known, maxBytes int64, st *RefreshStats) ([]pageWork, map[string]bool, error) {
+	now := ix.Now
+	if now == nil {
+		now = time.Now
+	}
+	budget := ix.ParseBudget
+	if budget <= 0 {
+		budget = DefaultParseBudget
+	}
+	var spent time.Duration
+	var work []pageWork
+	present := map[string]bool{}
+	var total int64
+	byteLimit := false
+	for i, rel := range rels {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		if byteLimit {
+			present[rel] = true // not read, so not deleted either
+			st.Skipped++
+			continue
+		}
+		data, err := ix.Repo.ReadFile(rel, maxPage)
+		if err != nil {
+			st.Refused++ // over the page size cap, unreadable or swapped for a symlink
+			ix.refusedN.add(rel)
+			continue
+		}
+		present[rel] = true
+		if total+int64(len(data)) > maxBytes {
+			byteLimit = true
+			st.Skipped++
+			continue
+		}
+		total += int64(len(data))
+		st.Pages++
+		hash := ids.SHA256Hex(data)
+		it := pageWork{rel: rel, hash: hash}
+		if k, ok := have[rel]; ok && k.hash == hash && k.malformed >= 0 {
+			it.malformed, it.degraded = k.malformed, k.degraded // unchanged: no parse
+		} else {
+			var p claim.Page
+			if spent > budget {
+				p = claim.ParsePageTitleOnly(rel, data, "parse time budget used up; only its title is indexed until the next refresh")
+				it.retry = true
+				st.Budgeted++
+			} else {
+				began := now()
+				p = claim.ParsePage(rel, data)
+				spent += now().Sub(began)
+			}
+			it.page, it.malformed, it.degraded = &p, malformedClaims(p), p.Degraded
+			st.Changed++
+		}
+		if it.malformed > 0 {
+			st.Malformed += it.malformed
+			ix.malformedN.add(rel)
+		}
+		if it.degraded != "" && !it.retry {
+			ix.degradedN.add(rel)
+			if ix.degradedWhy == "" {
+				ix.degradedWhy = it.degraded
+			}
+		}
+		work = append(work, it)
+		if ix.Progress != nil {
+			ix.Progress(i+1, len(rels))
+		}
+	}
+	return work, present, nil
+}
+
+// notices fills the refresh notices from what phase 1 counted.
+func (ix *Indexer) notices(st *RefreshStats, maxPages int, maxBytes int64, maxDepth int) {
+	if ix.refusedN.total > 0 {
+		st.Notices = append(st.Notices, fmt.Sprintf("%d wiki file(s) or director(ies) were not indexed, so search and the briefing cannot see them: a symlink, an unreadable file or directory, or a page over %d bytes: %s.", ix.refusedN.total, maxPage, ix.refusedN.describe()))
+	}
+	if st.Malformed > 0 {
+		st.Notices = append(st.Notices, fmt.Sprintf("%d claim(s) in %d page(s) were left out of the index because their metadata comment is malformed: %s.", st.Malformed, ix.malformedN.total, ix.malformedN.describe()))
+	}
+	if ix.degradedN.total > 0 {
+		st.Notices = append(st.Notices, fmt.Sprintf("%d page(s) are indexed only in part, so search and the briefing cannot see all of their text (%s): %s.", ix.degradedN.total, singleLine(truncateRunes(ix.degradedWhy, 120)), ix.degradedN.describe()))
+	}
+	if st.Budgeted > 0 {
+		st.Partial = true
+		st.Notices = append(st.Notices, fmt.Sprintf("The memory index is partial: the parse time budget ran out, so %d changed page(s) are indexed by title only until the next refresh.", st.Budgeted))
+	}
+	if st.Skipped > 0 {
+		st.Partial = true
+		st.Notices = append(st.Notices, fmt.Sprintf("The memory index is partial: %d page(s) or director(ies) were skipped because a size limit was reached (%d pages, %d bytes, depth %d).", st.Skipped, maxPages, maxBytes, maxDepth))
+	}
 }
 
 func deletePage(ctx context.Context, tx *sql.Tx, checkout, rel string) error {
 	for _, q := range []string{
 		`DELETE FROM fts WHERE checkout_id = ? AND relpath = ?`,
 		`DELETE FROM claims WHERE checkout_id = ? AND relpath = ?`,
+		`DELETE FROM page_notes WHERE checkout_id = ? AND relpath = ?`,
 		`DELETE FROM pages WHERE checkout_id = ? AND relpath = ?`,
 	} {
 		if _, err := tx.ExecContext(ctx, q, checkout, rel); err != nil {
@@ -296,35 +396,43 @@ func malformedClaims(p claim.Page) int {
 	return n
 }
 
-func (ix *Indexer) indexPage(ctx context.Context, tx *sql.Tx, rel string, data []byte) (int, error) {
+// indexPage writes one parsed page: the page row (with an empty hash when it is to be retried),
+// its notes, its body and its claims.
+func (ix *Indexer) indexPage(ctx context.Context, tx *sql.Tx, it pageWork) error {
+	rel, p := it.rel, *it.page
 	if err := deletePage(ctx, tx, ix.CheckoutID, rel); err != nil {
-		return 0, err
+		return err
 	}
-	p := claim.ParsePage(rel, data)
+	hash := it.hash
+	if it.retry {
+		hash = "" // never equal to a real hash, so the next refresh parses the page in full
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO pages(checkout_id, relpath, content_hash, page_id, title, type) VALUES(?, ?, ?, ?, ?, ?)`,
-		ix.CheckoutID, rel, ids.SHA256Hex(data), p.ID, p.Title, p.Type); err != nil {
-		return 0, err
+		ix.CheckoutID, rel, hash, p.ID, p.Title, p.Type); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO page_notes(checkout_id, relpath, malformed, degraded) VALUES(?, ?, ?, ?)`,
+		ix.CheckoutID, rel, it.malformed, it.degraded); err != nil {
+		return err
 	}
 	pathWords := strings.TrimSuffix(path.Base(rel), ".md")
 	if _, err := tx.ExecContext(ctx, `INSERT INTO fts(title, heading, claim, body, search_text, checkout_id, relpath, ordinal) VALUES(?, '', '', ?, ?, ?, ?, -1)`,
 		p.Title, p.Body, Expand(p.Title+" "+pathWords+" "+p.Body), ix.CheckoutID, rel); err != nil {
-		return 0, err
+		return err
 	}
-	malformed := 0
 	for i, b := range p.Blocks {
 		if b.Err != nil {
-			malformed++
 			continue
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO claims(checkout_id, relpath, ordinal, claim_id, meta, text, heading, status, kind) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			ix.CheckoutID, rel, i, b.Claim.ID, b.MetaLine, b.Text, b.Heading, b.Claim.Status, b.Claim.Kind); err != nil {
-			return 0, err
+			return err
 		}
 		extra := strings.Join(b.Claim.AKA, " ") + " " + strings.Join(b.Claim.Deps, " ")
 		if _, err := tx.ExecContext(ctx, `INSERT INTO fts(title, heading, claim, body, search_text, checkout_id, relpath, ordinal) VALUES(?, ?, ?, '', ?, ?, ?, ?)`,
 			p.Title, b.Heading, b.Text, Expand(p.Title+" "+b.Heading+" "+b.Text+" "+extra), ix.CheckoutID, rel, i); err != nil {
-			return 0, err
+			return err
 		}
 	}
-	return malformed, nil
+	return nil
 }

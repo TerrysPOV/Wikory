@@ -39,7 +39,7 @@ func (s *Store) HasCloneRecords(ctx context.Context, commonDir string) (bool, er
 
 // perCheckoutTables are the tables keyed by a checkout id. job_ops hangs off jobs and is
 // handled first.
-var perCheckoutTables = []string{"turn_starts", "turns", "jobs", "pages", "claims", "fts"}
+var perCheckoutTables = []string{"turn_starts", "turns", "jobs", "pages", "page_notes", "claims", "fts"}
 
 // RebindClone revokes everything the store holds for commonDir and binds it to newID, in one
 // transaction: the trust decision, the registered worktrees and every row keyed by their
