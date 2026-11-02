@@ -224,3 +224,32 @@ func hasCode(f []Finding, code string) bool {
 	}
 	return false
 }
+
+// A th= prefix shorter than six characters is too weak to show the text is unedited: one
+// hex character matches one text in sixteen. Every prefix of the real hash from one to five
+// characters is refused (prefixes of the right hash, so only the length can be what refuses
+// them), six or more match, and a wrong six-character prefix does not.
+func TestThMatchesNeedsAtLeastSixCharacters(t *testing.T) {
+	text := "Queue workers drain FIFO."
+	h := claim.TextHash(text)
+	if len(h) < 12 {
+		t.Fatalf("test premise broken: hash %q is shorter than 12 characters", h)
+	}
+	for n := 1; n <= 5; n++ {
+		if thMatches(text, h[:n]) {
+			t.Errorf("a %d character prefix %q matched", n, h[:n])
+		}
+	}
+	for n := 6; n <= len(h); n++ {
+		if !thMatches(text, h[:n]) {
+			t.Errorf("a %d character prefix %q did not match", n, h[:n])
+		}
+	}
+	other := "0"
+	if h[5] == '0' {
+		other = "1"
+	}
+	if wrong := h[:5] + other; thMatches(text, wrong) {
+		t.Errorf("a wrong six character prefix %q matched", wrong)
+	}
+}

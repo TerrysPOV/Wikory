@@ -13,3 +13,9 @@
 | G5-6 | the fingerprint refusal no longer marks the job refused (the `setJob(..., "refused", "fingerprint changed")` line dropped) | RED as predicted (`job state "begun" after a fingerprint refusal`) |
 | G5-7a | the `Seal` deadline check disabled (`if false \|\| ctx.Err() != nil`) | RED as predicted (`Seal past its deadline: n=1`) |
 | G5-7b | `Seal` reads the wall clock again (`time.Now().After(deadline)`) instead of `r.Now()` | RED as predicted (`Seal past its deadline: n=1`; the whole seal suite also goes red, because its deadlines are on the recorder clock) |
+| G5-8a | `thMatches` accepts a one-character prefix (`n >= 6` becomes `n >= 1`) | RED as predicted (`a 1 character prefix "e" matched`) |
+| G5-8b | `thMatches` minimum moved to 5, then to 7 | RED as predicted both ways (`a 5 character prefix "ed5ac" matched`; `a 6 character prefix "ed5ac7" did not match`) |
+| G5-9a | index byte cap `>` becomes `>=` | RED as predicted (`want 2 0 false`: pages summing to exactly the cap are refused) |
+| G5-9b | index byte cap `>` becomes `> maxBytes+1` | RED as predicted (`want 1 1 true`: a page one byte over the cap is admitted) |
+| G5-9c | briefing `fits` `<=` becomes `<` | RED as predicted (`at the exact cap 330: item shown=false`) |
+| G5-9d | briefing `fits` `<=` becomes `<= cap+1` | RED as predicted (`one byte under the exact cap 329: item shown=true`) |
