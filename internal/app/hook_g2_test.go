@@ -72,7 +72,7 @@ func TestHooksReturnWithinBudgetWhileTheRegistryLockIsHeld(t *testing.T) {
 			if code != ExitOK || el > 400*time.Millisecond+400*time.Millisecond*slack() {
 				t.Fatalf("code=%d elapsed=%v: the hook outlived its 400ms budget", code, el)
 			}
-			if !has(h.logKinds(t), "timeout") {
+			if h.logKindCount(t, "timeout") == 0 {
 				t.Fatalf("no timeout entry in the hook error log: %q", h.logText(t))
 			}
 		})
@@ -92,14 +92,7 @@ func TestHooksLogWhyTheProjectCouldNotBeOpened(t *testing.T) {
 			t.Fatalf("%s: code=%d out=%q", hc.arg, code, out)
 		}
 	}
-	kinds := h.logKinds(t)
-	n := 0
-	for _, k := range kinds {
-		if k == "open" {
-			n++
-		}
-	}
-	if n != 2 {
+	if h.logKindCount(t, "open") != 2 {
 		t.Fatalf("a corrupt config.toml was not logged by both hooks: %q", h.logText(t))
 	}
 }
@@ -125,8 +118,8 @@ func TestHooksStaySilentOutsideAnInitialisedGitRepo(t *testing.T) {
 // start still goes on to brief.
 func TestSealFailureIsLogged(t *testing.T) {
 	h := newHookRig(t)
-	h.hook(t, h.dir, "user-prompt-submit", h.payload("UserPromptSubmit", h.dir, map[string]any{"prompt": "x", "prompt_id": "p1"}))
-	h.hook(t, h.dir, "stop", h.payload("Stop", h.dir, map[string]any{"prompt_id": "p1", "last_assistant_message": "done"}))
+	h.hook(t, h.dir, "user-prompt-submit", h.promptPayload("x", "p1"))
+	h.hook(t, h.dir, "stop", h.stopPayload("p1", "done"))
 	files, _ := filepath.Glob(filepath.Join(h.storeDir(t), "turns", "*", "*", "v0001.json"))
 	if len(files) != 1 {
 		t.Fatalf("want one stored turn, found %v", files)
@@ -137,17 +130,11 @@ func TestSealFailureIsLogged(t *testing.T) {
 	if got := h.context(t, h.dir); !strings.HasPrefix(got, "wikory: mode=full") {
 		t.Fatalf("a corrupt turn stopped the briefing: %s", got)
 	}
-	if !has(h.logKinds(t), "seal") {
+	if h.logKindCount(t, "seal") == 0 {
 		t.Fatalf("the seal failure was not logged: %q", h.logText(t))
 	}
-	h.hook(t, h.dir, "user-prompt-submit", h.payload("UserPromptSubmit", h.dir, map[string]any{"prompt": "y", "prompt_id": "p2"}))
-	n := 0
-	for _, k := range h.logKinds(t) {
-		if k == "seal" {
-			n++
-		}
-	}
-	if n != 2 {
+	h.hook(t, h.dir, "user-prompt-submit", h.promptPayload("y", "p2"))
+	if h.logKindCount(t, "seal") != 2 {
 		t.Fatalf("UserPromptSubmit did not log its seal failure: %q", h.logText(t))
 	}
 }
@@ -163,7 +150,7 @@ func TestSessionStartOutputFailureIsLoggedAndExitsZero(t *testing.T) {
 	if code := RunEnv([]string{"hook", "session-start"}, e); code != ExitOK {
 		t.Fatalf("exit %d", code)
 	}
-	if !has(h.logKinds(t), "output") {
+	if h.logKindCount(t, "output") == 0 {
 		t.Fatalf("the failed write was not logged: %q", h.logText(t))
 	}
 }

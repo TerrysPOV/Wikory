@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -28,18 +29,9 @@ func TestStopRecordsAnUnresolvableHeadAsUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !has(warned, "git") || !strings.Contains(r.readVersion(t, id, "v0001.json"), `"head": "unknown"`) {
+	if !slices.Contains(warned, "git") || !strings.Contains(r.readVersion(t, id, "v0001.json"), `"head": "unknown"`) {
 		t.Fatalf("warned=%v record=%s", warned, r.readVersion(t, id, "v0001.json"))
 	}
-}
-
-func has(list []string, s string) bool {
-	for _, x := range list {
-		if x == s {
-			return true
-		}
-	}
-	return false
 }
 
 func gitOut(t *testing.T, dir string, args ...string) string {

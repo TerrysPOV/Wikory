@@ -14,6 +14,13 @@ import (
 	"time"
 )
 
+// resetModeCache forgets the mode probed in this process.
+func resetModeCache() {
+	modeCache.mu.Lock()
+	defer modeCache.mu.Unlock()
+	modeCache.done, modeCache.mode = false, ""
+}
+
 // stubClaudeVersion makes the version probe answer v, clears the process-wide mode cache, and
 // returns a counter of how many times the probe ran.
 func stubClaudeVersion(t *testing.T, v string) *atomic.Int32 {
@@ -25,21 +32,9 @@ func stubClaudeVersion(t *testing.T, v string) *atomic.Int32 {
 	return calls
 }
 
-func (h *hookRig) getenv() func(string) string {
-	return func(k string) string {
-		if k == "WIKORY_DATA_DIR" {
-			return h.c.dataDir
-		}
-		if v, ok := h.c.extra[k]; ok {
-			return v
-		}
-		return os.Getenv(k)
-	}
-}
-
 // hookEnv builds the environment a hook runs in, with stdout going to out.
 func (h *hookRig) hookEnv(stdin string, out io.Writer) *Env {
-	return &Env{IO: IO{In: strings.NewReader(stdin), Out: out, Err: io.Discard}, Version: "test", Cwd: h.dir, Getenv: h.getenv()}
+	return &Env{IO: IO{In: strings.NewReader(stdin), Out: out, Err: io.Discard}, Version: "test", Cwd: h.dir, Getenv: h.c.getenv()}
 }
 
 // runHookTimed runs one hook with stdin from stdin, reports its stdout, exit code and how long
@@ -81,13 +76,26 @@ func (h *hookRig) logKinds(t *testing.T) []string {
 	return kinds
 }
 
-func has(kinds []string, kind string) bool {
-	for _, k := range kinds {
+// logKindCount is how many lines of the hook error log are of the given kind.
+func (h *hookRig) logKindCount(t *testing.T, kind string) int {
+	t.Helper()
+	n := 0
+	for _, k := range h.logKinds(t) {
 		if k == kind {
-			return true
+			n++
 		}
 	}
-	return false
+	return n
+}
+
+// promptPayload is the UserPromptSubmit payload of a prompt with the given id.
+func (h *hookRig) promptPayload(prompt, promptID string) string {
+	return h.payload("UserPromptSubmit", h.dir, map[string]any{"prompt": prompt, "prompt_id": promptID})
+}
+
+// stopPayload is the Stop payload that ends the prompt with the given id.
+func (h *hookRig) stopPayload(promptID, final string) string {
+	return h.payload("Stop", h.dir, map[string]any{"prompt_id": promptID, "last_assistant_message": final})
 }
 
 func (h *hookRig) storeDir(t *testing.T) string {

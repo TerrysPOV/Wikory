@@ -147,21 +147,6 @@ func TestCloneIdFileIsOwnerOnlyAndStableAcrossInit(t *testing.T) {
 	}
 }
 
-// storeDB opens the single private store the rig created.
-func storeDB(t *testing.T, h *hookRig) *sql.DB {
-	t.Helper()
-	dbs, _ := filepath.Glob(filepath.Join(h.c.dataDir, "stores", "*", "wikory.db"))
-	if len(dbs) != 1 {
-		t.Fatalf("want one store, found %v", dbs)
-	}
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbs[0])+"?_pragma=busy_timeout(5000)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return db
-}
-
 func count(t *testing.T, db *sql.DB, query string, args ...any) int {
 	t.Helper()
 	var n int
@@ -175,7 +160,7 @@ func count(t *testing.T, db *sql.DB, query string, args ...any) int {
 // but with no clone id in the store or in the git directory.
 func makeLegacy(t *testing.T, h *hookRig) {
 	t.Helper()
-	db := storeDB(t, h)
+	db := h.storeDB(t)
 	if _, err := db.Exec(`DELETE FROM meta WHERE k LIKE 'clone-id:%'`); err != nil {
 		t.Fatal(err)
 	}
@@ -238,10 +223,10 @@ func TestCloneIdFailureAtAnyStepLeavesThePathUntrusted(t *testing.T) {
 // A replacement clone gets new checkout ids and finds none of the old clone's private rows.
 func TestReplacedCloneSeesNoPrivateDataOfTheOldOne(t *testing.T) {
 	h := newHookRig(t)
-	h.hook(t, h.dir, "user-prompt-submit", h.payload("UserPromptSubmit", h.dir, map[string]any{"prompt": "OLD-CLONE-PROMPT", "prompt_id": "p1"}))
-	h.hook(t, h.dir, "stop", h.payload("Stop", h.dir, map[string]any{"prompt_id": "p1", "last_assistant_message": "done"}))
+	h.hook(t, h.dir, "user-prompt-submit", h.promptPayload("OLD-CLONE-PROMPT", "p1"))
+	h.hook(t, h.dir, "stop", h.stopPayload("p1", "done"))
 	h.context(t, h.dir) // builds the page index
-	db := storeDB(t, h)
+	db := h.storeDB(t)
 	oldID := ""
 	if err := db.QueryRow(`SELECT id FROM checkouts`).Scan(&oldID); err != nil {
 		t.Fatal(err)

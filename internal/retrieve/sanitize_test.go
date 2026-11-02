@@ -96,19 +96,18 @@ func TestSanitizeStripsEveryInvisibleClass(t *testing.T) {
 
 // Every rune of Unicode category Cf is removed, not just the ones listed by name.
 func TestSanitizeStripsAllFormatCharacters(t *testing.T) {
-	for _, rg := range unicode.Cf.R16 {
-		for r := rune(rg.Lo); r <= rune(rg.Hi); r += rune(rg.Stride) {
+	check := func(lo, hi, stride rune) {
+		for r := lo; r <= hi; r += stride {
 			if out := Sanitize("a" + string(r) + "b"); out != "ab" {
 				t.Fatalf("Cf rune U+%04X survived: %q", r, out)
 			}
 		}
 	}
+	for _, rg := range unicode.Cf.R16 {
+		check(rune(rg.Lo), rune(rg.Hi), rune(rg.Stride))
+	}
 	for _, rg := range unicode.Cf.R32 {
-		for r := rune(rg.Lo); r <= rune(rg.Hi); r += rune(rg.Stride) {
-			if out := Sanitize("a" + string(r) + "b"); out != "ab" {
-				t.Fatalf("Cf rune U+%04X survived: %q", r, out)
-			}
-		}
+		check(rune(rg.Lo), rune(rg.Hi), rune(rg.Stride))
 	}
 }
 

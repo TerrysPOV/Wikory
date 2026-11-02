@@ -114,13 +114,7 @@ func TestRecoverFinishesAStampThatStoppedMidApply(t *testing.T) {
 }
 
 func testEnv(c *cli, dir string) *Env {
-	return &Env{IO: IO{In: strings.NewReader(""), Out: &strings.Builder{}, Err: &strings.Builder{}}, Version: "test", Cwd: dir,
-		Getenv: func(k string) string {
-			if k == "WIKORY_DATA_DIR" {
-				return c.dataDir
-			}
-			return os.Getenv(k)
-		}}
+	return &Env{IO: IO{In: strings.NewReader(""), Out: &strings.Builder{}, Err: &strings.Builder{}}, Version: "test", Cwd: dir, Getenv: c.getenv()}
 }
 
 // beginJobs opens a publish job per age given (how long ago it began) and never writes a

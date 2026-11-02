@@ -25,15 +25,15 @@ func TestStopCapturesWhenGitStatusBlocksOnAFifoExclude(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(h.dir, "untracked.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	h.hook(t, h.dir, "user-prompt-submit", h.payload("UserPromptSubmit", h.dir, map[string]any{"prompt": "x", "prompt_id": "p1"}))
-	_, el, code := runHookTimed(t, h, "stop", h.payload("Stop", h.dir, map[string]any{"prompt_id": "p1", "last_assistant_message": "done"}), 9*time.Second)
+	h.hook(t, h.dir, "user-prompt-submit", h.promptPayload("x", "p1"))
+	_, el, code := runHookTimed(t, h, "stop", h.stopPayload("p1", "done"), 9*time.Second)
 	if code != ExitOK || el > 1200*time.Millisecond+500*time.Millisecond*slack() {
 		t.Fatalf("code=%d elapsed=%v: Stop outlived its 1200ms budget", code, el)
 	}
 	if n := h.turnCount(t); n != 1 {
 		t.Fatalf("the turn was lost with git status blocked: turns=%d", n)
 	}
-	if !has(h.logKinds(t), "git-status") {
+	if h.logKindCount(t, "git-status") == 0 {
 		t.Fatalf("the lost git facts were not logged: %q", h.logText(t))
 	}
 }
@@ -61,7 +61,7 @@ func TestSweepFailureIsLogged(t *testing.T) {
 	if got := h.context(t, h.dir); !strings.HasPrefix(got, "wikory: mode=full") {
 		t.Fatalf("a failed sweep stopped the briefing: %s", got)
 	}
-	if !has(h.logKinds(t), "sweep") {
+	if h.logKindCount(t, "sweep") == 0 {
 		t.Fatalf("the sweep failure was not logged: %q", h.logText(t))
 	}
 }

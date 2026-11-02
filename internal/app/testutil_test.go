@@ -43,18 +43,23 @@ type cli struct {
 
 func newCLI(t *testing.T) *cli { return &cli{t: t, dataDir: t.TempDir(), extra: map[string]string{}} }
 
+// getenv is the environment a command run through c sees: the private data directory, then
+// the overrides in extra, then the process environment.
+func (c *cli) getenv() func(string) string {
+	return func(k string) string {
+		if k == "WIKORY_DATA_DIR" {
+			return c.dataDir
+		}
+		if v, ok := c.extra[k]; ok {
+			return v
+		}
+		return os.Getenv(k)
+	}
+}
+
 func (c *cli) run(dir string, args ...string) (stdout, stderr string, code int) {
 	var out, errb bytes.Buffer
-	env := &Env{IO: IO{In: strings.NewReader(c.stdin), Out: &out, Err: &errb}, Version: "test",
-		Getenv: func(k string) string {
-			if k == "WIKORY_DATA_DIR" {
-				return c.dataDir
-			}
-			if v, ok := c.extra[k]; ok {
-				return v
-			}
-			return os.Getenv(k)
-		}, Cwd: dir}
+	env := &Env{IO: IO{In: strings.NewReader(c.stdin), Out: &out, Err: &errb}, Version: "test", Getenv: c.getenv(), Cwd: dir}
 	code = RunEnv(args, env)
 	return out.String(), errb.String(), code
 }

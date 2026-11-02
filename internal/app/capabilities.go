@@ -62,13 +62,6 @@ var modeCache struct {
 	mode string
 }
 
-// resetModeCache forgets the probed mode. Tests that change probeClaudeVersion call it.
-func resetModeCache() {
-	modeCache.mu.Lock()
-	defer modeCache.mu.Unlock()
-	modeCache.done, modeCache.mode = false, ""
-}
-
 // probeBudget bounds the version probe inside a hook: `claude --version` takes about 0.3 s, and
 // a hook has two seconds. A probe that does not answer in time leaves the mode reduced, which is
 // the truthful answer when the harness cannot be identified (spec 8.1).
