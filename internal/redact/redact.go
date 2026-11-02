@@ -46,10 +46,12 @@ var rules = []rule{
 	// A value already replaced is not replaced or counted again. The operator is ":", "=" or
 	// ":=" and the value may start with any character, so "=~secret" and "==secret" are
 	// assignments. A comparison written with spaces ("password == other", "token => name",
-	// "password =~ /re/") is a named group "cmp" that consumes the rest of its line and is left
-	// alone, so ordinary code is not rewritten ("!=", "<=" and ">=" never reach the operator).
-	{"assignment", regexp.MustCompile(`(?i)` + keywords + `(?:[_-][A-Za-z0-9_-]*)?["']?\s*(?:(?P<cmp>(?:==|=>|=~)[ \t][^\n]*)|(?::=|[:=])\s*(?P<secret>[^\s"'][^\n]{7,199}))`)},
-	{"assignment", regexp.MustCompile(`(?i)` + keywords + `[A-Za-z0-9_-]*["']?\s*(?:(?P<cmp>(?:==|=>|=~)[ \t][^\n]*)|(?::=|[:=])\s*(?P<secret>"[^"\n]{8,}"|'[^'\n]{8,}'|["']?[^\s"']{8,}["']?))`)},
+	// "password =~ /re/") is a named group "cmp" that consumes the operator and the one operand
+	// after it and is left alone, so ordinary code is not rewritten and scanning resumes right
+	// after the operand ("if password == other: password=SECRET" still redacts the second).
+	// "!=", "<=" and ">=" never reach the operator.
+	{"assignment", regexp.MustCompile(`(?i)` + keywords + `(?:[_-][A-Za-z0-9_-]*)?["']?\s*(?:(?P<cmp>(?:==|=>|=~)[ \t]+\S*)|(?::=|[:=])\s*(?P<secret>[^\s"'][^\n]{7,199}))`)},
+	{"assignment", regexp.MustCompile(`(?i)` + keywords + `[A-Za-z0-9_-]*["']?\s*(?:(?P<cmp>(?:==|=>|=~)[ \t]+\S*)|(?::=|[:=])\s*(?P<secret>"[^"\n]{8,}"|'[^'\n]{8,}'|["']?[^\s"']{8,}["']?))`)},
 }
 
 // markerRe matches a value that is exactly one redaction marker. Markers in the input are

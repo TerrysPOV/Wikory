@@ -15,3 +15,4 @@
 | G8-4d | the comparison operators need no following whitespace | RED as predicted (`a secret behind an operator character survived: "token=>correct ..."`) |
 | G8-4e | a skipped comparison is still counted | RED as predicted (`map[assignment:2]`) |
 | G8-4f | the `:=` operator removed from the multi-word rule | covered by the earlier row of the same name; the test `tk := correct horse battery staple` is unchanged |
+| G8-4g | the comparison alternative consumes the rest of the line again (in BOTH assignment rules; each rule alone is masked by the other, so inject.sh cannot fault one site, and the two sites were changed together by hand and restored) | RED as predicted (`a secret after a comparison survived`) |

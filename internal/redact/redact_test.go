@@ -166,6 +166,26 @@ func TestComparisonOperatorsAreNotAssignments(t *testing.T) {
 	}
 }
 
+// A comparison does not hide what follows it: scanning resumes after its one operand, so a
+// real assignment or connection URL later on the same line is still redacted.
+func TestSecretsAfterAComparisonOnTheSameLineAreRedacted(t *testing.T) {
+	kw := strings.ToLower(kwPassword)
+	tail := "hunter2" + "hunter2"
+	for name, in := range map[string]string{
+		"assignment": "if " + kw + " == other_value: " + kw + "=" + tail,
+		"keyword":    "if " + kw + " =~ pattern; " + kw + ": " + tail,
+		"url":        "if " + kw + " => handler_name; dsn postgres://app:" + tail + "@db.internal/app",
+	} {
+		out, c := String(in)
+		if strings.Contains(out, tail) || len(c) == 0 {
+			t.Errorf("%s: a secret after a comparison survived: %q -> %q %v", name, in, out, c)
+		}
+		if !strings.HasPrefix(out, "if "+kw) || !strings.Contains(out, " other_value") && name == "assignment" {
+			t.Errorf("%s: the comparison itself was rewritten: %q", name, out)
+		}
+	}
+}
+
 // A real secret may start with an operator character. After a single "=" or ":" the value is
 // anything at all, so these are assignments and are redacted. Secrets are built at runtime.
 func TestValuesStartingWithOperatorCharactersAreRedacted(t *testing.T) {
