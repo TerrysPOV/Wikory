@@ -84,16 +84,12 @@ func TestConflictReportsARecordingFailure(t *testing.T) {
 	ctx := context.Background()
 	t.Run("database", func(t *testing.T) {
 		f := newFixture(t)
-		if _, err := f.st.DB.Exec(`CREATE TRIGGER no_conflict BEFORE UPDATE OF state ON jobs WHEN NEW.state = 'conflict'
-			BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
-			t.Fatal(err)
-		}
-		testHookBeforeApply = func(i int) {
+		f.failConflictRecording(t)
+		setBeforeApplyHook(t, func(i int) {
 			if i == 1 {
 				f.writeRepo(t, "project-memory/wiki/b.md", "EDITED DURING APPLY")
 			}
-		}
-		t.Cleanup(func() { testHookBeforeApply = func(int) {} })
+		})
 		p := f.publisher("co-1")
 		j, _ := p.Begin(ctx, "test")
 		err := p.Publish(ctx, j, standardOps(), "x")
@@ -105,7 +101,7 @@ func TestConflictReportsARecordingFailure(t *testing.T) {
 		f := newFixture(t)
 		p := f.publisher("co-1")
 		j, _ := p.Begin(ctx, "test")
-		testHookBeforeApply = func(i int) {
+		setBeforeApplyHook(t, func(i int) {
 			if i == 1 {
 				f.writeRepo(t, "project-memory/wiki/b.md", "EDITED DURING APPLY")
 				mp := f.manifestPath(j.ID)
@@ -116,8 +112,7 @@ func TestConflictReportsARecordingFailure(t *testing.T) {
 					t.Error(err)
 				}
 			}
-		}
-		t.Cleanup(func() { testHookBeforeApply = func(int) {} })
+		})
 		err := p.Publish(ctx, j, standardOps(), "x")
 		if !errors.Is(err, ErrConflict) || !strings.Contains(fmt.Sprint(err), "manifest") || f.jobState(t, j.ID) != "conflict" {
 			t.Fatalf("the failure to record the conflict in the manifest was discarded: err=%v state=%s", err, f.jobState(t, j.ID))
@@ -256,10 +251,7 @@ func TestRecoveryReportsAConflictItCouldNotRecord(t *testing.T) {
 	ctx := context.Background()
 	f, id := runKilled(t, "marked-0")
 	f.writeRepo(t, "project-memory/wiki/b.md", "HUMAN EDIT")
-	if _, err := f.st.DB.Exec(`CREATE TRIGGER no_conflict BEFORE UPDATE OF state ON jobs WHEN NEW.state = 'conflict'
-		BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
-		t.Fatal(err)
-	}
+	f.failConflictRecording(t)
 	rep, err := f.publisher("co-1").Recover(ctx)
 	if len(rep.Conflicts) != 1 || len(rep.Errors) != 1 || rep.Errors[0].JobID != id || err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("the unrecorded conflict is not reported: rep=%+v err=%v", rep, err)

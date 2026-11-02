@@ -130,29 +130,26 @@ func TestTakeoverWaitsForThePublishingLock(t *testing.T) {
 	pubErr := make(chan error, 1)
 	go func() { pubErr <- p.Publish(ctx, j, standardOps(), "in progress") }()
 	<-reached
-	type result struct {
-		err error
-	}
-	taken := make(chan result, 1)
+	taken := make(chan error, 1)
 	go func() {
 		_, err := f.publisher("co-1").Takeover(ctx, j.ID)
-		taken <- result{err}
+		taken <- err
 	}()
 	// A takeover that ignores the lock returns within milliseconds, so a returned result inside
 	// this window is a failure. A slow machine only makes a correct takeover wait longer, never
 	// return early, so the window cannot fail a correct implementation.
 	select {
-	case r := <-taken:
+	case err := <-taken:
 		close(release)
-		t.Fatalf("takeover returned while the publish still held the lock: err=%v", r.err)
+		t.Fatalf("takeover returned while the publish still held the lock: err=%v", err)
 	case <-time.After(300 * time.Millisecond):
 	}
 	close(release)
 	if err := <-pubErr; err != nil {
 		t.Fatalf("the publish in progress was fenced mid-way: %v", err)
 	}
-	if r := <-taken; !errors.Is(r.err, ErrJobState) {
-		t.Fatalf("takeover after the publish finished: want ErrJobState, got %v", r.err)
+	if err := <-taken; !errors.Is(err, ErrJobState) {
+		t.Fatalf("takeover after the publish finished: want ErrJobState, got %v", err)
 	}
 }
 
@@ -161,12 +158,11 @@ func TestTakeoverWaitsForThePublishingLock(t *testing.T) {
 func TestEditBetweenStageAndApplyIsAConflict(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
-	testHookBeforeApply = func(i int) {
+	setBeforeApplyHook(t, func(i int) {
 		if i == 1 {
 			f.writeRepo(t, "project-memory/wiki/b.md", "EDITED DURING APPLY")
 		}
-	}
-	t.Cleanup(func() { testHookBeforeApply = func(int) {} })
+	})
 	p := f.publisher("co-1")
 	j, _ := p.Begin(ctx, "test")
 	err := p.Publish(ctx, j, standardOps(), "x")

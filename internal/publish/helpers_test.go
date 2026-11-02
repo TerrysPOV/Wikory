@@ -84,6 +84,23 @@ func (f *fixture) jobState(t *testing.T, jobID string) string {
 	return s
 }
 
+// failConflictRecording makes the database refuse to record a conflict, so a conflict's own
+// recording fails.
+func (f *fixture) failConflictRecording(t *testing.T) {
+	t.Helper()
+	if _, err := f.st.DB.Exec(`CREATE TRIGGER no_conflict BEFORE UPDATE OF state ON jobs WHEN NEW.state = 'conflict'
+		BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// setBeforeApplyHook installs hook for the duration of the test.
+func setBeforeApplyHook(t *testing.T, hook func(i int)) {
+	t.Helper()
+	testHookBeforeApply = hook
+	t.Cleanup(func() { testHookBeforeApply = func(int) {} })
+}
+
 func standardOps() []Op {
 	return []Op{
 		{Target: "project-memory/wiki/a.md", OldHash: Absent, Content: []byte("A1")},

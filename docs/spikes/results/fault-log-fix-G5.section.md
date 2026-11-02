@@ -28,7 +28,7 @@
 | G5-11b2 | the trailing-space refusal removed | RED as predicted (`"trailing " (trailing dot or space) was accepted`) |
 | G5-11b3 | the colon dropped from the forbidden characters | RED as predicted (`"f.txt:stream" (stream or forbidden character) was accepted`) |
 | G5-11b4 | the case fold (`strings.ToUpper`) removed | RED as predicted (`"con" (a reserved device name) was accepted`) |
-| G5-11c | Windows hard-link tests (read, append, replace) added to `confine_windows_test.go`; the `NumberOfLinks > 1` check cannot be faulted from this machine | pending-ci: compiled and vetted with `GOOS=windows`, not run |
+| G5-11c | Windows hard-link tests (read, append, replace) added to `confine_windows_test.go`, since moved with their helpers into the shared `confine_test.go` (they skip on Windows when hard links are unavailable); the `NumberOfLinks > 1` check cannot be faulted from this machine | pending-ci: compiled and vetted with `GOOS=windows`, not run |
 | G5-12a | `recover` reports completed jobs as the abandoned list (`"completed": nz(rep.Abandoned)`), tested with a stamp that stopped after moving the live page aside | RED as predicted (`recover={OK:true Data:{Completed:[] ...}}`) |
 | G5-12b | `Recover` stops appending finished jobs to `Report.Completed`; `apply` skipped in `recoverJob` | RED as predicted both ways (`recover={...Completed:[]...}`; `recovery did not finish the stamp`) |
 | G5-12c | the abandoned count in the text form of `recover` forced to 0 | RED as predicted (`text form: ... 0 abandoned`) |

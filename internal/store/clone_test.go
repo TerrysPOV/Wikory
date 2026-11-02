@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-// Revocation and binding are one transaction. When binding the new id fails, the old trust
-// decision and registration must still be there: a half-done rebind must never be visible.
-func TestRebindCloneIsAllOrNothing(t *testing.T) {
+// trustedCheckout is a store with one registered checkout whose common directory is trusted.
+func trustedCheckout(t *testing.T) (*Store, Identity) {
+	t.Helper()
 	ctx := context.Background()
 	id := ident("wkp_P", "", "/c/.git", "/c")
 	s := open(t, t.TempDir(), id, true)
@@ -17,6 +17,14 @@ func TestRebindCloneIsAllOrNothing(t *testing.T) {
 	if err := s.RecordTrust(ctx, id.CommonDir, TrustTrusted, "seeded"); err != nil {
 		t.Fatal(err)
 	}
+	return s, id
+}
+
+// Revocation and binding are one transaction. When binding the new id fails, the old trust
+// decision and registration must still be there: a half-done rebind must never be visible.
+func TestRebindCloneIsAllOrNothing(t *testing.T) {
+	ctx := context.Background()
+	s, id := trustedCheckout(t)
 	if _, err := s.DB.Exec(`CREATE TRIGGER refuse_clone_id BEFORE INSERT ON meta WHEN NEW.k LIKE 'clone-id:%'
 		BEGIN SELECT RAISE(ABORT, 'refused'); END`); err != nil {
 		t.Fatal(err)
@@ -34,14 +42,7 @@ func TestRebindCloneIsAllOrNothing(t *testing.T) {
 
 func TestRebindCloneRevokesTrustToUndecidedAndBinds(t *testing.T) {
 	ctx := context.Background()
-	id := ident("wkp_P", "", "/c/.git", "/c")
-	s := open(t, t.TempDir(), id, true)
-	if _, err := s.Register(ctx, id); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.RecordTrust(ctx, id.CommonDir, TrustTrusted, "seeded"); err != nil {
-		t.Fatal(err)
-	}
+	s, id := trustedCheckout(t)
 	if err := s.RebindClone(ctx, id.CommonDir, "wkc_NEW"); err != nil {
 		t.Fatal(err)
 	}

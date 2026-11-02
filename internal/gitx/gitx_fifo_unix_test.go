@@ -19,6 +19,31 @@ func mkfifo(t *testing.T, path string) {
 	}
 }
 
+// excludePath is the repository's info/exclude file, removed so a test can put something else there.
+func excludePath(t *testing.T, r *Repo) string {
+	t.Helper()
+	exclude := filepath.Join(r.CommonDir, "info", "exclude")
+	if err := os.Remove(exclude); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	return exclude
+}
+
+// requireOnlyYTxtDirty creates x.log and y.txt and fails unless Dirty reports y.txt
+// alone, which shows the "*.log" pattern of the exclude file still applies.
+func requireOnlyYTxtDirty(t *testing.T, dir string, r *Repo) {
+	t.Helper()
+	for _, f := range []string{"x.log", "y.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte("z"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	paths, err, _ := dirtyWithin(t, r, 10*time.Second)
+	if err != nil || len(paths) != 1 || paths[0] != "y.txt" {
+		t.Fatalf("paths=%v err=%v, want only y.txt", paths, err)
+	}
+}
+
 // dirtyWithin runs Dirty with a deadline and fails the test if it did not return on its own
 // well before it: git blocking on a FIFO would only end when the deadline killed it.
 func dirtyWithin(t *testing.T, r *Repo, limit time.Duration) ([]string, error, time.Duration) {
@@ -39,11 +64,7 @@ func TestFIFOAtInfoExcludeIsRefusedNotWaitedOn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exclude := filepath.Join(r.CommonDir, "info", "exclude")
-	if err := os.Remove(exclude); err != nil && !errors.Is(err, os.ErrNotExist) {
-		t.Fatal(err)
-	}
-	mkfifo(t, exclude)
+	mkfifo(t, excludePath(t, r))
 	_, err, took := dirtyWithin(t, r, 10*time.Second)
 	if !errors.Is(err, ErrUnsafeExclude) || took > 5*time.Second {
 		t.Fatalf("Dirty with a FIFO at info/exclude: err=%v after %v, want ErrUnsafeExclude promptly", err, took)
@@ -56,9 +77,7 @@ func TestSymlinkToFIFOAtInfoExcludeIsRefused(t *testing.T) {
 	r, _ := Discover(context.Background(), dir)
 	fifo := filepath.Join(t.TempDir(), "fifo")
 	mkfifo(t, fifo)
-	exclude := filepath.Join(r.CommonDir, "info", "exclude")
-	_ = os.Remove(exclude)
-	if err := os.Symlink(fifo, exclude); err != nil {
+	if err := os.Symlink(fifo, excludePath(t, r)); err != nil {
 		t.Fatal(err)
 	}
 	_, err, took := dirtyWithin(t, r, 10*time.Second)
@@ -74,15 +93,7 @@ func TestRegularInfoExcludeStillWorks(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(r.CommonDir, "info", "exclude"), []byte("*.log\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range []string{"x.log", "y.txt"} {
-		if err := os.WriteFile(filepath.Join(dir, f), []byte("z"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	paths, err, _ := dirtyWithin(t, r, 10*time.Second)
-	if err != nil || len(paths) != 1 || paths[0] != "y.txt" {
-		t.Fatalf("paths=%v err=%v, want only y.txt", paths, err)
-	}
+	requireOnlyYTxtDirty(t, dir, r)
 }
 
 // core.excludesFile names a file git reads on every status. Pointed at a FIFO (in the user's
@@ -112,18 +123,8 @@ func TestSymlinkToARegularInfoExcludeStillWorks(t *testing.T) {
 	if err := os.WriteFile(target, []byte("*.log\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	exclude := filepath.Join(r.CommonDir, "info", "exclude")
-	_ = os.Remove(exclude)
-	if err := os.Symlink(target, exclude); err != nil {
+	if err := os.Symlink(target, excludePath(t, r)); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range []string{"x.log", "y.txt"} {
-		if err := os.WriteFile(filepath.Join(dir, f), []byte("z"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	paths, err, _ := dirtyWithin(t, r, 10*time.Second)
-	if err != nil || len(paths) != 1 || paths[0] != "y.txt" {
-		t.Fatalf("paths=%v err=%v, want only y.txt", paths, err)
-	}
+	requireOnlyYTxtDirty(t, dir, r)
 }
