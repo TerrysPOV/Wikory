@@ -268,12 +268,11 @@ func freshness(ctx context.Context, c claim.Claim, algo string, env Env, d *Disp
 			evOID[e.Path] = e.OID
 		}
 	}
-	var stale, removed []string
-	unknown := 0
+	var stale, removed, unchecked []string
 	for _, p := range deps {
 		want, ok := evOID[p]
 		if !ok {
-			unknown++
+			unchecked = append(unchecked, p)
 			continue
 		}
 		cur, present, err := env.WorkBlob(ctx, p)
@@ -294,12 +293,16 @@ func freshness(ctx context.Context, c claim.Claim, algo string, env Env, d *Disp
 	case len(removed) > 0:
 		d.Stale = true
 		d.Freshness = "source removed: " + strings.Join(removed, ", ")
-	case unknown == len(deps):
+	case len(unchecked) == len(deps):
 		d.Freshness = "freshness unknown"
-	case d.Status == "verified" && c.VRev != "":
-		d.Freshness = "verified @" + c.VRev + ", sources unchanged"
 	default:
 		d.Freshness = "sources unchanged"
+		if len(unchecked) > 0 { // some dependencies have no recorded baseline, so they were not compared
+			d.Freshness = "unchanged where checked; no baseline for: " + strings.Join(unchecked, ", ")
+		}
+		if d.Status == "verified" && c.VRev != "" {
+			d.Freshness = "verified @" + c.VRev + ", " + d.Freshness
+		}
 	}
 	return nil
 }
