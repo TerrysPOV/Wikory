@@ -17,3 +17,10 @@
 | G1-7a | the lock file is opened without `O_NOFOLLOW` | RED as predicted (`Lock followed a symlink and locked its target`) |
 | G1-7b | the regular-file check removed (a device is accepted) | RED as predicted (`Lock accepted a device as its lock file`) |
 | G1-7c | the lock file is opened without `O_NONBLOCK` | SURVIVED: no portable test can observe it, because the lock is opened `O_RDWR`, which never blocks on a FIFO on Linux or macOS. The flag is defence in depth for devices that block on open |
+| G1-8 | a clone with no recorded nonce is bound without revoking (taken to be the same clone) | RED as predicted (`init kept a trusted decision it could not verify`) |
+| G1-9 | the nonce is bound without revoking the old trust | RED as predicted (`a failure at after-file left the path trusted`) |
+| G1-9b | revocation commits, then the nonce is bound in a separate step (not one transaction) | RED as predicted (`a failed rebind changed the trust decision: "undecided" true`) |
+| G1-10a | `pages` rows of the replaced clone are not deleted | RED as predicted (`2 row(s) of the old clone survive in pages`) |
+| G1-10b | `job_ops` rows of the replaced clone are not deleted | RED as predicted (`5 job_ops row(s) of the old clone survive`) |
+| G1-10c | the checkout id ignores the clone nonce | RED as predicted (`the replacement clone got the old checkout id`) |
+| G1-10d | `turns` rows of the replaced clone are not deleted | RED as predicted (`1 row(s) of the old clone survive in turns`) |

@@ -92,17 +92,16 @@ func runInit(ctx context.Context, env *Env, args []string) (Result, error) {
 		return Result{}, err
 	}
 	defer st.Close()
-	replaced, err := ensureCloneID(ctx, st, repo.CommonDir)
+	cloneID, revoked, err := ensureCloneID(ctx, st, repo.CommonDir)
 	if err != nil {
 		return Result{}, err
 	}
-	if replaced {
-		// Another repository now sits where a registered clone was: nothing the store holds
-		// for that path, its trust decision included, is this repository's.
-		if err := st.ForgetClone(ctx, repo.CommonDir); err != nil {
-			return Result{}, err
-		}
-		notices = append(notices, "a different repository now occupies the path of a clone registered earlier; its trust decision was discarded")
+	id.CloneID = cloneID
+	if revoked {
+		// The store could not tie what it held for this path to this repository: nothing it
+		// held, its trust decision and registrations included, is carried over.
+		notices = append(notices, "this clone could not be verified against the store's record (a different repository may now occupy this path, "+
+			"or the record predates clone ids), so its earlier trust decision, registrations and private data were discarded; trust must be granted again")
 	}
 	co, err := st.Register(ctx, id)
 	if err != nil {

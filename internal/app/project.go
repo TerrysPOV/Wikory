@@ -91,6 +91,16 @@ budget_tokens = %d
 // different repository; the nonce is what a replacement cannot carry over.
 const cloneIDFile = "wikory-checkout-id"
 
+// testHookCloneID lets a test fail ensureCloneID at a named step. Nil in production.
+var testHookCloneID func(stage string) error
+
+func cloneIDStage(stage string) error {
+	if f := testHookCloneID; f != nil {
+		return f(stage)
+	}
+	return nil
+}
+
 // readCloneID returns the nonce in commonDir, or "" when the file is absent or unreadable.
 func readCloneID(commonDir string) string {
 	root, err := confine.Open(commonDir)
@@ -105,27 +115,51 @@ func readCloneID(commonDir string) string {
 	return strings.TrimSpace(string(data))
 }
 
-// ensureCloneID makes the store and the git directory agree on a nonce for this clone. It
-// reports replaced when the store knew a different nonce, meaning another repository now
-// occupies the path: the caller discards what the store held for it.
-func ensureCloneID(ctx context.Context, st *store.Store, commonDir string) (replaced bool, err error) {
+// ensureCloneID makes the store and the git directory agree on a nonce for this clone and
+// returns it. When the nonce in the git directory matches the store's record the clone is
+// verified and nothing changes. In every other case the clone cannot be verified: either the
+// store knew a different nonce (another repository now occupies the path) or it knew none
+// while holding trust or registrations for the path (a record from before clone ids). Then
+// revoked is true. The order is fixed so that no failure leaves the path trusted: the store
+// revokes everything and binds the new nonce in one transaction, and only then is the file
+// written. A failure before the transaction commits changes nothing, and the old record no
+// longer matches the file; a failure after it leaves a nonce the file does not carry.
+func ensureCloneID(ctx context.Context, st *store.Store, commonDir string) (cloneID string, revoked bool, err error) {
 	want, known, err := st.CloneID(ctx, commonDir)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
 	if known && want != "" && readCloneID(commonDir) == want {
-		return false, nil
+		return want, false, nil
+	}
+	revoked = known
+	if !known {
+		if revoked, err = st.HasCloneRecords(ctx, commonDir); err != nil {
+			return "", false, err
+		}
 	}
 	id := "wkc_" + ids.NewULID()
+	if err := cloneIDStage("before-revoke"); err != nil {
+		return "", false, err
+	}
+	if err := st.RebindClone(ctx, commonDir, id); err != nil {
+		return "", false, err
+	}
+	if err := cloneIDStage("after-revoke"); err != nil {
+		return "", false, err
+	}
 	root, err := confine.Open(commonDir)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
 	defer root.Close()
 	if err := root.WriteFileAtomic(cloneIDFile, []byte(id+"\n"), 0o600); err != nil {
-		return false, fmt.Errorf("recording the clone id in %s: %w", commonDir, err)
+		return "", false, fmt.Errorf("recording the clone id in %s: %w", commonDir, err)
 	}
-	return known, st.SetCloneID(ctx, commonDir, id)
+	if err := cloneIDStage("after-file"); err != nil {
+		return "", false, err
+	}
+	return id, revoked, nil
 }
 
 // project is what a command knows about the current checkout.
@@ -223,13 +257,16 @@ func (p *project) load(ctx context.Context, env *Env, createStore bool) error {
 	}
 	p.Trusted = decision == store.TrustTrusted
 	// The store must have registered this very clone, not just a clone at this path.
-	if want, known, err := p.Store.CloneID(ctx, p.Repo.CommonDir); err != nil {
+	want, known, err := p.Store.CloneID(ctx, p.Repo.CommonDir)
+	if err != nil {
 		return err
-	} else if !known || want == "" || readCloneID(p.Repo.CommonDir) != want {
+	}
+	if !known || want == "" || readCloneID(p.Repo.CommonDir) != want {
 		p.Trusted = false
 		p.Notices = append(p.Notices, "this path was not registered as this repository (it may have been replaced); run wikory init to register it")
 		return nil
 	}
+	p.Identity.CloneID = want
 	if !p.Repo.Confirmed {
 		// Never registered, never trusted, whatever the store says about the common dir the
 		// .git file names. Nothing is served and nothing captured.

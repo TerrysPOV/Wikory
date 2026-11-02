@@ -28,6 +28,8 @@ type Identity struct {
 	Origin    string
 	CommonDir string
 	Worktree  string
+	// CloneID is the verified nonce of the clone (see CloneID); it is part of every checkout id.
+	CloneID string
 }
 
 type registry struct {

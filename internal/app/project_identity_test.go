@@ -1,6 +1,7 @@
 package app
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -143,5 +144,128 @@ func TestCloneIdFileIsOwnerOnlyAndStableAcrossInit(t *testing.T) {
 	}
 	if second := readFile(t, p); second != first {
 		t.Fatalf("a second init rewrote the clone id: %q -> %q", first, second)
+	}
+}
+
+// storeDB opens the single private store the rig created.
+func storeDB(t *testing.T, h *hookRig) *sql.DB {
+	t.Helper()
+	dbs, _ := filepath.Glob(filepath.Join(h.c.dataDir, "stores", "*", "wikory.db"))
+	if len(dbs) != 1 {
+		t.Fatalf("want one store, found %v", dbs)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbs[0])+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+func count(t *testing.T, db *sql.DB, query string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(query, args...).Scan(&n); err != nil {
+		t.Fatalf("%s: %v", query, err)
+	}
+	return n
+}
+
+// makeLegacy turns the rig's clone into one a pre-nonce build registered: trusted, registered,
+// but with no clone id in the store or in the git directory.
+func makeLegacy(t *testing.T, h *hookRig) {
+	t.Helper()
+	db := storeDB(t, h)
+	if _, err := db.Exec(`DELETE FROM meta WHERE k LIKE 'clone-id:%'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(h.dir, ".git", "wikory-checkout-id")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A clone the store has trust or registrations for, but no recorded clone id, cannot be
+// verified. init must not keep its trusted decision.
+func TestInitKeepsNoTrustForAClonePredatingCloneIds(t *testing.T) {
+	h := newHookRig(t)
+	makeLegacy(t, h)
+	if got := h.context(t, h.dir); !strings.Contains(got, "not registered") {
+		t.Fatalf("an unverifiable clone was served before init: %s", got)
+	}
+	out, errOut, code := h.c.run(h.dir, "init")
+	if code != ExitOK {
+		t.Fatalf("init: code=%d %s", code, errOut)
+	}
+	if got := h.context(t, h.dir); strings.Contains(got, "Retries are capped") {
+		t.Fatalf("init kept a trusted decision it could not verify: %s", got)
+	}
+	if !strings.Contains(out+errOut, "discarded") {
+		t.Fatalf("the user was not told the earlier trust was discarded: %s %s", out, errOut)
+	}
+}
+
+// Revoke first, bind second, then write the file: a failure at any step leaves the path
+// untrusted, never trusted.
+func TestCloneIdFailureAtAnyStepLeavesThePathUntrusted(t *testing.T) {
+	for _, scenario := range []string{"replaced", "predates clone ids"} {
+		for _, stage := range []string{"before-revoke", "after-revoke", "after-file"} {
+			t.Run(scenario+"/"+stage, func(t *testing.T) {
+				h := newHookRig(t)
+				if scenario == "replaced" {
+					replaceClone(t, h.dir)
+				} else {
+					makeLegacy(t, h)
+				}
+				testHookCloneID = func(s string) error {
+					if s == stage {
+						return fmt.Errorf("injected failure at %s", s)
+					}
+					return nil
+				}
+				t.Cleanup(func() { testHookCloneID = nil })
+				if _, errOut, code := h.c.run(h.dir, "init"); code == ExitOK || !strings.Contains(errOut, "injected failure") {
+					t.Fatalf("the injected failure did not stop init: code=%d err=%s", code, errOut)
+				}
+				testHookCloneID = nil
+				if got := h.context(t, h.dir); strings.Contains(got, "Retries are capped") {
+					t.Fatalf("a failure at %s left the path trusted: %s", stage, got)
+				}
+			})
+		}
+	}
+}
+
+// A replacement clone gets new checkout ids and finds none of the old clone's private rows.
+func TestReplacedCloneSeesNoPrivateDataOfTheOldOne(t *testing.T) {
+	h := newHookRig(t)
+	h.hook(t, h.dir, "user-prompt-submit", h.payload("UserPromptSubmit", h.dir, map[string]any{"prompt": "OLD-CLONE-PROMPT", "prompt_id": "p1"}))
+	h.hook(t, h.dir, "stop", h.payload("Stop", h.dir, map[string]any{"prompt_id": "p1", "last_assistant_message": "done"}))
+	h.context(t, h.dir) // builds the page index
+	db := storeDB(t, h)
+	oldID := ""
+	if err := db.QueryRow(`SELECT id FROM checkouts`).Scan(&oldID); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{`SELECT count(*) FROM turns`, `SELECT count(*) FROM jobs`, `SELECT count(*) FROM job_ops`, `SELECT count(*) FROM pages`, `SELECT count(*) FROM claims`} {
+		if count(t, db, q) == 0 {
+			t.Fatalf("the test seeded nothing for %q", q)
+		}
+	}
+	replaceClone(t, h.dir)
+	d, _ := initJSON(t, h.c, h.dir)
+	if d.Checkout == oldID {
+		t.Fatalf("the replacement clone got the old checkout id %s", oldID)
+	}
+	for _, table := range []string{"turn_starts", "turns", "jobs", "pages", "claims", "fts", "checkouts"} {
+		col := "checkout_id"
+		if table == "checkouts" {
+			col = "id"
+		}
+		if n := count(t, db, `SELECT count(*) FROM `+table+` WHERE `+col+` != ?`, d.Checkout); n != 0 {
+			t.Errorf("%d row(s) of the old clone survive in %s", n, table)
+		}
+	}
+	if n := count(t, db, `SELECT count(*) FROM job_ops`); n != 0 {
+		t.Errorf("%d job_ops row(s) of the old clone survive", n)
 	}
 }

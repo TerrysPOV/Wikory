@@ -26,12 +26,79 @@ func (s *Store) SetCloneID(ctx context.Context, commonDir, id string) error {
 	return err
 }
 
-// ForgetClone drops what the store holds about a common directory whose repository has been
-// replaced: its trust decision and its registered worktrees.
-func (s *Store) ForgetClone(ctx context.Context, commonDir string) error {
-	if _, err := s.DB.ExecContext(ctx, `DELETE FROM trust WHERE common_dir = ?`, commonDir); err != nil {
+// HasCloneRecords reports whether the store holds a trust decision or a registered worktree
+// for commonDir.
+func (s *Store) HasCloneRecords(ctx context.Context, commonDir string) (bool, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM trust WHERE common_dir = ?) + (SELECT count(*) FROM checkouts WHERE common_dir = ?)`,
+		commonDir, commonDir).Scan(&n)
+	return n > 0, err
+}
+
+// perCheckoutTables are the tables keyed by a checkout id. job_ops hangs off jobs and is
+// handled first.
+var perCheckoutTables = []string{"turn_starts", "turns", "jobs", "pages", "claims", "fts"}
+
+// RebindClone revokes everything the store holds for commonDir and binds it to newID, in one
+// transaction: the trust decision, the registered worktrees and every row keyed by their
+// checkout ids (turn_starts, turns, jobs, job_ops, pages, claims, fts). Revocation comes
+// first and the new id second, and either both happen or neither, so no failure can leave the
+// new id bound while the old trust survives. When a trust decision existed it is replaced by
+// "undecided", never dropped to nothing, so the next init cannot mistake the path for a new
+// clone it may trust on creation.
+func (s *Store) RebindClone(ctx context.Context, commonDir, newID string) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	_, err := s.DB.ExecContext(ctx, `DELETE FROM checkouts WHERE common_dir = ?`, commonDir)
-	return err
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM checkouts WHERE common_dir = ?`, commonDir)
+	if err != nil {
+		return err
+	}
+	var old []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		old = append(old, id)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range old {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM job_ops WHERE job_id IN (SELECT job_id FROM jobs WHERE checkout_id = ?)`, id); err != nil {
+			return err
+		}
+		for _, table := range perCheckoutTables {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE checkout_id = ?`, id); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM checkouts WHERE common_dir = ?`, commonDir); err != nil {
+		return err
+	}
+	var hadTrust int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM trust WHERE common_dir = ?`, commonDir).Scan(&hadTrust); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM trust WHERE common_dir = ?`, commonDir); err != nil {
+		return err
+	}
+	if hadTrust > 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO trust(common_dir, decision, reason, at) VALUES(?, ?, ?, ?)`,
+			commonDir, TrustUndecided, "clone could not be verified against the store's record", now()); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO meta(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, cloneNonceKey+commonDir, newID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
