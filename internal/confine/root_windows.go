@@ -11,15 +11,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-var reserved = map[string]bool{"CON": true, "PRN": true, "AUX": true, "NUL": true,
-	"COM1": true, "COM2": true, "COM3": true, "COM4": true, "COM5": true, "COM6": true, "COM7": true, "COM8": true, "COM9": true,
-	"LPT1": true, "LPT2": true, "LPT3": true, "LPT4": true, "LPT5": true, "LPT6": true, "LPT7": true, "LPT8": true, "LPT9": true}
-
 // checkPlatformName refuses device names, alternate data streams and names Windows
 // silently rewrites (a trailing dot or space).
 func checkPlatformName(c string) error {
-	base := strings.ToUpper(strings.SplitN(c, ".", 2)[0])
-	if reserved[base] || strings.ContainsAny(c, `:*?"<>|`) || strings.HasSuffix(c, ".") || strings.HasSuffix(c, " ") {
+	if windowsUnsafeName(c) {
 		return ErrEscape
 	}
 	return nil

@@ -21,3 +21,11 @@
 | G5-9d | briefing `fits` `<=` becomes `<= cap+1` | RED as predicted (`one byte under the exact cap 329: item shown=true`) |
 | G5-10a | `Takeover` no longer takes the publishing lock (now a handshake test, not a 300 ms sleep against a 200 ms floor) | RED as predicted (`takeover returned while the publish still held the lock`) |
 | G5-10b | the SessionStart timeout waits an extra 2 s before giving up (the two hook budget tests now scale by `WIKORY_LATENCY_SLACK`, skip the strict budget under `-race`, and wait for the abandoned work by handshake) | RED as predicted (`elapsed=902ms out=`) |
+| G5-11a | the gitx hostile-config tests (clean filter, key names, submodule, fsmonitor) now run on every platform using the test binary as the marker command; driver neutralisation dropped in `Repo.git` (`run(ctx, r.Top, nil, ...)`) | RED as predicted (`the repository's clean filter command ran`; `a driver named with '=' ran`). Found while doing this: `TestRepositoryCleanFilterIsNeverRun` SURVIVED the same fault before the fix, because its working copy differed in size so git never needed the filter; it now uses same-size content and a later mtime |
+| G5-11a2 | `core.fsmonitor=false` dropped from the git safety flags | RED as predicted (`the repository's core.fsmonitor command ran`) |
+| G5-11a3 | `--ignore-submodules=all` dropped from `status` | RED as predicted (`a filter defined in a submodule's own config ran`). Dropping `submodule.recurse`/`diff.ignoreSubmodules` from `baseConfig` SURVIVES: the `--ignore-submodules=all` flag is what stops the descent |
+| G5-11b1 | `LPT9` removed from the reserved device names | RED as predicted (`"LPT9" (a reserved device name) was accepted`) |
+| G5-11b2 | the trailing-space refusal removed | RED as predicted (`"trailing " (trailing dot or space) was accepted`) |
+| G5-11b3 | the colon dropped from the forbidden characters | RED as predicted (`"f.txt:stream" (stream or forbidden character) was accepted`) |
+| G5-11b4 | the case fold (`strings.ToUpper`) removed | RED as predicted (`"con" (a reserved device name) was accepted`) |
+| G5-11c | Windows hard-link tests (read, append, replace) added to `confine_windows_test.go`; the `NumberOfLinks > 1` check cannot be faulted from this machine | pending-ci: compiled and vetted with `GOOS=windows`, not run |
