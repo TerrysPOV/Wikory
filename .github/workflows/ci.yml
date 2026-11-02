@@ -32,7 +32,7 @@ jobs:
         if: runner.os != 'Windows'
         run: scripts/inject_selftest.sh && scripts/scrub_selftest.sh
       - name: Stage 0 spikes that need this platform
-        run: go test -tags spike -count=1 -v -run "TestFTS5Available|TestWALParallelProcesses|TestOSRoot|TestOpenat|TestRootHas|TestWindowsJunctionUnderOSRoot|TestWindowsSameFileAndOpenDirectoryRename|TestDenyHookCorpus" ./internal/spikes/
+        run: go test -tags spike -count=1 -v -run "TestFTS5Available|TestWALParallelProcesses|TestLedger|TestOSRoot|TestOpenat|TestRootHas|TestWindowsJunctionUnderOSRoot|TestWindowsSameFileAndOpenDirectoryRename|TestDenyHookCorpus" ./internal/spikes/
       - name: Build
         run: go build -o bin/ ./cmd/wikory
       - name: Hook smoke test with a real executable (Windows exec form)
