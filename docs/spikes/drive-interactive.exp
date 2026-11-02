@@ -1,0 +1,19 @@
+#!/usr/bin/expect -f
+# Usage (only through run-interactive.sh): drive-interactive.exp <scratch>/wikory-spikes
+set S [lindex $argv 0]
+set timeout 20
+log_file -noappend "$S/out/s10/screen.log"
+cd "$S/proj"
+spawn claude --model haiku --setting-sources project --settings "$S/settings.json" --strict-mcp-config --mcp-config "$S/empty-mcp.json" --plugin-dir "$S/plugin/wikoryspike"
+expect {
+  -re {(?i)trust} { puts "\nTRUST PROMPT SHOWN: stopping; record S10 items not-verifiable-here"; exit 4 }
+  -re {(?i)(for shortcuts|bypass|>)} {}
+  timeout {}
+}
+sleep 4
+send "/clear\r"
+sleep 4
+send "!echo WIKORY_BANG\r"
+sleep 4
+send "/exit\r"
+expect eof

@@ -1,0 +1,2 @@
+{ "statusLine": { "type": "command", "command": "echo WIKORY_SPIKE_STATUSLINE" },
+  "subagentStatusLine": { "type": "command", "command": "echo WIKORY_SPIKE_SUBAGENT_STATUSLINE" } }

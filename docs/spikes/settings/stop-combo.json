@@ -1,0 +1,9 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "@BIN@/spike-recorder", "args": ["record", "base"] } ] } ],
+    "Stop": [ { "hooks": [
+      { "type": "command", "command": "@BIN@/spike-recorder", "args": ["block-once", "alpha", "WIKORY_SPIKE_ALPHA: reply with the word alpha"] },
+      { "type": "command", "command": "@BIN@/spike-recorder", "args": ["block-once", "beta", "WIKORY_SPIKE_BETA: reply with the word beta"] }
+    ] } ]
+  }
+}

@@ -7,3 +7,19 @@ ruvector.db
 
 # Working notes, kept local
 docs/notes/
+
+# Scaffolding written by Codex and Serena session hooks, not part of the project
+.serena/
+SCRATCHPAD.md
+TASK-QUEUE.md
+WORKING.md
+hipocampus.config.json
+/memory/
+
+# Build outputs
+/bin/
+/dist/
+/wikory
+/wikory.exe
+agentdb.rvf
+agentdb.rvf.lock

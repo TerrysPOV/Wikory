@@ -1,0 +1,11 @@
+s11a (write) result: Saved.
+s11b (new session, read back) result: Teal.
+s11a tool calls (PreToolUse, in order):
+  Read MEMORY.md
+  Write spike-colour-teal.md
+  Write MEMORY.md
+s11b tool calls (PreToolUse, in order; --allowedTools not given in this launch):
+  Read spike-colour-teal.md
+files in redirected autoMemoryDirectory after s11a: MEMORY.md spike-colour-teal.md 
+s11a usage: {"num_turns":4,"total_cost_usd":0.00235725}
+s11b usage: {"num_turns":2,"total_cost_usd":0.0014531000000000001}

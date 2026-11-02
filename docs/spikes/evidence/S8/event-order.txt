@@ -1,0 +1,11 @@
++0.00s	SessionStart	agent_id=-	background_tasks=n/a
++3.06s	UserPromptSubmit	agent_id=-	background_tasks=n/a
++5.32s	PreToolUse	agent_id=-	background_tasks=n/a
++5.36s	PostToolUse	agent_id=-	background_tasks=n/a
++6.86s	Stop	agent_id=-	background_tasks=[{"id":"a5e2d6c1f8d5088cd","type":"subagent","status":"running","description":"Run wikoryspike probe in background","agent_type":"wikoryspike:probe-bg"}]
++7.47s	PreToolUse	agent_id=a5e2d6c1f8d5088cd	background_tasks=n/a
++7.49s	PostToolUse	agent_id=a5e2d6c1f8d5088cd	background_tasks=n/a
++9.91s	SubagentStop	agent_id=a5e2d6c1f8d5088cd	background_tasks=[{"id":"a5e2d6c1f8d5088cd","type":"subagent","status":"running","description":"Run wikoryspike probe in background","agent_type":"wikoryspike:probe-bg"}]
++9.95s	UserPromptSubmit	agent_id=-	background_tasks=n/a
++12.58s	Stop	agent_id=-	background_tasks=[]
++12.65s	SessionEnd	agent_id=-	background_tasks=n/a
