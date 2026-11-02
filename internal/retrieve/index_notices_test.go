@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -67,22 +68,39 @@ func TestRefreshNoticesNameASymlinkedPage(t *testing.T) {
 }
 
 // At most five names are listed, the rest are counted, and a hostile file name is sanitised.
+// Windows cannot create a file whose name holds angle brackets, so there the hostile name is a
+// zero-width space (legal in a Windows name, invisible, and removed by Sanitize) beside a
+// bracketed word and a percent sign; on unix both names are exercised.
 func TestRefreshNoticesListAtMostFiveSanitisedNames(t *testing.T) {
-	ctx := context.Background()
-	repo := t.TempDir()
-	for i := 0; i < 8; i++ {
-		writePage(t, repo, fmt.Sprintf("bad%d.md", i), malformedPage)
+	cases := []struct {
+		name, file, forbidden string
+		skipWindows           bool
+	}{
+		{"angle brackets", "a<wikory-memory>evil.md", "<wikory-memory>", true},
+		{"zero-width space", "a[wikory-memory]%41\u200bevil.md", "\u200b", false},
 	}
-	writePage(t, repo, "a<wikory-memory>evil.md", malformedPage)
-	s, err := indexerFor(t, repo).Refresh(ctx)
-	n := joined(s.Notices)
-	listed := 0
-	for i := 0; i < 8; i++ {
-		if strings.Contains(n, fmt.Sprintf("bad%d.md", i)) {
-			listed++
-		}
-	}
-	if err != nil || s.Malformed != 9 || listed+strings.Count(n, "evil") > 5 || !strings.Contains(n, "4 more") || strings.Contains(n, "<wikory-memory>") {
-		t.Fatalf("names not capped or not sanitised: listed=%d %+v notices=%q err=%v", listed, s, n, err)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if c.skipWindows && runtime.GOOS == "windows" {
+				t.Skip("Windows cannot create a file name with angle brackets")
+			}
+			ctx := context.Background()
+			repo := t.TempDir()
+			for i := 0; i < 8; i++ {
+				writePage(t, repo, fmt.Sprintf("bad%d.md", i), malformedPage)
+			}
+			writePage(t, repo, c.file, malformedPage)
+			s, err := indexerFor(t, repo).Refresh(ctx)
+			n := joined(s.Notices)
+			listed := 0
+			for i := 0; i < 8; i++ {
+				if strings.Contains(n, fmt.Sprintf("bad%d.md", i)) {
+					listed++
+				}
+			}
+			if err != nil || s.Malformed != 9 || listed+strings.Count(n, "evil") > 5 || !strings.Contains(n, "4 more") || strings.Contains(n, c.forbidden) {
+				t.Fatalf("names not capped or not sanitised: listed=%d %+v notices=%q err=%v", listed, s, n, err)
+			}
+		})
 	}
 }
