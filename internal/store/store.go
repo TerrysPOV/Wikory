@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -304,6 +305,20 @@ func openDB(ctx context.Context, path, lockPath string) (*sql.DB, error) {
 		return nil
 	}
 	if !missingVersion && v == strconv.Itoa(SchemaVersion) {
+		complete, cerr := schemaComplete(ctx, db)
+		if cerr != nil {
+			db.Close()
+			return nil, cerr
+		}
+		if !complete {
+			// A table or index is missing from a database that says it is up to date: creating
+			// it writes, so it runs inside the lock like any other schema change.
+			if err := WithWriteLockAt(ctx, lockPath, applySchema); err != nil {
+				db.Close()
+				return nil, err
+			}
+			return db, nil
+		}
 		// Every statement is CREATE ... IF NOT EXISTS on an object that exists, which SQLite
 		// resolves while compiling the statement, without a write transaction. Taking the write
 		// lock here would only make every open wait behind another process's write, so a store
@@ -320,6 +335,36 @@ func openDB(ctx context.Context, path, lockPath string) (*sql.DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+// schemaObjectRe finds the object each schema statement creates.
+var schemaObjectRe = regexp.MustCompile(`(?i)CREATE (?:VIRTUAL )?(?:TABLE|INDEX) IF NOT EXISTS (\w+)`)
+
+// schemaComplete reports whether every table and index the schema statements create is
+// already in the database, so that running them changes nothing.
+func schemaComplete(ctx context.Context, db *sql.DB) (bool, error) {
+	rows, err := db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type IN ('table', 'index')`)
+	if err != nil {
+		return false, fmt.Errorf("store: schema: %w", err)
+	}
+	defer rows.Close()
+	have := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return false, err
+		}
+		have[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	for _, m := range schemaObjectRe.FindAllStringSubmatch(schemaSQL, -1) {
+		if !have[m[1]] {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // Close releases the database and the store root.

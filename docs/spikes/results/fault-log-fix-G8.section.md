@@ -10,3 +10,5 @@
 | G8-4a | the multi-word value may start with `=`, `~` or `>` again | RED as predicted (`a comparison was rewritten: "if password == expected_value_here"`, `=>` and `=~` too) |
 | G8-4b | the single-word value may start with `=`, `~` or `>` again | RED as predicted (`a comparison was rewritten: "password==expected_value_here"`) |
 | G8-4c | `:=` no longer an operator of the multi-word rule | RED as predicted (`an assignment survived: ... := correct horse battery staple`) |
+| G8-5a | `schemaComplete` never reports a missing object (the repair runs without the lock again) | RED as predicted (`want ErrWriteLockTimeout, got <nil>`) |
+| G8-5b | `schemaComplete` always reports incomplete (every open takes the lock) | RED as predicted (`a complete database should open while another process holds the lock`) |
