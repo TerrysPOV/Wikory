@@ -49,8 +49,10 @@ func transcriptRoots(env *Env) []string {
 	if d := env.Getenv("CLAUDE_CONFIG_DIR"); d != "" {
 		return []string{filepath.Join(d, "projects")}
 	}
-	if h := env.Getenv("HOME"); h != "" {
-		return []string{filepath.Join(h, ".claude", "projects")}
+	for _, home := range []string{"HOME", "USERPROFILE"} { // Windows usually sets only USERPROFILE
+		if h := env.Getenv(home); h != "" {
+			return []string{filepath.Join(h, ".claude", "projects")}
+		}
 	}
 	return nil
 }

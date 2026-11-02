@@ -304,9 +304,17 @@ func TestOneHugeLineOfDelimitersIsFast(t *testing.T) {
 func TestWorstAllowedPageParsesWithinTheBudget(t *testing.T) {
 	md := "# Title\n\n" + strings.Repeat("[a](", 750) + strings.Repeat("![a](", 750) +
 		strings.Repeat("*a_", 2000) + strings.Repeat("`a", 2000) + "\n"
-	start := time.Now()
-	p := ParsePage("x.md", []byte(md))
-	el := time.Since(start)
+	// Best of three: one slow run on a loaded machine is not a slow parser, but a parser that
+	// is slow every time still fails.
+	var p Page
+	el := time.Duration(1 << 62)
+	for i := 0; i < 3; i++ {
+		start := time.Now()
+		p = ParsePage("x.md", []byte(md))
+		if d := time.Since(start); d < el {
+			el = d
+		}
+	}
 	for _, f := range p.Findings {
 		if strings.Contains(f.Msg, "too complex") {
 			t.Fatalf("the allowed page was refused: %+v (size %d)", f, len(md))
