@@ -31,7 +31,7 @@ var rules = []rule{
 	// everything up to the last '@' of the token, so a '/', '+' or '@' inside it does not end
 	// the match early; a URL with a later '@' in its path or query is redacted further than
 	// necessary, which is the safe direction.
-	{"url-credentials", regexp.MustCompile(`\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/@:]+:(?P<secret>\S+)@`)},
+	{"url-credentials", regexp.MustCompile(`\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/@:]*:(?P<secret>\S+)@`)},
 	// Authorization: Basic <base64>. The header name is required so that the word "basic"
 	// in prose is left alone.
 	{"basic-auth", regexp.MustCompile(`(?i)\bauthori` + `zation\s*[:=]\s*basic\s+(?P<secret>[A-Za-z0-9+/_-]{8,}={0,2})`)},
@@ -43,9 +43,11 @@ var rules = []rule{
 	// 200 characters, because a passphrase is several short words ("correct horse battery").
 	// The key tail must not be plain letters, so prose such as "Passwords: never reuse them."
 	// is left alone. Second rule: any key tail, a quoted value or one unquoted word of 8 or more.
-	// A value already replaced is not replaced or counted again.
-	{"assignment", regexp.MustCompile(`(?i)` + keywords + `(?:[_-][A-Za-z0-9_-]*)?["']?\s*[:=]\s*(?P<secret>[^\s"'][^\n]{7,199})`)},
-	{"assignment", regexp.MustCompile(`(?i)` + keywords + `[A-Za-z0-9_-]*["']?\s*[:=]\s*(?P<secret>"[^"\n]{8,}"|'[^'\n]{8,}'|["']?[^\s"']{8,}["']?)`)},
+	// A value already replaced is not replaced or counted again. The operator is ":", "=" or
+	// ":=", and the value may not start with "=", "~" or ">", so "==", "=>" and "=~" in code
+	// are comparisons and not assignments ("!=", "<=" and ">=" never reach the operator).
+	{"assignment", regexp.MustCompile(`(?i)` + keywords + `(?:[_-][A-Za-z0-9_-]*)?["']?\s*(?::=|[:=])\s*(?P<secret>[^\s"'=~>][^\n]{7,199})`)},
+	{"assignment", regexp.MustCompile(`(?i)` + keywords + `[A-Za-z0-9_-]*["']?\s*(?::=|[:=])\s*(?P<secret>"[^"\n]{8,}"|'[^'\n]{8,}'|["']?[^\s"'=~>][^\s"']{7,}["']?)`)},
 }
 
 // markerRe matches a value that is exactly one redaction marker. Markers in the input are

@@ -130,6 +130,41 @@ func TestKeywordRuleLeavesProseAlone(t *testing.T) {
 	}
 }
 
+// Review M2: a connection URL with an empty username (redis://:SECRET@host) is common.
+func TestRedactsURLPasswordWithAnEmptyUsername(t *testing.T) {
+	pw := "Zq8" + "kW3mR" + "7vN2"
+	in := "cache redis://:" + pw + "@cache.internal:6379 end"
+	out, counts := String(in)
+	if strings.Contains(out, pw) || counts["url-credentials"] != 1 || !strings.Contains(out, "redis://:[REDACTED:url-credentials]@cache.internal:6379") {
+		t.Fatalf("out=%q counts=%v", out, counts)
+	}
+}
+
+// Review L2: comparison and match operators are not assignments, so ordinary code that tests
+// a keyword-named variable is not rewritten; single-character assignment forms still are.
+func TestComparisonOperatorsAreNotAssignments(t *testing.T) {
+	kw := strings.ToLower(kwPassword)
+	tk := strings.ToLower(kwToken)
+	for _, in := range []string{
+		"if " + kw + " == expected_value_here",
+		"if " + tk + " != previous_value_here",
+		"while " + kw + " <= limit_value_here",
+		"while " + kw + " >= other_value_here",
+		kw + " => some_function_name",
+		kw + " =~ regex_pattern_here",
+		kw + "==expected_value_here",
+	} {
+		if out, c := String(in); out != in || len(c) != 0 {
+			t.Errorf("a comparison was rewritten: %q -> %q %v", in, out, c)
+		}
+	}
+	for _, in := range []string{kw + " = hunter2hunter2", kw + "=hunter2hunter2", kw + ": hunter2hunter2", tk + " := hunter2hunter2", tk + " := correct horse battery staple"} {
+		if out, c := String(in); strings.Contains(out, "hunter2") || strings.Contains(out, "horse") || len(c) == 0 {
+			t.Errorf("an assignment survived: %q -> %q %v", in, out, c)
+		}
+	}
+}
+
 // A fine-grained GitHub token has its own prefix and underscores in the body; only the
 // github_pat_ alternative of the github-token rule can see it.
 func TestRedactsFineGrainedGitHubToken(t *testing.T) {
