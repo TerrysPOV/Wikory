@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // maxJudged bounds the bytes read back from a file whose content is judged (a moved-aside
@@ -321,6 +322,34 @@ func (r *Root) CreateExclusive(rel string, data []byte, perm fs.FileMode) error 
 		return lerr
 	}
 	return dir.sync()
+}
+
+// ReclaimTempLinks removes the temporary names CreateExclusive made for rel, and reports how
+// many it removed. A kill between the link and the removal leaves the finished file with a
+// second name, which opening refuses as a hard link. Only names of this package's temp shape
+// for rel go (prefix, rel's base name, a dash and 16 characters); any other extra link stays,
+// so the hard-link guard is not weakened. Callers use it after ErrHardlink on a file they
+// created themselves, so no writer of rel is still between its write and its link.
+func (r *Root) ReclaimTempLinks(rel string) (int, error) {
+	dir, name, err := r.parent(rel)
+	if err != nil {
+		return 0, err
+	}
+	defer dir.close()
+	ents, err := dir.readDir()
+	if err != nil {
+		return 0, err
+	}
+	prefix, removed := TempPrefix+name+"-", 0
+	for _, e := range ents {
+		if n := e.Name(); strings.HasPrefix(n, prefix) && len(n) == len(prefix)+16 && dir.remove(n) == nil {
+			removed++
+		}
+	}
+	if removed > 0 {
+		return removed, dir.sync()
+	}
+	return 0, nil
 }
 
 // AppendFile appends data to a regular file, creating it if needed, and fsyncs it.

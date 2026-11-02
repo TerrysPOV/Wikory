@@ -250,7 +250,15 @@ func (r *Recorder) writeVersion(rec *Record) error {
 
 func (r *Recorder) readVersion(turnID string, v int) (Record, error) {
 	var rec Record
-	data, err := r.Store.Root.ReadFile(r.versionPath(turnID, v), 1<<22)
+	path := r.versionPath(turnID, v)
+	data, err := r.Store.Root.ReadFile(path, 1<<22)
+	if errors.Is(err, confine.ErrHardlink) {
+		// A hook killed after CreateExclusive linked this version and before it dropped its
+		// temporary name leaves a second link; remove that name and read again.
+		if n, rerr := r.Store.Root.ReclaimTempLinks(path); rerr == nil && n > 0 {
+			data, err = r.Store.Root.ReadFile(path, 1<<22)
+		}
+	}
 	if err != nil {
 		return rec, err
 	}
