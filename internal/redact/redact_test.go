@@ -181,6 +181,7 @@ func TestValuesStartingWithOperatorCharactersAreRedacted(t *testing.T) {
 		kw + " = =" + tail,
 		kw + "=~" + tail + " and more words",
 		tk + "=>correct horse battery staple",
+		tk + "s=~" + tail, // a key tail of letters reaches only the single-word rule
 	} {
 		out, c := String(in)
 		if strings.Contains(out, "hunter2") || strings.Contains(out, "horse") || c["assignment"] != 1 {
