@@ -3,6 +3,7 @@ package claim
 import (
 	"errors"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -148,6 +149,11 @@ func TestRenderParseRoundTripNastyCharacters(t *testing.T) {
 // raw comma, which the parser rejects. Every percent form below must come back as itself.
 func TestParsedPercentFormsRenderBack(t *testing.T) {
 	for _, enc := range []string{"%2C", "%28", "%29", "%26", "%27", "%24", "%21", "%2A", "%5B", "%5D", "%7B", "%7D", "%5E", "%60", "%7C", "%3F", "%25", "%2525"} {
+		// These three decode to * | ? inside a path, which Windows file names cannot hold, so
+		// the grammar correctly refuses them there. The grammar is unchanged; only the test skips.
+		if runtime.GOOS == "windows" && (enc == "%2A" || enc == "%7C" || enc == "%3F") {
+			continue
+		}
 		line := "<!-- claim kind=intent status=unverified ev=docs/a" + enc + "b.md dep=docs/a" + enc + "b.md#s" + enc + " sup=s" + enc + " -->"
 		c, err := ParseComment(line)
 		if err != nil {
