@@ -42,3 +42,5 @@
 | G6-6a | the duplicate check ignores log.1.md | RED as predicted (`a job line that lives in log.1.md was appended again to log.md (1 copies)`) |
 | G6-6b | rotation attempted even though log.1.md is not a regular file | RED as predicted (`a blocked rotation failed the publish: err=renameat log.md log.1.md: is a directory`) |
 | G6-6c | the refusal is not reported as a notice | RED as predicted (`no notice that the log could not be rotated`). `Publisher.Notices` is new; the app does not print it yet (the app's publisher construction is outside this wave's files), so today the notice is available to callers and tests only |
+| G6-5f | the already-redacted skip goes back to a prefix test (`value starts with [REDACTED:`) | RED as predicted (`the real value survived behind a forged marker`). The multi-word rule no longer excludes a leading `[`, and a bounded remainder glued to a marker is now absorbed by the single-word rule, so the bound test separates its tail with spaces |
+| G6-5g | the already-redacted skip disabled entirely (G6-5d re-run against the exact-marker version) | RED as predicted (`counts=map[assignment:2]`) |

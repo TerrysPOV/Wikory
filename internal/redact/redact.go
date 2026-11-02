@@ -2,10 +2,7 @@
 // store (spec 10.2, layer 1). It is a floor, not a guarantee.
 package redact
 
-import (
-	"regexp"
-	"strings"
-)
+import "regexp"
 
 // A rule with a named group "secret" replaces only that span and keeps the rest of the
 // match (the key, the separator, the URL host); a rule without one replaces the whole match.
@@ -44,9 +41,13 @@ var rules = []rule{
 	// The key tail must not be plain letters, so prose such as "Passwords: never reuse them."
 	// is left alone. Second rule: any key tail, a quoted value or one unquoted word of 8 or more.
 	// A value already replaced is not replaced or counted again.
-	{"assignment", regexp.MustCompile(`(?i)` + keywords + `(?:[_-][A-Za-z0-9_-]*)?["']?\s*[:=]\s*(?P<secret>[^\s"'\[][^\n]{7,199})`)},
+	{"assignment", regexp.MustCompile(`(?i)` + keywords + `(?:[_-][A-Za-z0-9_-]*)?["']?\s*[:=]\s*(?P<secret>[^\s"'][^\n]{7,199})`)},
 	{"assignment", regexp.MustCompile(`(?i)` + keywords + `[A-Za-z0-9_-]*["']?\s*[:=]\s*(?P<secret>"[^"\n]{8,}"|'[^'\n]{8,}'|["']?[^\s"']{8,}["']?)`)},
 }
+
+// markerRe matches a value that is exactly one redaction marker. A value that only starts
+// with one is attacker-controlled text and is redacted whole.
+var markerRe = regexp.MustCompile(`^\[REDACTED:[a-z0-9-]+\]$`)
 
 // String redacts s and returns counts of what was replaced, by kind.
 func String(s string) (string, map[string]int) {
@@ -64,8 +65,8 @@ func String(s string) (string, map[string]int) {
 			if loc == nil || loc[2*secret] < 0 {
 				return mark
 			}
-			if strings.HasPrefix(m[loc[2*secret]:], "[REDACTED:") {
-				n-- // an earlier rule already replaced this value
+			if markerRe.MatchString(m[loc[2*secret]:loc[2*secret+1]]) {
+				n-- // an earlier rule already replaced this whole value
 				return m
 			}
 			return m[:loc[2*secret]] + mark + m[loc[2*secret+1]:]

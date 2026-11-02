@@ -176,6 +176,32 @@ func TestRedactsURLPasswordsContainingSlashPlusAndAt(t *testing.T) {
 	}
 }
 
+// A value that merely starts with a redaction marker is attacker-controlled text, not an
+// already-redacted value: only a value that is exactly one marker is left alone.
+func TestOnlyAWholeMarkerCountsAsAlreadyRedacted(t *testing.T) {
+	kw := strings.ToLower(kwPassword)
+	tail := "real" + "secret" + "value123"
+	for _, in := range []string{
+		kw + "=[REDACTED:x]" + tail,
+		kw + ": [REDACTED:x]" + tail,
+		kw + ": [REDACTED:x] " + tail + " more words",
+		strings.ToUpper(kw) + "_X=[REDACTED:api-key]" + tail,
+	} {
+		out, counts := String(in)
+		if strings.Contains(out, tail) {
+			t.Errorf("the real value survived behind a forged marker: %q -> %q", in, out)
+		}
+		if counts["assignment"] != 1 {
+			t.Errorf("%q: counts %v", in, counts)
+		}
+	}
+	// A genuinely redacted value stays one marker and is not counted twice.
+	in := kw + ": " + "[REDACTED:api-key]"
+	if out, counts := String(in); out != in || counts["assignment"] != 0 {
+		t.Errorf("an already-redacted value was rewritten or recounted: %q %v", out, counts)
+	}
+}
+
 // Review L4: only the first word of an unquoted value used to be tested against the eight
 // character minimum, so a passphrase of short words was left in the text.
 func TestRedactsMultiWordUnquotedValues(t *testing.T) {
@@ -198,8 +224,8 @@ func TestRedactsMultiWordUnquotedValues(t *testing.T) {
 		}
 	}
 	// The redaction is bounded: past 200 characters the line is left alone.
-	long := kw + ": " + strings.Repeat("w", 199) + " " + strings.Repeat("TAIL", 20)
-	if out, _ := String(long); !strings.Contains(out, "TAILTAIL") || !strings.Contains(out, "[REDACTED:assignment]") {
+	long := kw + ": " + strings.Repeat("w", 199) + "  " + strings.Repeat("TAIL ", 20)
+	if out, _ := String(long); !strings.Contains(out, "TAIL TAIL") || !strings.Contains(out, "[REDACTED:assignment]") {
 		t.Errorf("unbounded or missed: %q", out)
 	}
 }
