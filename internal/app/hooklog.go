@@ -53,23 +53,12 @@ func logHookError(env *Env, kind string) {
 // grown past hookLogMax. It is best effort: a hook that loses the race to another loses at most
 // a few lines, and a log that cannot be trimmed is left alone.
 func trimHookLog(path string) {
-	rf, err := openHookLogRead(path)
-	if err != nil {
+	// The read handle is closed before the rename: Windows refuses to replace a file that
+	// any handle still has open (Go opens without FILE_SHARE_DELETE), so a deferred Close
+	// held across the rename would leave the log uncapped there while unix passed.
+	keep, ok := newestHookLogLines(path)
+	if !ok {
 		return
-	}
-	defer rf.Close()
-	fi, err := rf.Stat()
-	if err != nil || fi.Size() <= hookLogMax {
-		return
-	}
-	buf := make([]byte, hookLogKeep)
-	n, err := rf.ReadAt(buf, fi.Size()-hookLogKeep)
-	if err != nil && err != io.EOF {
-		return
-	}
-	buf = buf[:n]
-	if i := bytes.IndexByte(buf, '\n'); i >= 0 {
-		buf = buf[i+1:]
 	}
 	tmp := path + ".trim"
 	_ = os.Remove(tmp)
@@ -77,11 +66,35 @@ func trimHookLog(path string) {
 	if err != nil {
 		return
 	}
-	_, werr := out.Write(buf)
+	_, werr := out.Write(keep)
 	cerr := out.Close()
 	if werr != nil || cerr != nil || os.Rename(tmp, path) != nil {
 		_ = os.Remove(tmp)
 	}
+}
+
+// newestHookLogLines returns the newest hookLogKeep bytes of the log, from a line boundary,
+// when the log has grown past hookLogMax. Its read handle is closed on return.
+func newestHookLogLines(path string) ([]byte, bool) {
+	rf, err := openHookLogRead(path)
+	if err != nil {
+		return nil, false
+	}
+	defer rf.Close()
+	fi, err := rf.Stat()
+	if err != nil || fi.Size() <= hookLogMax {
+		return nil, false
+	}
+	buf := make([]byte, hookLogKeep)
+	n, err := rf.ReadAt(buf, fi.Size()-hookLogKeep)
+	if err != nil && err != io.EOF {
+		return nil, false
+	}
+	buf = buf[:n]
+	if i := bytes.IndexByte(buf, '\n'); i >= 0 {
+		buf = buf[i+1:]
+	}
+	return buf, true
 }
 
 // hookLogReport is what doctor and the briefing know about the hook error log.
