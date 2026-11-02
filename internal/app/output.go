@@ -26,10 +26,12 @@ type ErrBody struct {
 
 func schemaFor(cmd string) string { return "wikory." + cmd + "/" + SchemaVersion }
 
-func writeEnvelope(w io.Writer, e Envelope) {
+// writeEnvelope writes e to w and returns the write error, if any. The caller decides what a
+// lost answer means; it is never allowed to change the command's exit code.
+func writeEnvelope(w io.Writer, e Envelope) error {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
-	_ = enc.Encode(e)
+	return enc.Encode(e)
 }
 
 func writeNotices(w io.Writer, notices []string) {

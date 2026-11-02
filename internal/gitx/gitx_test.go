@@ -270,3 +270,19 @@ func TestDiscoverRefusesCorruptConfig(t *testing.T) {
 		t.Fatalf("a corrupt config must give an error and no Repo, got %+v %v", r, err)
 	}
 }
+
+// GIT_OPTIONAL_LOCKS=0 is set in the environment of every git call whatever the caller's own
+// environment says (a status that takes the index lock can race the user's own git command),
+// and each name appears once.
+func TestGitEnvDisablesOptionalLocks(t *testing.T) {
+	t.Setenv("GIT_OPTIONAL_LOCKS", "1")
+	var values []string
+	for _, kv := range gitEnv(nil) {
+		if strings.HasPrefix(kv, "GIT_OPTIONAL_LOCKS=") {
+			values = append(values, kv)
+		}
+	}
+	if len(values) != 1 || values[0] != "GIT_OPTIONAL_LOCKS=0" {
+		t.Fatalf("GIT_OPTIONAL_LOCKS entries: %v, want exactly GIT_OPTIONAL_LOCKS=0", values)
+	}
+}

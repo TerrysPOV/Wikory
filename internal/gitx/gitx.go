@@ -23,6 +23,9 @@ var (
 	// directory nor one of its ancestors, as core.worktree in the repository's config can
 	// make it. Wikory writes inside the work tree, so it refuses to follow the redirection.
 	ErrWorktreeRedirected = errors.New("gitx: the repository config redirects its work tree outside the current directory")
+	// ErrUnsafeExclude means the repository's info/exclude is not a regular file (a FIFO or a
+	// device, or a link to one). git opens it on every status and would block on it for ever.
+	ErrUnsafeExclude = errors.New("gitx: info/exclude is not a regular file; git status would block on it")
 )
 
 var shaRe = regexp.MustCompile(`^[0-9a-f]{4,64}$`)
@@ -46,7 +49,7 @@ type Repo struct {
 // never widens safe.directory. Comparing like with like through the repository's clean
 // filters is deferred to the engine specification (spec 14.6): blobs are hashed raw.
 var safety = []string{"-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "core.hooksPath=" + os.DevNull,
-	"-c", "core.attributesFile=" + os.DevNull, "-c", "diff.external=", "--no-optional-locks", "--literal-pathspecs"}
+	"-c", "core.attributesFile=" + os.DevNull, "-c", "core.excludesFile=", "-c", "diff.external=", "--no-optional-locks", "--literal-pathspecs"}
 
 // baseConfig is applied to every invocation, after any environment config is cleared. It
 // keeps git from walking into submodules, which have config and attributes of their own that
@@ -61,7 +64,8 @@ func gitEnv(extra [][2]string) []string {
 	env := make([]string, 0, len(os.Environ())+2*len(all)+5)
 	for _, kv := range os.Environ() {
 		up := strings.ToUpper(kv)
-		if strings.HasPrefix(up, "GIT_CONFIG_COUNT=") || strings.HasPrefix(up, "GIT_CONFIG_KEY_") || strings.HasPrefix(up, "GIT_CONFIG_VALUE_") {
+		if strings.HasPrefix(up, "GIT_CONFIG_COUNT=") || strings.HasPrefix(up, "GIT_CONFIG_KEY_") || strings.HasPrefix(up, "GIT_CONFIG_VALUE_") ||
+			strings.HasPrefix(up, "GIT_OPTIONAL_LOCKS=") {
 			continue
 		}
 		env = append(env, kv)
@@ -70,7 +74,7 @@ func gitEnv(extra [][2]string) []string {
 	for i, o := range all {
 		env = append(env, "GIT_CONFIG_KEY_"+strconv.Itoa(i)+"="+o[0], "GIT_CONFIG_VALUE_"+strconv.Itoa(i)+"="+o[1])
 	}
-	return append(env, "GIT_TERMINAL_PROMPT=0", "LC_ALL=C", "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1")
+	return append(env, "GIT_TERMINAL_PROMPT=0", "LC_ALL=C", "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0")
 }
 
 var driverRe = regexp.MustCompile(`^(filter|diff)\.(.+)\.(clean|smudge|process|required|textconv|command)$`)
@@ -381,6 +385,9 @@ func (r *Repo) OriginURL(ctx context.Context) string {
 
 // Dirty lists changed and untracked paths under pathspec, repository-relative.
 func (r *Repo) Dirty(ctx context.Context, pathspec string) ([]string, error) {
+	if err := r.checkExcludeFile(); err != nil {
+		return nil, err
+	}
 	out, err := r.git(ctx, nil, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all", "--", pathspec)
 	if err != nil {
 		return nil, err
@@ -398,4 +405,19 @@ func (r *Repo) Dirty(ctx context.Context, pathspec string) ([]string, error) {
 		}
 	}
 	return paths, nil
+}
+
+// checkExcludeFile refuses a repository whose info/exclude is not a regular file. git reads
+// that file on every status and no option skips it, so a FIFO there would block git (and its
+// caller) for ever. core.excludesFile, which can name the same trap, is overridden with an
+// empty value in safety instead. A missing file is normal. The check follows links, as git does.
+func (r *Repo) checkExcludeFile() error {
+	fi, err := os.Stat(filepath.Join(r.CommonDir, "info", "exclude"))
+	if err != nil {
+		return nil // absent or unreadable: git reports its own error for the latter
+	}
+	if !fi.Mode().IsRegular() {
+		return ErrUnsafeExclude
+	}
+	return nil
 }

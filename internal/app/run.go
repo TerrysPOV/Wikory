@@ -115,6 +115,14 @@ func extractJSONFlag(args []string) ([]string, bool) {
 	return out, found
 }
 
+// logEnvelopeFailure records, as kind "output", a --json answer that could not be written (the
+// reader closed its end). The exit code is not touched: the command did what it was asked.
+func logEnvelopeFailure(env *Env, err error) {
+	if err != nil {
+		logHookError(env, "output")
+	}
+}
+
 func finish(env *Env, name string, res Result, err error) int {
 	if err != nil {
 		code, exit := "failure", ExitFailure
@@ -123,8 +131,8 @@ func finish(env *Env, name string, res Result, err error) int {
 			code, exit = "usage", ExitUsage
 		}
 		if env.JSON {
-			writeEnvelope(env.IO.Out, Envelope{Schema: schemaFor(name), OK: false,
-				Error: &ErrBody{Code: code, Message: err.Error()}, Notices: res.Notices})
+			logEnvelopeFailure(env, writeEnvelope(env.IO.Out, Envelope{Schema: schemaFor(name), OK: false,
+				Error: &ErrBody{Code: code, Message: err.Error()}, Notices: res.Notices}))
 		} else {
 			writeNotices(env.IO.Err, res.Notices)
 			fmt.Fprintf(env.IO.Err, "wikory %s: %v\n", name, err)
@@ -132,7 +140,7 @@ func finish(env *Env, name string, res Result, err error) int {
 		return exit
 	}
 	if env.JSON {
-		writeEnvelope(env.IO.Out, Envelope{Schema: schemaFor(name), OK: true, Data: res.Data, Notices: res.Notices})
+		logEnvelopeFailure(env, writeEnvelope(env.IO.Out, Envelope{Schema: schemaFor(name), OK: true, Data: res.Data, Notices: res.Notices}))
 		return ExitOK
 	}
 	writeNotices(env.IO.Err, res.Notices)
