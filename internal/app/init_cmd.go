@@ -132,6 +132,13 @@ func runInit(ctx context.Context, env *Env, args []string) (Result, error) {
 		notices = append(notices, "project-memory/ already existed, so this checkout is registered but not trusted yet; "+
 			"the committed wiki is withheld until trust is granted (the wikory trust command arrives in a later version)")
 	}
+	p := &project{Repo: repo, RepoRoot: root, Config: cfg, Identity: id, Store: st, Checkout: co, Registered: true, Trusted: trusted}
+	pub := p.publisher()
+	// Finish an interrupted earlier init first: the operations below are built from what is on
+	// disk, so building them before recovery would make them stale once recovery applies files.
+	if _, err := pub.Recover(ctx); err != nil {
+		return Result{}, err
+	}
 	want := []struct {
 		path    string
 		content []byte
@@ -155,11 +162,6 @@ func runInit(ctx context.Context, env *Env, args []string) (Result, error) {
 		case w.path == gitattributesPath && string(existing) != gitattributesContent:
 			notices = append(notices, "project-memory/.gitattributes differs from Wikory's; it needs: "+strings.TrimSpace(strings.ReplaceAll(gitattributesContent, "\n", "; ")))
 		}
-	}
-	p := &project{Repo: repo, RepoRoot: root, Config: cfg, Identity: id, Store: st, Checkout: co, Registered: true, Trusted: trusted}
-	pub := p.publisher()
-	if _, err := pub.Recover(ctx); err != nil {
-		return Result{}, err
 	}
 	if len(ops) > 0 {
 		job, err := pub.Begin(ctx, "init")
