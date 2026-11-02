@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -47,6 +48,16 @@ func logHookError(env *Env, kind string) {
 	}
 	defer f.Close()
 	fmt.Fprintf(f, "%s %s\n", time.Now().UTC().Format(time.RFC3339), kind)
+}
+
+// logHookFailure logs a failed hook step under kind, or under "dblock" when the step failed
+// because another process held the database write lock for the whole wait. That is not a
+// fault of the step, so doctor and the briefing can tell it from one.
+func logHookFailure(env *Env, kind string, err error) {
+	if errors.Is(err, store.ErrWriteLockTimeout) {
+		kind = "dblock"
+	}
+	logHookError(env, kind)
 }
 
 // trimHookLog keeps the newest hookLogKeep bytes (from a line boundary) of a log that has

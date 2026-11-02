@@ -26,8 +26,11 @@ func CheckoutID(commonDir, worktree, cloneID string) string {
 // Register records the checkout and its common directory. Callers decide trust first.
 func (s *Store) Register(ctx context.Context, id Identity) (Checkout, error) {
 	c := Checkout{ID: CheckoutID(id.CommonDir, id.Worktree, id.CloneID), CommonDir: id.CommonDir, Worktree: id.Worktree}
-	if _, err := s.DB.ExecContext(ctx, `INSERT INTO checkouts(id, common_dir, worktree, registered_at) VALUES(?, ?, ?, ?)
-		ON CONFLICT(id) DO NOTHING`, c.ID, c.CommonDir, c.Worktree, now()); err != nil {
+	if err := s.WithWriteLock(ctx, func(ctx context.Context) error {
+		_, err := s.DB.ExecContext(ctx, `INSERT INTO checkouts(id, common_dir, worktree, registered_at) VALUES(?, ?, ?, ?)
+		ON CONFLICT(id) DO NOTHING`, c.ID, c.CommonDir, c.Worktree, now())
+		return err
+	}); err != nil {
 		return Checkout{}, err
 	}
 	var ownErr error

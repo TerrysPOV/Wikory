@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/fs"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -115,6 +116,17 @@ func jobDir(id string) string { return "jobs/" + id }
 
 func (p *Publisher) lock() (func(), error) { return store.Lock(p.LockPath, 10*time.Second) }
 
+// writeLockPath is the store's database write lock, which sits beside publish.lock in the
+// store's locks directory.
+func (p *Publisher) writeLockPath() string { return store.WriteLockPath(filepath.Dir(p.LockPath)) }
+
+// dbWrite runs one database write transaction inside the cross-process database write lock.
+// Lock order: publish.lock (taken by Publish and Takeover, when they run) comes first and
+// db-write.lock last, and only the write transaction itself is inside the latter.
+func (p *Publisher) dbWrite(ctx context.Context, fn func(ctx context.Context) error) error {
+	return store.WithWriteLockAt(ctx, p.writeLockPath(), fn)
+}
+
 // check reports a Publisher that lacks a field it needs, so a zero value fails with a clear
 // error instead of a nil-function panic (or, for AbandonAfter 0, by abandoning live jobs).
 // It runs lazily at each entry point, so struct literals that set every field keep working.
@@ -150,8 +162,12 @@ func (p *Publisher) Begin(ctx context.Context, kind string) (Job, error) {
 		return Job{}, err
 	}
 	j := Job{ID: ids.JobID(), CheckoutID: p.CheckoutID, Kind: kind, Fingerprint: fp, Epoch: 1}
-	_, err = p.DB.ExecContext(ctx, `INSERT INTO jobs(job_id, checkout_id, kind, state, epoch, fingerprint, created_at, updated_at)
-		VALUES(?, ?, ?, 'begun', 1, ?, ?, ?)`, j.ID, j.CheckoutID, kind, fp, p.now(), p.now())
+	created, updated := p.now(), p.now()
+	err = p.dbWrite(ctx, func(ctx context.Context) error {
+		_, err := p.DB.ExecContext(ctx, `INSERT INTO jobs(job_id, checkout_id, kind, state, epoch, fingerprint, created_at, updated_at)
+		VALUES(?, ?, ?, 'begun', 1, ?, ?, ?)`, j.ID, j.CheckoutID, kind, fp, created, updated)
+		return err
+	})
 	return j, err
 }
 
@@ -170,11 +186,18 @@ func (p *Publisher) Takeover(ctx context.Context, jobID string) (Job, error) {
 }
 
 func (p *Publisher) takeoverLocked(ctx context.Context, jobID string) (Job, error) {
-	res, err := p.DB.ExecContext(ctx, `UPDATE jobs SET epoch = epoch + 1, updated_at = ? WHERE job_id = ? AND checkout_id = ? AND state IN ('begun','applying')`, p.now(), jobID, p.CheckoutID)
-	if err != nil {
+	var affected int64
+	if err := p.dbWrite(ctx, func(ctx context.Context) error {
+		res, err := p.DB.ExecContext(ctx, `UPDATE jobs SET epoch = epoch + 1, updated_at = ? WHERE job_id = ? AND checkout_id = ? AND state IN ('begun','applying')`, p.now(), jobID, p.CheckoutID)
+		if err != nil {
+			return err
+		}
+		affected, _ = res.RowsAffected()
+		return nil
+	}); err != nil {
 		return Job{}, err
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
+	if affected != 1 {
 		var owner string
 		if qerr := p.DB.QueryRowContext(ctx, `SELECT checkout_id FROM jobs WHERE job_id = ?`, jobID).Scan(&owner); qerr == nil && owner != p.CheckoutID {
 			return Job{}, ErrWrongCheckout // never fence another checkout's job
@@ -182,7 +205,7 @@ func (p *Publisher) takeoverLocked(ctx context.Context, jobID string) (Job, erro
 		return Job{}, ErrJobState
 	}
 	var j Job
-	err = p.DB.QueryRowContext(ctx, `SELECT job_id, checkout_id, kind, fingerprint, epoch FROM jobs WHERE job_id = ?`, jobID).
+	err := p.DB.QueryRowContext(ctx, `SELECT job_id, checkout_id, kind, fingerprint, epoch FROM jobs WHERE job_id = ?`, jobID).
 		Scan(&j.ID, &j.CheckoutID, &j.Kind, &j.Fingerprint, &j.Epoch)
 	return j, err
 }
@@ -208,8 +231,10 @@ func (p *Publisher) fence(ctx context.Context, jobID string, epoch int64) error 
 }
 
 func (p *Publisher) setJob(ctx context.Context, id, state, detail string) error {
-	_, err := p.DB.ExecContext(ctx, `UPDATE jobs SET state = ?, detail = ?, updated_at = ? WHERE job_id = ?`, state, detail, p.now(), id)
-	return err
+	return p.dbWrite(ctx, func(ctx context.Context) error {
+		_, err := p.DB.ExecContext(ctx, `UPDATE jobs SET state = ?, detail = ?, updated_at = ? WHERE job_id = ?`, state, detail, p.now(), id)
+		return err
+	})
 }
 
 // currentHash is the target's content hash, Absent when missing. A symlink or other
@@ -336,6 +361,11 @@ func fencedOneRow(res sql.Result) error {
 
 // recordOps marks the job applying and records each operation as pending, in one transaction.
 func (p *Publisher) recordOps(ctx context.Context, m *manifest) error {
+	return p.dbWrite(ctx, func(ctx context.Context) error { return p.recordOpsTx(ctx, m) })
+}
+
+// recordOpsTx is the transaction of recordOps. The caller holds the database write lock.
+func (p *Publisher) recordOpsTx(ctx context.Context, m *manifest) error {
 	tx, err := p.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -367,12 +397,25 @@ func (p *Publisher) writeManifest(m *manifest) error {
 
 // markDone records an applied operation in the database, fenced by the epoch.
 func (p *Publisher) markDone(ctx context.Context, m *manifest, i int) error {
-	res, err := p.DB.ExecContext(ctx, `UPDATE job_ops SET state = 'done' WHERE job_id = ? AND idx = ?
+	return p.dbWrite(ctx, func(ctx context.Context) error {
+		res, err := p.DB.ExecContext(ctx, `UPDATE job_ops SET state = 'done' WHERE job_id = ? AND idx = ?
 		AND EXISTS (SELECT 1 FROM jobs WHERE job_id = ? AND epoch = ? AND state = 'applying')`, m.JobID, i, m.JobID, m.Epoch)
-	if err != nil {
-		return err
-	}
-	return fencedOneRow(res)
+		if err != nil {
+			return err
+		}
+		return fencedOneRow(res)
+	})
+}
+
+// finishJob marks the job done, fenced by the epoch.
+func (p *Publisher) finishJob(ctx context.Context, m *manifest) error {
+	return p.dbWrite(ctx, func(ctx context.Context) error {
+		res, err := p.DB.ExecContext(ctx, `UPDATE jobs SET state = 'done', updated_at = ? WHERE job_id = ? AND epoch = ? AND state = 'applying'`, p.now(), m.JobID, m.Epoch)
+		if err != nil {
+			return err
+		}
+		return fencedOneRow(res)
+	})
 }
 
 // apply runs steps 3 to 5 from whatever state the manifest records. Recovery calls it too.
@@ -447,11 +490,7 @@ func (p *Publisher) apply(ctx context.Context, m *manifest) error {
 		}
 	}
 	killHook("logged")
-	res, err := p.DB.ExecContext(ctx, `UPDATE jobs SET state = 'done', updated_at = ? WHERE job_id = ? AND epoch = ? AND state = 'applying'`, p.now(), m.JobID, m.Epoch)
-	if err != nil {
-		return err
-	}
-	if err := fencedOneRow(res); err != nil {
+	if err := p.finishJob(ctx, m); err != nil {
 		return err
 	}
 	killHook("committed")

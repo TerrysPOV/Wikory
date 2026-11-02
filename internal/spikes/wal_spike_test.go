@@ -3,6 +3,7 @@
 package spikes
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -31,16 +32,62 @@ type walVariant struct {
 	name    string
 	journal string // journal_mode pragma value
 	lock    bool   // each child takes the store Lock around every write transaction
+	prod    bool   // each child writes through a real store.Store and store.WithWriteLock (the production path)
 	gate    bool   // a failure of this variant fails the test on every platform
 }
 
 var walVariants = []walVariant{
-	{name: "wal", journal: "WAL"},                              // the original measurement: reported, never fails the test
-	{name: "wal+lock", journal: "WAL", lock: true, gate: true}, // the mitigation: the store lock serialises writers
-	{name: "delete", journal: "DELETE"},                        // the alternative: rollback journal, no WAL
+	{name: "wal", journal: "WAL"},                                             // the original measurement: reported, never fails the test
+	{name: "wal+lock", journal: "WAL", lock: true, gate: true},                // the mitigation: the store lock serialises writers
+	{name: "wal+store.WithWriteLock", journal: "WAL", prod: true, gate: true}, // the production helper itself, on a real store
+	{name: "delete", journal: "DELETE"},                                       // the alternative: rollback journal, no WAL
+}
+
+// storeIdentity is the project the production-path variant opens in every process.
+var storeIdentity = store.Identity{ProjectID: "wkp_SPIKE", Origin: "github.com/o/spike", CommonDir: "/spike/.git", Worktree: "/spike"}
+
+// walChildStore is walChild for the production path: its own store.Store, and every write
+// transaction inside store.WithWriteLock, exactly as capture, publish and the indexer do it.
+func walChildStore() int {
+	ctx := context.Background()
+	s, err := store.Resolve(ctx, os.Getenv("WIKORY_SPIKE_DATA"), storeIdentity, false)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "resolve:", err)
+		return 1
+	}
+	defer s.Close()
+	id := os.Getenv("WIKORY_SPIKE_CHILD")
+	var lat []time.Duration
+	locks := 0
+	for i := 0; i < walRowsPerChild; i++ {
+		start := time.Now()
+		err := s.WithWriteLock(ctx, func(ctx context.Context) error {
+			locks++
+			tx, err := s.DB.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			if _, err := tx.ExecContext(ctx, `INSERT INTO t(child, n) VALUES(?, ?)`, id, i); err != nil {
+				return err
+			}
+			return tx.Commit()
+		})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "write:", err)
+			return 1
+		}
+		lat = append(lat, time.Since(start))
+	}
+	sort.Slice(lat, func(a, b int) bool { return lat[a] < lat[b] })
+	fmt.Printf("p50=%d p99=%d locks=%d\n", lat[len(lat)/2].Microseconds(), lat[len(lat)*99/100].Microseconds(), locks)
+	return 0
 }
 
 func walChild() int {
+	if os.Getenv("WIKORY_SPIKE_DATA") != "" {
+		return walChildStore()
+	}
 	db, err := sql.Open("sqlite", walDSN(os.Getenv("WIKORY_SPIKE_DB"), os.Getenv("WIKORY_SPIKE_JOURNAL")))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -122,13 +169,24 @@ func TestWALParallelProcesses(t *testing.T) {
 func runWALVariant(t *testing.T, v walVariant) (failed, rows int) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "w.db")
-	lockPath := ""
+	lockPath, dataDir := "", ""
 	if v.lock {
 		lockPath = filepath.Join(dir, "w.lock")
 	}
-	db, err := sql.Open("sqlite", walDSN(path, v.journal))
-	if err != nil {
-		t.Fatal(err)
+	var db *sql.DB
+	if v.prod {
+		dataDir = filepath.Join(dir, "data")
+		s, err := store.Resolve(context.Background(), dataDir, storeIdentity, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { s.Close() })
+		db = s.DB
+	} else {
+		var err error
+		if db, err = sql.Open("sqlite", walDSN(path, v.journal)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := db.Exec(`CREATE TABLE t(child TEXT NOT NULL, n INTEGER NOT NULL)`); err != nil {
 		t.Fatal(err)
@@ -149,7 +207,7 @@ func runWALVariant(t *testing.T, v walVariant) (failed, rows int) {
 	for i := range cmds {
 		c := exec.Command(exe, "-test.run=^$")
 		c.Env = append(os.Environ(), "WIKORY_SPIKE_ROLE=wal-child", "WIKORY_SPIKE_DB="+path, "WIKORY_SPIKE_CHILD="+strconv.Itoa(i),
-			"WIKORY_SPIKE_JOURNAL="+v.journal, "WIKORY_SPIKE_LOCK="+lockPath)
+			"WIKORY_SPIKE_JOURNAL="+v.journal, "WIKORY_SPIKE_LOCK="+lockPath, "WIKORY_SPIKE_DATA="+dataDir)
 		outs[i] = &strings.Builder{}
 		c.Stdout, c.Stderr = outs[i], outs[i]
 		if err := c.Start(); err != nil {
@@ -164,13 +222,15 @@ func runWALVariant(t *testing.T, v walVariant) (failed, rows int) {
 			continue
 		}
 		t.Logf("child %d %s", i, strings.TrimSpace(outs[i].String()))
-		if v.lock && !strings.Contains(outs[i].String(), "locks="+strconv.Itoa(walRowsPerChild)) {
+		if (v.lock || v.prod) && !strings.Contains(outs[i].String(), "locks="+strconv.Itoa(walRowsPerChild)) {
 			t.Fatalf("variant %s: child %d did not take the lock around every transaction: %s", v.name, i, outs[i].String())
 		}
 	}
 	if err := db.QueryRow(`SELECT count(*) FROM t`).Scan(&rows); err != nil {
 		t.Fatal(err)
 	}
-	db.Close()
+	if !v.prod { // the store closes its own handle at cleanup
+		db.Close()
+	}
 	return failed, rows
 }

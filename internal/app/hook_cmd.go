@@ -220,7 +220,7 @@ func sessionStartBriefing(ctx context.Context, env *Env, ev decode.Event, deadli
 	if err != nil {
 		// Registration and trust cannot be confirmed without the store, so this is status only:
 		// no repository file is read into the session (it may belong to a hostile checkout).
-		logHookError(env, "open")
+		logHookFailure(env, "open", err)
 		return degradedBriefing(nil, "the store could not be opened")
 	}
 	defer p.Close()
@@ -229,14 +229,14 @@ func sessionStartBriefing(ctx context.Context, env *Env, ev decode.Event, deadli
 	}
 	rec := newRecorder(p, env)
 	if err := rec.SweepStale(ctx, ev.SessionID); err != nil {
-		logHookError(env, "sweep")
+		logHookFailure(env, "sweep", err)
 	}
 	if _, err := rec.Seal(ctx, deadline.Add(-time.Duration(float64(time.Until(deadline))*0.6))); err != nil {
-		logHookError(env, "seal")
+		logHookFailure(env, "seal", err)
 	}
 	text, err := buildBriefing(ctx, p, env, mode(), deadline)
 	if err != nil {
-		logHookError(env, "briefing")
+		logHookFailure(env, "briefing", err)
 		return degradedBriefing(p.RepoRoot, "the index could not be read")
 	}
 	return text
@@ -246,7 +246,7 @@ func userPrompt(ctx context.Context, env *Env, ev decode.Event) string {
 	p, err := openProject(ctx, env, false)
 	if err != nil {
 		if openFailureIsNews(ctx, err) {
-			logHookError(env, "open")
+			logHookFailure(env, "open", err)
 		}
 		return "skipped"
 	}
@@ -256,11 +256,11 @@ func userPrompt(ctx context.Context, env *Env, ev decode.Event) string {
 	}
 	rec := newRecorder(p, env)
 	if err := rec.TurnStart(ctx, ev); err != nil {
-		logHookError(env, "turn-start")
+		logHookFailure(env, "turn-start", err)
 		return "error"
 	}
 	if _, err := rec.Seal(ctx, time.Now().Add(100*time.Millisecond)); err != nil {
-		logHookError(env, "seal")
+		logHookFailure(env, "seal", err)
 	}
 	return "turn-start"
 }
@@ -269,7 +269,7 @@ func stopCapture(ctx context.Context, env *Env, ev decode.Event) string {
 	p, err := openProject(ctx, env, false)
 	if err != nil {
 		if openFailureIsNews(ctx, err) {
-			logHookError(env, "open")
+			logHookFailure(env, "open", err)
 		}
 		return "skipped"
 	}
@@ -278,7 +278,7 @@ func stopCapture(ctx context.Context, env *Env, ev decode.Event) string {
 		return "unregistered"
 	}
 	if _, _, err := newRecorder(p, env).Stop(ctx, ev); err != nil {
-		logHookError(env, "capture")
+		logHookFailure(env, "capture", err)
 		return "error"
 	}
 	return "captured"

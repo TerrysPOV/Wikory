@@ -23,7 +23,7 @@ func (p *project) validateEnv() validate.GitEnv {
 }
 
 func (p *project) refresh(ctx context.Context, prog *Progress) (retrieve.RefreshStats, error) {
-	ix := &retrieve.Indexer{DB: p.Store.DB, CheckoutID: p.Checkout.ID, Repo: p.RepoRoot}
+	ix := &retrieve.Indexer{DB: p.Store.DB, CheckoutID: p.Checkout.ID, Repo: p.RepoRoot, WriteLockPath: p.Store.WriteLockPath()}
 	if prog != nil {
 		first := true
 		ix.Progress = func(done, total int) {

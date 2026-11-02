@@ -116,10 +116,13 @@ func (r *Recorder) TurnStart(ctx context.Context, ev decode.Event) error {
 	}
 	req := clean(ev.Prompt, maxRequest, map[string]int{})
 	ptr, _ := r.locate(ev.TranscriptPath)
-	_, err := r.Store.DB.ExecContext(ctx, `INSERT INTO turn_starts(session_id, marker, checkout_id, transcript_path, transcript_offset, request, at)
+	size, at := r.transcriptSize(ev.TranscriptPath), r.stamp()
+	return r.Store.WithWriteLock(ctx, func(ctx context.Context) error {
+		_, err := r.Store.DB.ExecContext(ctx, `INSERT INTO turn_starts(session_id, marker, checkout_id, transcript_path, transcript_offset, request, at)
 		VALUES(?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, marker) DO NOTHING`,
-		ev.SessionID, marker, r.CheckoutID, encodePointer(ptr), r.transcriptSize(ev.TranscriptPath), req, r.stamp())
-	return err
+			ev.SessionID, marker, r.CheckoutID, encodePointer(ptr), size, req, at)
+		return err
+	})
 }
 
 // SweepStale stubs open markers of other sessions in this checkout older than StaleMarkerAfter.
@@ -254,15 +257,15 @@ func (r *Recorder) readVersion(turnID string, v int) (Record, error) {
 	return rec, json.Unmarshal(data, &rec)
 }
 
-type execer interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-}
-
-func (r *Recorder) insertRow(ctx context.Context, db execer, rec Record) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO turns(turn_id, checkout_id, session_id, marker, state, version, outcome, stub, request, created_at, updated_at)
+// insertRow inserts the turn's row, inside the database write lock.
+func (r *Recorder) insertRow(ctx context.Context, rec Record) error {
+	created, updated := r.stamp(), r.stamp()
+	return r.Store.WithWriteLock(ctx, func(ctx context.Context) error {
+		_, err := r.Store.DB.ExecContext(ctx, `INSERT INTO turns(turn_id, checkout_id, session_id, marker, state, version, outcome, stub, request, created_at, updated_at)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(turn_id) DO NOTHING`,
-		rec.TurnID, rec.CheckoutID, rec.SessionID, rec.Marker, rec.State, rec.Version, rec.Outcome, boolInt(rec.Stub), rec.Request, r.stamp(), r.stamp())
-	return err
+			rec.TurnID, rec.CheckoutID, rec.SessionID, rec.Marker, rec.State, rec.Version, rec.Outcome, boolInt(rec.Stub), rec.Request, created, updated)
+		return err
+	})
 }
 
 func boolInt(b bool) int {
@@ -285,7 +288,22 @@ func (r *Recorder) transition(ctx context.Context, turnID string, from int, next
 	if testHookBeforeTransition != nil {
 		testHookBeforeTransition(turnID)
 	}
-	tx, err := r.Store.DB.BeginTx(ctx, nil) // _txlock=immediate: the write lock is taken here
+	var (
+		published Record
+		ok        bool
+	)
+	// The whole transaction runs inside the cross-process database write lock (spec 4.5): on
+	// Windows SQLite's own locking loses writes between processes.
+	err := r.Store.WithWriteLock(ctx, func(ctx context.Context) (err error) {
+		published, ok, err = r.transitionLocked(ctx, turnID, from, next, allowed)
+		return err
+	})
+	return published, ok, err
+}
+
+// transitionLocked is the body of transition. The caller holds the database write lock.
+func (r *Recorder) transitionLocked(ctx context.Context, turnID string, from int, next Record, allowed func(state string, stub bool) bool) (Record, bool, error) {
+	tx, err := r.Store.DB.BeginTx(ctx, nil) // _txlock=immediate: the SQLite write lock is taken here
 	if err != nil {
 		return Record{}, false, err
 	}
@@ -322,7 +340,7 @@ func (r *Recorder) transition(ctx context.Context, turnID string, from int, next
 func (r *Recorder) createOrComplete(ctx context.Context, rec Record) (string, bool, error) {
 	err := r.writeVersion(&rec)
 	if err == nil {
-		return rec.TurnID, true, r.insertRow(ctx, r.Store.DB, rec)
+		return rec.TurnID, true, r.insertRow(ctx, rec)
 	}
 	if !errors.Is(err, confine.ErrExist) {
 		return "", false, err
@@ -335,7 +353,7 @@ func (r *Recorder) createOrComplete(ctx context.Context, rec Record) (string, bo
 		if err != nil {
 			return "", false, err
 		}
-		if err := r.insertRow(ctx, r.Store.DB, first); err != nil {
+		if err := r.insertRow(ctx, first); err != nil {
 			return "", false, err
 		}
 		// The repaired row may be an interrupted stub that this Stop completes: continue

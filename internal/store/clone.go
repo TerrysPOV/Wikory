@@ -22,8 +22,10 @@ func (s *Store) CloneID(ctx context.Context, commonDir string) (string, bool, er
 
 // SetCloneID records the nonce for a clone, replacing any earlier one.
 func (s *Store) SetCloneID(ctx context.Context, commonDir, id string) error {
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO meta(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, cloneNonceKey+commonDir, id)
-	return err
+	return s.WithWriteLock(ctx, func(ctx context.Context) error {
+		_, err := s.DB.ExecContext(ctx, `INSERT INTO meta(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, cloneNonceKey+commonDir, id)
+		return err
+	})
 }
 
 // HasCloneRecords reports whether the store holds a trust decision or a registered worktree
@@ -47,64 +49,78 @@ var perCheckoutTables = []string{"turn_starts", "turns", "jobs", "pages", "claim
 // "undecided", never dropped to nothing, so the next init cannot mistake the path for a new
 // clone it may trust on creation.
 func (s *Store) RebindClone(ctx context.Context, commonDir, newID string) error {
+	var old []string
+	if err := s.WithWriteLock(ctx, func(ctx context.Context) (err error) {
+		old, err = s.rebindTx(ctx, commonDir, newID)
+		return err
+	}); err != nil {
+		return err
+	}
+	// The rows are gone and the notice will say the data was discarded, so the files must go
+	// too. This is best effort and never undoes the revocation, and it is not database work,
+	// so it runs after the write lock is released.
+	s.purgeCheckoutFiles(old)
+	return nil
+}
+
+// rebindTx is the transaction of RebindClone. It returns the checkout ids it discarded. The
+// caller holds the database write lock.
+func (s *Store) rebindTx(ctx context.Context, commonDir, newID string) ([]string, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
 	rows, err := tx.QueryContext(ctx, `SELECT id FROM checkouts WHERE common_dir = ?`, commonDir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var old []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			rows.Close()
-			return err
+			return nil, err
 		}
 		old = append(old, id)
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	for _, id := range old {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM job_ops WHERE job_id IN (SELECT job_id FROM jobs WHERE checkout_id = ?)`, id); err != nil {
-			return err
+			return nil, err
 		}
 		for _, table := range perCheckoutTables {
 			if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE checkout_id = ?`, id); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM checkouts WHERE common_dir = ?`, commonDir); err != nil {
-		return err
+		return nil, err
 	}
 	var hadTrust int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM trust WHERE common_dir = ?`, commonDir).Scan(&hadTrust); err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM trust WHERE common_dir = ?`, commonDir); err != nil {
-		return err
+		return nil, err
 	}
 	if hadTrust > 0 {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO trust(common_dir, decision, reason, at) VALUES(?, ?, ?, ?)`,
 			commonDir, TrustUndecided, "clone could not be verified against the store's record", now()); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO meta(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, cloneNonceKey+commonDir, newID); err != nil {
-		return err
+		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
-		return err
+		return nil, err
 	}
-	// The rows are gone and the notice will say the data was discarded, so the files must go
-	// too. This is best effort and never undoes the revocation.
-	s.purgeCheckoutFiles(old)
-	return nil
+	return old, nil
 }

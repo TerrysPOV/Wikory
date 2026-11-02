@@ -13,6 +13,7 @@ import (
 	"github.com/TerrysPOV/Wikory/internal/claim"
 	"github.com/TerrysPOV/Wikory/internal/confine"
 	"github.com/TerrysPOV/Wikory/internal/ids"
+	"github.com/TerrysPOV/Wikory/internal/store"
 )
 
 // WikiDir is where committed pages live.
@@ -44,6 +45,10 @@ type Indexer struct {
 	MaxPages      int
 	MaxTotalBytes int64
 	MaxDepth      int
+	// WriteLockPath is the store's database write lock file (store.Store.WriteLockPath). The
+	// refresh transaction runs inside it. Empty means no cross-process lock, which only a
+	// caller with a private database (a test) may want.
+	WriteLockPath string
 }
 
 // RefreshStats reports what a refresh did. Skipped counts pages and directories that a limit
@@ -148,6 +153,14 @@ func (ix *Indexer) walk(ctx context.Context, dir string, depth int, w *walkState
 	return nil
 }
 
+// write runs fn, the refresh transaction, inside the database write lock when one is set.
+func (ix *Indexer) write(ctx context.Context, fn func(ctx context.Context) error) error {
+	if ix.WriteLockPath == "" {
+		return fn(ctx)
+	}
+	return store.WithWriteLockAt(ctx, ix.WriteLockPath, fn)
+}
+
 // Refresh makes the index match the tree.
 func (ix *Indexer) Refresh(ctx context.Context) (RefreshStats, error) {
 	var st RefreshStats
@@ -184,75 +197,80 @@ func (ix *Indexer) Refresh(ctx context.Context) (RefreshStats, error) {
 		known[r] = h
 	}
 	rows.Close()
-	tx, err := ix.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return st, err
-	}
-	defer tx.Rollback()
-	present := map[string]bool{}
-	var total int64
-	byteLimit := false
-	for i, rel := range rels {
-		if err := ctx.Err(); err != nil {
-			return st, err
-		}
-		if byteLimit {
-			present[rel] = true // not read, so not deleted either
-			st.Skipped++
-			continue
-		}
-		data, err := ix.Repo.ReadFile(rel, maxPage)
+	// The whole transaction, file reads included, runs inside the cross-process database write
+	// lock, so the index is rewritten by one process at a time on every platform.
+	err = ix.write(ctx, func(ctx context.Context) error {
+		tx, err := ix.DB.BeginTx(ctx, nil)
 		if err != nil {
-			st.Refused++ // over the page size cap, unreadable or swapped for a symlink
-			refusedN.add(rel)
-			continue
+			return err
 		}
-		present[rel] = true
-		if total+int64(len(data)) > maxBytes {
-			byteLimit = true
-			st.Skipped++
-			continue
-		}
-		total += int64(len(data))
-		st.Pages++
-		var n int
-		if known[rel] != ids.SHA256Hex(data) {
-			if n, err = ix.indexPage(ctx, tx, rel, data); err != nil {
-				return st, err
+		defer tx.Rollback()
+		present := map[string]bool{}
+		var total int64
+		byteLimit := false
+		for i, rel := range rels {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
-			st.Changed++
-		} else {
-			n = malformedClaims(claim.ParsePage(rel, data)) // unchanged pages are still disclosed
-		}
-		if n > 0 {
-			st.Malformed += n
-			malformedN.add(rel)
-		}
-		if ix.Progress != nil {
-			ix.Progress(i+1, len(rels))
-		}
-	}
-	if !w.cutShort {
-		for rel := range known {
-			if !present[rel] {
-				if err := deletePage(ctx, tx, ix.CheckoutID, rel); err != nil {
-					return st, err
+			if byteLimit {
+				present[rel] = true // not read, so not deleted either
+				st.Skipped++
+				continue
+			}
+			data, err := ix.Repo.ReadFile(rel, maxPage)
+			if err != nil {
+				st.Refused++ // over the page size cap, unreadable or swapped for a symlink
+				refusedN.add(rel)
+				continue
+			}
+			present[rel] = true
+			if total+int64(len(data)) > maxBytes {
+				byteLimit = true
+				st.Skipped++
+				continue
+			}
+			total += int64(len(data))
+			st.Pages++
+			var n int
+			if known[rel] != ids.SHA256Hex(data) {
+				if n, err = ix.indexPage(ctx, tx, rel, data); err != nil {
+					return err
 				}
-				st.Removed++
+				st.Changed++
+			} else {
+				n = malformedClaims(claim.ParsePage(rel, data)) // unchanged pages are still disclosed
+			}
+			if n > 0 {
+				st.Malformed += n
+				malformedN.add(rel)
+			}
+			if ix.Progress != nil {
+				ix.Progress(i+1, len(rels))
 			}
 		}
-	}
-	if refusedN.total > 0 {
-		st.Notices = append(st.Notices, fmt.Sprintf("%d wiki file(s) or director(ies) were not indexed, so search and the briefing cannot see them: a symlink, an unreadable file or directory, or a page over %d bytes: %s.", refusedN.total, maxPage, refusedN.describe()))
-	}
-	if st.Malformed > 0 {
-		st.Notices = append(st.Notices, fmt.Sprintf("%d claim(s) in %d page(s) were left out of the index because their metadata comment is malformed: %s.", st.Malformed, malformedN.total, malformedN.describe()))
-	}
-	if st.Skipped > 0 {
-		st.Partial = true
-		st.Notices = append(st.Notices, fmt.Sprintf("The memory index is partial: %d page(s) or director(ies) were skipped because a size limit was reached (%d pages, %d bytes, depth %d).", st.Skipped, maxPages, maxBytes, maxDepth))
-	}
-	return st, tx.Commit()
+		if !w.cutShort {
+			for rel := range known {
+				if !present[rel] {
+					if err := deletePage(ctx, tx, ix.CheckoutID, rel); err != nil {
+						return err
+					}
+					st.Removed++
+				}
+			}
+		}
+		if refusedN.total > 0 {
+			st.Notices = append(st.Notices, fmt.Sprintf("%d wiki file(s) or director(ies) were not indexed, so search and the briefing cannot see them: a symlink, an unreadable file or directory, or a page over %d bytes: %s.", refusedN.total, maxPage, refusedN.describe()))
+		}
+		if st.Malformed > 0 {
+			st.Notices = append(st.Notices, fmt.Sprintf("%d claim(s) in %d page(s) were left out of the index because their metadata comment is malformed: %s.", st.Malformed, malformedN.total, malformedN.describe()))
+		}
+		if st.Skipped > 0 {
+			st.Partial = true
+			st.Notices = append(st.Notices, fmt.Sprintf("The memory index is partial: %d page(s) or director(ies) were skipped because a size limit was reached (%d pages, %d bytes, depth %d).", st.Skipped, maxPages, maxBytes, maxDepth))
+		}
+		return tx.Commit()
+	})
+	return st, err
 }
 
 func deletePage(ctx context.Context, tx *sql.Tx, checkout, rel string) error {

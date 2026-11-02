@@ -138,7 +138,7 @@ func Resolve(ctx context.Context, dataDir string, id Identity, create bool) (*St
 	}
 	s := &Store{Dir: dir, Key: key, DataDir: dataDir, Root: root, reg: reg, Notices: notices}
 	// The database is opened first: a newer schema is refused before anything is written.
-	if s.DB, err = openDB(ctx, filepath.Join(dir, "wikory.db")); err != nil {
+	if s.DB, err = openDB(ctx, filepath.Join(dir, "wikory.db"), WriteLockPath(filepath.Join(dir, "locks"))); err != nil {
 		root.Close()
 		return nil, err
 	}
@@ -259,7 +259,10 @@ func (s *Store) updateRegistry(change func(*registry) bool) error {
 // Origins lists every canonical origin this store has been known by.
 func (s *Store) Origins() []string { return slices.Clone(s.reg.Origins) }
 
-func openDB(ctx context.Context, path string) (*sql.DB, error) {
+// openDB opens the database and brings its schema up to date. The schema statements are
+// writes, so they run inside the database write lock (lockPath), which Resolve takes after
+// the registry lock.
+func openDB(ctx context.Context, path, lockPath string) (*sql.DB, error) {
 	dsn := "file:" + filepath.ToSlash(path) +
 		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=foreign_keys(1)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
@@ -289,15 +292,32 @@ func openDB(ctx context.Context, path string) (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
-	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("store: schema: %w", err)
+	missingVersion := errors.Is(err, sql.ErrNoRows)
+	applySchema := func(ctx context.Context) error {
+		if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
+			return fmt.Errorf("store: schema: %w", err)
+		}
+		if missingVersion {
+			_, err := db.ExecContext(ctx, `INSERT INTO meta(k, v) VALUES('schema_version', ?) ON CONFLICT(k) DO NOTHING`, strconv.Itoa(SchemaVersion))
+			return err
+		}
+		return nil
 	}
-	if errors.Is(err, sql.ErrNoRows) {
-		if _, err := db.ExecContext(ctx, `INSERT INTO meta(k, v) VALUES('schema_version', ?) ON CONFLICT(k) DO NOTHING`, strconv.Itoa(SchemaVersion)); err != nil {
+	if !missingVersion && v == strconv.Itoa(SchemaVersion) {
+		// Every statement is CREATE ... IF NOT EXISTS on an object that exists, which SQLite
+		// resolves while compiling the statement, without a write transaction. Taking the write
+		// lock here would only make every open wait behind another process's write, so a store
+		// that is up to date opens without it.
+		if err := applySchema(ctx); err != nil {
 			db.Close()
 			return nil, err
 		}
+		return db, nil
+	}
+	// Creating or upgrading the schema writes, so it runs inside the database write lock.
+	if err := WithWriteLockAt(ctx, lockPath, applySchema); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return db, nil
 }
@@ -313,8 +333,10 @@ func (s *Store) Close() error {
 
 // Bump increments a named counter (hook errors, refusals, fallbacks).
 func (s *Store) Bump(ctx context.Context, name string) error {
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO counters(name, n) VALUES(?, 1) ON CONFLICT(name) DO UPDATE SET n = n + 1`, name)
-	return err
+	return s.WithWriteLock(ctx, func(ctx context.Context) error {
+		_, err := s.DB.ExecContext(ctx, `INSERT INTO counters(name, n) VALUES(?, 1) ON CONFLICT(name) DO UPDATE SET n = n + 1`, name)
+		return err
+	})
 }
 
 // Counter reads a named counter, zero when absent.

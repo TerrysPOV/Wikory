@@ -14,10 +14,12 @@ const (
 
 // RecordTrust records the decision for a clone (its git common directory).
 func (s *Store) RecordTrust(ctx context.Context, commonDir, decision, reason string) error {
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO trust(common_dir, decision, reason, at) VALUES(?, ?, ?, ?)
+	return s.WithWriteLock(ctx, func(ctx context.Context) error {
+		_, err := s.DB.ExecContext(ctx, `INSERT INTO trust(common_dir, decision, reason, at) VALUES(?, ?, ?, ?)
 		ON CONFLICT(common_dir) DO UPDATE SET decision = excluded.decision, reason = excluded.reason, at = excluded.at`,
-		commonDir, decision, reason, now())
-	return err
+			commonDir, decision, reason, now())
+		return err
+	})
 }
 
 // TrustDecision returns the recorded decision, if any.
