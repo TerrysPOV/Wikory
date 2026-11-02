@@ -19,3 +19,5 @@
 | G5-9b | index byte cap `>` becomes `> maxBytes+1` | RED as predicted (`want 1 1 true`: a page one byte over the cap is admitted) |
 | G5-9c | briefing `fits` `<=` becomes `<` | RED as predicted (`at the exact cap 330: item shown=false`) |
 | G5-9d | briefing `fits` `<=` becomes `<= cap+1` | RED as predicted (`one byte under the exact cap 329: item shown=true`) |
+| G5-10a | `Takeover` no longer takes the publishing lock (now a handshake test, not a 300 ms sleep against a 200 ms floor) | RED as predicted (`takeover returned while the publish still held the lock`) |
+| G5-10b | the SessionStart timeout waits an extra 2 s before giving up (the two hook budget tests now scale by `WIKORY_LATENCY_SLACK`, skip the strict budget under `-race`, and wait for the abandoned work by handshake) | RED as predicted (`elapsed=902ms out=`) |

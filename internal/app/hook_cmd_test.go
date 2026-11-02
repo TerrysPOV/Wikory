@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -252,17 +253,52 @@ func TestHookUnregisteredCheckoutNeverReadsItsIndex(t *testing.T) {
 	}
 }
 
+// waitFor waits for ch to close, for at most a generous limit so a hook that never ran fails
+// the test instead of hanging it.
+func waitFor(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// slowThenSignal returns a function that sleeps for d and then closes the returned channel (once),
+// so a test can wait for the abandoned work to finish instead of sleeping for a guessed time.
+func slowThenSignal(d time.Duration) (func(), <-chan struct{}) {
+	finished := make(chan struct{})
+	var once sync.Once
+	return func() {
+		time.Sleep(d)
+		once.Do(func() { close(finished) })
+	}, finished
+}
+
+// abandonedWorkGrace covers what the abandoned goroutine does after the injected delay returns
+// (building the briefing in a temp directory the test is about to remove). The delay itself is
+// waited for with a handshake; only this short tail is not observable from a test.
+const abandonedWorkGrace = 250 * time.Millisecond
+
 func TestHookDegradedOnTimeout(t *testing.T) {
 	h := newHookRig(t)
 	h.c.extra["WIKORY_HOOK_BUDGET_MS"] = "300"
-	testHookSlowBriefing = func() { time.Sleep(900 * time.Millisecond) } // exceeds the 300 ms budget
+	slow, finished := slowThenSignal(900 * time.Millisecond) // exceeds the 300 ms budget
+	testHookSlowBriefing = slow
 	t.Cleanup(func() { testHookSlowBriefing = nil })
 	start := time.Now()
 	got := h.context(t, h.dir)
-	if !strings.Contains(got, "timed out") || time.Since(start) > 800*time.Millisecond {
-		t.Fatalf("elapsed=%v out=%s", time.Since(start), got)
+	el := time.Since(start)
+	if !strings.Contains(got, "timed out") {
+		t.Fatalf("elapsed=%v out=%s", el, got)
 	}
-	time.Sleep(800 * time.Millisecond) // let the abandoned goroutine finish before temp dirs are removed
+	// The strict budget is measured without the race detector, which slows code several-fold
+	// (the latency tests skip under it for the same reason); WIKORY_LATENCY_SLACK scales it.
+	if !raceEnabled && el > 800*time.Millisecond*slack() {
+		t.Fatalf("elapsed=%v (limit %v) out=%s", el, 800*time.Millisecond*slack(), got)
+	}
+	waitFor(t, finished, "the abandoned briefing to finish") // so it is done before temp dirs are removed
+	time.Sleep(abandonedWorkGrace)
 }
 
 // After the deadline nothing may run synchronously: with git discovery itself slow, the hook
@@ -270,13 +306,21 @@ func TestHookDegradedOnTimeout(t *testing.T) {
 func TestHookTimeoutDoesNoSynchronousWork(t *testing.T) {
 	h := newHookRig(t)
 	h.c.extra["WIKORY_HOOK_BUDGET_MS"] = "300"
-	slow := func() { time.Sleep(900 * time.Millisecond) } // exceeds the budget
+	slow, finished := slowThenSignal(900 * time.Millisecond) // exceeds the budget
 	testHookSlowDiscover.Store(&slow)
-	t.Cleanup(func() { time.Sleep(1200 * time.Millisecond); testHookSlowDiscover.Store(nil) })
+	t.Cleanup(func() {
+		waitFor(t, finished, "the abandoned discovery to finish")
+		time.Sleep(abandonedWorkGrace)
+		testHookSlowDiscover.Store(nil)
+	})
 	start := time.Now()
 	got := h.context(t, h.dir)
 	el := time.Since(start)
-	if !strings.Contains(got, "timed out") || el > 300*time.Millisecond+250*time.Millisecond {
-		t.Fatalf("elapsed %v (budget 300ms plus 250ms slack): %s", el, got)
+	if !strings.Contains(got, "timed out") {
+		t.Fatalf("elapsed %v: %s", el, got)
+	}
+	limit := (300*time.Millisecond + 250*time.Millisecond) * slack()
+	if !raceEnabled && el > limit {
+		t.Fatalf("elapsed %v (budget 300ms plus 250ms slack, scaled: %v): %s", el, limit, got)
 	}
 }

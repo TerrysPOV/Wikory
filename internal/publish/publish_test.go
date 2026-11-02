@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -117,25 +118,41 @@ func TestTakeoverWaitsForThePublishingLock(t *testing.T) {
 	f := newFixture(t)
 	p := f.publisher("co-1")
 	j, _ := p.Begin(ctx, "test")
-	reached := make(chan struct{})
+	reached, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
 	killHook = func(step string) {
 		if step == "marked-0" {
-			close(reached)
-			time.Sleep(300 * time.Millisecond)
+			once.Do(func() { close(reached) })
+			<-release // the publish holds the lock until the test lets it go
 		}
 	}
 	t.Cleanup(func() { killHook = func(string) {} })
 	pubErr := make(chan error, 1)
 	go func() { pubErr <- p.Publish(ctx, j, standardOps(), "in progress") }()
 	<-reached
-	start := time.Now()
-	_, takeErr := f.publisher("co-1").Takeover(ctx, j.ID)
-	waited := time.Since(start)
+	type result struct {
+		err error
+	}
+	taken := make(chan result, 1)
+	go func() {
+		_, err := f.publisher("co-1").Takeover(ctx, j.ID)
+		taken <- result{err}
+	}()
+	// A takeover that ignores the lock returns within milliseconds, so a returned result inside
+	// this window is a failure. A slow machine only makes a correct takeover wait longer, never
+	// return early, so the window cannot fail a correct implementation.
+	select {
+	case r := <-taken:
+		close(release)
+		t.Fatalf("takeover returned while the publish still held the lock: err=%v", r.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
 	if err := <-pubErr; err != nil {
 		t.Fatalf("the publish in progress was fenced mid-way: %v", err)
 	}
-	if !errors.Is(takeErr, ErrJobState) || waited < 200*time.Millisecond {
-		t.Fatalf("takeover did not wait for the lock: err=%v waited=%v", takeErr, waited)
+	if r := <-taken; !errors.Is(r.err, ErrJobState) {
+		t.Fatalf("takeover after the publish finished: want ErrJobState, got %v", r.err)
 	}
 }
 
