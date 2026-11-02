@@ -129,3 +129,31 @@ func TestKeywordRuleLeavesProseAlone(t *testing.T) {
 		}
 	}
 }
+
+// A fine-grained GitHub token has its own prefix and underscores in the body; only the
+// github_pat_ alternative of the github-token rule can see it.
+func TestRedactsFineGrainedGitHubToken(t *testing.T) {
+	body := strings.Repeat("A", 22) + "_" + strings.Repeat("b", 59)
+	in := "use " + "github_" + "pat_" + body + " end"
+	out, counts := String(in)
+	if counts["github-token"] != 1 || !strings.Contains(out, "[REDACTED:github-token]") || strings.Contains(out, body) {
+		t.Fatalf("fine-grained token survived: out=%q counts=%v", out, counts)
+	}
+}
+
+// The api-key rule starts at 20 characters after the prefix. The existing 32 character input
+// cannot see that bound move; 20 and 25 characters can, and 19 must stay as prose.
+func TestAPIKeyMinimumLengthIsTwenty(t *testing.T) {
+	for _, n := range []int{20, 25} {
+		body := strings.Repeat("k", n)
+		in := "use " + "sk" + "-" + body + " end"
+		out, counts := String(in)
+		if counts["api-key"] != 1 || strings.Contains(out, body) {
+			t.Errorf("%d characters: out=%q counts=%v", n, out, counts)
+		}
+	}
+	short := "use " + "sk" + "-" + strings.Repeat("k", 19) + " end"
+	if out, counts := String(short); out != short || len(counts) != 0 {
+		t.Errorf("19 characters were redacted: out=%q counts=%v", out, counts)
+	}
+}

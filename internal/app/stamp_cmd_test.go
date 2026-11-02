@@ -129,3 +129,27 @@ func TestRenderCheckedRefusesALineThatDoesNotReparse(t *testing.T) {
 		t.Fatalf("line=%q err=%v", line, err)
 	}
 }
+
+// A page saved with CRLF endings must come out of a stamp with every line still ending CRLF:
+// restoring the carriage return on the rewritten claim line is the one place that can lose it,
+// leaving a page with mixed endings.
+func TestStampKeepsCRLFOnEveryLine(t *testing.T) {
+	page := strings.ReplaceAll(handPage, "\n", "\r\n")
+	dir, c := stampRepo(t, page)
+	if _, e, code := c.run(dir, "page", "stamp", "project-memory/wiki/q.md"); code != ExitOK {
+		t.Fatal(e)
+	}
+	got := readFile(t, filepath.Join(dir, "project-memory", "wiki", "q.md"))
+	if !strings.Contains(got, "c=") {
+		t.Fatalf("the claim line was not stamped: %q", got)
+	}
+	lines := strings.SplitAfter(got, "\n")
+	for i, l := range lines[:len(lines)-1] { // the last element is what follows the final newline
+		if !strings.HasSuffix(l, "\r\n") {
+			t.Fatalf("line %d lost its CRLF (mixed endings): %q\nwhole page: %q", i+1, l, got)
+		}
+	}
+	if strings.Count(got, "\r\n") != strings.Count(got, "\n") {
+		t.Fatalf("mixed line endings: %q", got)
+	}
+}

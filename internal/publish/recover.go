@@ -175,8 +175,17 @@ func (p *Publisher) abandonStale(ctx context.Context, withManifest map[string]bo
 			rows.Close()
 			return err
 		}
-		t, _ := time.Parse(time.RFC3339Nano, created)
-		if !withManifest[id] && p.Now().Sub(t) >= p.AbandonAfter {
+		if withManifest[id] {
+			continue
+		}
+		t, perr := time.Parse(time.RFC3339Nano, created)
+		if perr != nil {
+			// An age that cannot be read is not an old age: the zero time would read as ancient and
+			// abandon a job that may be live. Keep the job and say so.
+			rep.Errors = append(rep.Errors, JobError{JobID: id, Err: fmt.Errorf("unreadable created_at %q, job kept: %w", created, perr)})
+			continue
+		}
+		if p.Now().Sub(t) >= p.AbandonAfter {
 			stale = append(stale, id)
 		}
 	}
