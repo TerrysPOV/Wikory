@@ -152,7 +152,8 @@ func TestComparisonOperatorsAreNotAssignments(t *testing.T) {
 		"while " + kw + " >= other_value_here",
 		kw + " => some_function_name",
 		kw + " =~ regex_pattern_here",
-		kw + "==expected_value_here",
+		"if " + kw + " == expected_" + kw + ": return True",
+		"x = " + kw + " =~ /re/",
 	} {
 		if out, c := String(in); out != in || len(c) != 0 {
 			t.Errorf("a comparison was rewritten: %q -> %q %v", in, out, c)
@@ -161,6 +162,29 @@ func TestComparisonOperatorsAreNotAssignments(t *testing.T) {
 	for _, in := range []string{kw + " = hunter2hunter2", kw + "=hunter2hunter2", kw + ": hunter2hunter2", tk + " := hunter2hunter2", tk + " := correct horse battery staple"} {
 		if out, c := String(in); strings.Contains(out, "hunter2") || strings.Contains(out, "horse") || len(c) == 0 {
 			t.Errorf("an assignment survived: %q -> %q %v", in, out, c)
+		}
+	}
+}
+
+// A real secret may start with an operator character. After a single "=" or ":" the value is
+// anything at all, so these are assignments and are redacted. Secrets are built at runtime.
+func TestValuesStartingWithOperatorCharactersAreRedacted(t *testing.T) {
+	kw := strings.ToLower(kwPassword)
+	tk := strings.ToLower(kwToken)
+	tail := "hunter2" + "hunter2"
+	for _, in := range []string{
+		kw + "=~" + tail,
+		tk + "=>" + tail,
+		"key_" + kw + "==" + tail,
+		kw + ":~" + tail,
+		kw + ": >" + tail,
+		kw + " = =" + tail,
+		kw + "=~" + tail + " and more words",
+		tk + "=>correct horse battery staple",
+	} {
+		out, c := String(in)
+		if strings.Contains(out, "hunter2") || strings.Contains(out, "horse") || c["assignment"] != 1 {
+			t.Errorf("a secret behind an operator character survived: %q -> %q %v", in, out, c)
 		}
 	}
 }

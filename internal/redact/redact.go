@@ -44,10 +44,12 @@ var rules = []rule{
 	// The key tail must not be plain letters, so prose such as "Passwords: never reuse them."
 	// is left alone. Second rule: any key tail, a quoted value or one unquoted word of 8 or more.
 	// A value already replaced is not replaced or counted again. The operator is ":", "=" or
-	// ":=", and the value may not start with "=", "~" or ">", so "==", "=>" and "=~" in code
-	// are comparisons and not assignments ("!=", "<=" and ">=" never reach the operator).
-	{"assignment", regexp.MustCompile(`(?i)` + keywords + `(?:[_-][A-Za-z0-9_-]*)?["']?\s*(?::=|[:=])\s*(?P<secret>[^\s"'=~>][^\n]{7,199})`)},
-	{"assignment", regexp.MustCompile(`(?i)` + keywords + `[A-Za-z0-9_-]*["']?\s*(?::=|[:=])\s*(?P<secret>"[^"\n]{8,}"|'[^'\n]{8,}'|["']?[^\s"'=~>][^\s"']{7,}["']?)`)},
+	// ":=" and the value may start with any character, so "=~secret" and "==secret" are
+	// assignments. A comparison written with spaces ("password == other", "token => name",
+	// "password =~ /re/") is a named group "cmp" that consumes the rest of its line and is left
+	// alone, so ordinary code is not rewritten ("!=", "<=" and ">=" never reach the operator).
+	{"assignment", regexp.MustCompile(`(?i)` + keywords + `(?:[_-][A-Za-z0-9_-]*)?["']?\s*(?:(?P<cmp>(?:==|=>|=~)[ \t][^\n]*)|(?::=|[:=])\s*(?P<secret>[^\s"'][^\n]{7,199}))`)},
+	{"assignment", regexp.MustCompile(`(?i)` + keywords + `[A-Za-z0-9_-]*["']?\s*(?:(?P<cmp>(?:==|=>|=~)[ \t][^\n]*)|(?::=|[:=])\s*(?P<secret>"[^"\n]{8,}"|'[^'\n]{8,}'|["']?[^\s"']{8,}["']?))`)},
 }
 
 // markerRe matches a value that is exactly one redaction marker. Markers in the input are
@@ -72,6 +74,10 @@ func String(s string) (string, map[string]int) {
 				return mark
 			}
 			loc := r.re.FindStringSubmatchIndex(m)
+			if cmp := r.re.SubexpIndex("cmp"); cmp >= 0 && loc != nil && loc[2*cmp] >= 0 {
+				n-- // a comparison, not an assignment
+				return m
+			}
 			if loc == nil || loc[2*secret] < 0 {
 				return mark
 			}

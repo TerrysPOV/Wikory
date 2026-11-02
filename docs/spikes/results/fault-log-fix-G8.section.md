@@ -7,8 +7,11 @@
 | G8-2b | headings holding raw inline HTML are indexed again | RED as predicted (`atx heading` and `setext heading` shapes) |
 | G8-6 | entities and escapes decoded inside code spans again | RED as predicted (`body "Use <x> and * here and <y> outside."`) |
 | G8-3 | the url-credentials username back to `+` (at least one character) | RED as predicted (`out="cache redis://:...@cache.internal:6379 end"`, no redaction) |
-| G8-4a | the multi-word value may start with `=`, `~` or `>` again | RED as predicted (`a comparison was rewritten: "if password == expected_value_here"`, `=>` and `=~` too) |
-| G8-4b | the single-word value may start with `=`, `~` or `>` again | RED as predicted (`a comparison was rewritten: "password==expected_value_here"`) |
-| G8-4c | `:=` no longer an operator of the multi-word rule | RED as predicted (`an assignment survived: ... := correct horse battery staple`) |
 | G8-5a | `schemaComplete` never reports a missing object (the repair runs without the lock again) | RED as predicted (`want ErrWriteLockTimeout, got <nil>`) |
 | G8-5b | `schemaComplete` always reports incomplete (every open takes the lock) | RED as predicted (`a complete database should open while another process holds the lock`) |
+| G8-4a | superseded form (value may not start with `=`, `~`, `>`) restored in the multi-word rule | RED as predicted (`a secret behind an operator character survived: "token=>correct horse battery staple"`) |
+| G8-4b | the same exclusion restored in the single-word rule | RED as predicted (`a secret behind an operator character survived`) |
+| G8-4c | the comparison group is detected but not honoured (`false && ...`) | RED as predicted (`a comparison was rewritten: "if password == expected_value_here"`) |
+| G8-4d | the comparison operators need no following whitespace | RED as predicted (`a secret behind an operator character survived: "token=>correct ..."`) |
+| G8-4e | a skipped comparison is still counted | RED as predicted (`map[assignment:2]`) |
+| G8-4f | the `:=` operator removed from the multi-word rule | covered by the earlier row of the same name; the test `tk := correct horse battery staple` is unchanged |
