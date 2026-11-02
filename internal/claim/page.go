@@ -3,8 +3,13 @@ package claim
 import (
 	"fmt"
 	"path"
-	"regexp"
+	"sort"
 	"strings"
+
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/text"
+	"github.com/yuin/goldmark/util"
 )
 
 // PageTypes are the page types of spec 5.4.
@@ -40,59 +45,40 @@ type Page struct {
 }
 
 // ParsePage parses a page. It never fails: problems become findings.
+//
+// The body that reaches the index is built from a CommonMark parse (goldmark, no extensions)
+// of the text after the frontmatter, from the text of visible nodes only: text, code spans and
+// code blocks, headings, paragraphs, list items, quoted text, and the text of emphasis and
+// links. HTML blocks, raw inline HTML, comments, image alt text and link reference
+// definitions contribute nothing, so what the index holds is what a renderer shows and never
+// something it hides. Claim comments are recognised on top of that parse: a claim comment is
+// a one-line HTML block at the top level of the page, so a claim-looking line inside a code
+// fence, a quote, a list item or a longer HTML block is not a claim.
 func ParsePage(rel string, data []byte) Page {
 	lines := strings.Split(normaliseNewlines(string(data)), "\n")
 	p := Page{RelPath: rel, Type: "concept"}
 	start := p.parseFrontmatter(lines)
-	var body []string
-	heading := ""
-	clean, dropped, defs := stripComments(lines, start)
-	for _, d := range defs {
-		p.Findings = append(p.Findings, Finding{d.line, fmt.Sprintf("link-definition-like text ignored (%d lines)", d.n)})
+	if tooNested(lines[start:]) {
+		// goldmark's cost grows with the square of the container depth of a line. A page built
+		// to stall the indexer is not indexed at all; nothing hidden can leak that way.
+		p.Findings = append(p.Findings, Finding{start + 1, "page nests quotes or lists too deeply to index; its body is not indexed"})
+		p.ID = strings.TrimSuffix(path.Base(rel), path.Ext(rel))
+		p.Title = p.ID
+		return p
 	}
-	for i := start; i < len(lines); i++ {
-		if dropped[i] {
-			continue
-		}
-		line := clean[i]
-		trimmed := strings.TrimSpace(line)
-		switch {
-		case isHeading(trimmed):
-			heading = strings.TrimSpace(strings.TrimLeft(trimmed, "#"))
-			if p.Title == "" && strings.HasPrefix(trimmed, "# ") {
-				p.Title = heading
-			}
-			body = append(body, line)
-		case IsClaimComment(trimmed):
-			b := Block{MetaLine: trimmed, Line: i + 1, Heading: heading}
-			b.Claim, b.Err = ParseComment(trimmed)
-			var para []string
-			for i+1 < len(lines) {
-				if dropped[i+1] { // a comment inside the paragraph is removed; it does not end it
-					i++
-					continue
-				}
-				next := strings.TrimSpace(clean[i+1])
-				if next == "" || IsClaimComment(next) || isHeading(next) {
-					break
-				}
-				para = append(para, strings.TrimRight(clean[i+1], " \t"))
-				i++
-			}
-			b.Text = strings.Join(para, "\n")
-			if b.Text == "" {
-				p.Findings = append(p.Findings, Finding{i + 1, "claim comment has no claim text; skipped"})
-				continue
-			}
-			if b.Err != nil {
-				p.Findings = append(p.Findings, Finding{b.Line, b.Err.Error()})
-			}
-			p.Blocks = append(p.Blocks, b)
-		default:
-			body = append(body, line)
+	src := []byte(strings.Join(lines[start:], "\n"))
+	w := &pageWalk{src: src, firstLine: start, page: &p, consumed: map[ast.Node]bool{}}
+	w.lineStarts = append(w.lineStarts, 0)
+	for i, c := range src {
+		if c == '\n' {
+			w.lineStarts = append(w.lineStarts, i+1)
 		}
 	}
-	p.Body = strings.TrimSpace(strings.Join(body, "\n"))
+	if err := w.run(); err != nil {
+		p.Findings = append(p.Findings, Finding{start + 1, "page text could not be parsed; its body is not indexed"})
+		p.Blocks, w.body = nil, nil
+	}
+	p.Body = strings.TrimSpace(strings.Join(w.body, "\n"))
 	if p.ID == "" {
 		p.ID = strings.TrimSuffix(path.Base(rel), path.Ext(rel))
 	}
@@ -102,108 +88,246 @@ func ParsePage(rel string, data []byte) Page {
 	return p
 }
 
-// defGroup is a run of lines dropped because it starts like a link reference definition.
-type defGroup struct{ line, n int }
+// nestingBudget bounds the sum, over the lines of a page, of the square of the length of the
+// leading run of quote, list and indentation characters. Real pages use a few thousand; a
+// line of 8192 quote marks alone costs the parser about 70 ms, and a megabyte of them 9 s.
+const nestingBudget = 20_000_000
 
-// defLikeRe matches the start of a link reference definition: up to three spaces, a
-// bracketed label, a colon. Nothing after the colon is looked at.
-var defLikeRe = regexp.MustCompile(`^ {0,3}\[[^\]]+\]:`)
-
-// stripComments removes HTML comments from lines[start:] with one scan that carries the
-// "inside a comment" state across lines (spec 7.4: comments are not indexed and never
-// rendered). It returns the cleaned lines, which lines vanish entirely, and the runs of
-// link-definition-like lines it dropped. Lines keep their positions so claim line numbers
-// still point into the file.
-//
-//   - A complete claim comment line (see isCompleteClaimComment) is kept as it is, unless it
-//     sits inside an open comment. A line that only starts like one goes through the scan.
-//   - Text after a closing marker on the same line survives.
-//   - A comment that is never closed hides everything after its opener.
-//   - A line that starts like a link reference definition ("[label]: ...") is dropped together
-//     with every following non-blank line. CommonMark lets such a definition render nothing
-//     ("[//]: # (text)"), with a title that may run over several lines or sit on the next one,
-//     and parsing titles exactly is a parser-differential risk. Over-stripping can only hide
-//     visible text from the index, never reveal hidden text, and each run is reported.
-//     Comment markers inside a dropped run are still scanned, because an HTML block can
-//     interrupt a paragraph and run across blank lines.
-func stripComments(lines []string, start int) (clean []string, dropped []bool, defs []defGroup) {
-	clean = append([]string(nil), lines...)
-	dropped = make([]bool, len(lines))
-	inComment := false
-	inDef := false
-	for i := start; i < len(lines); i++ {
-		if inComment {
-			inDef = false
-		} else if inDef && strings.TrimSpace(lines[i]) == "" {
-			inDef = false
+func tooNested(lines []string) bool {
+	total := 0
+	for _, l := range lines {
+		m := 0
+		for m < len(l) && strings.IndexByte("> \t-*+", l[m]) >= 0 {
+			m++
 		}
-		if !inComment && !inDef && defLikeRe.MatchString(lines[i]) {
-			inDef = true
-			defs = append(defs, defGroup{line: i + 1})
-		}
-		if inDef {
-			defs[len(defs)-1].n++
-			inComment = scanComments(lines[i], inComment, nil)
-			clean[i], dropped[i] = "", true
-			continue
-		}
-		if !inComment && isCompleteClaimComment(lines[i]) {
-			continue
-		}
-		var out strings.Builder
-		was := inComment
-		inComment = scanComments(lines[i], inComment, &out)
-		if was || inComment || out.String() != lines[i] {
-			clean[i] = out.String()
-			dropped[i] = strings.TrimSpace(clean[i]) == ""
+		if total += m * m; total > nestingBudget {
+			return true
 		}
 	}
-	return clean, dropped, defs
+	return false
 }
 
-// scanComments walks one line from the given comment state, writing the text outside comments
-// to out (if not nil), and returns the state at the end of the line.
-func scanComments(line string, inComment bool, out *strings.Builder) bool {
-	rest := line
-	for {
-		if inComment {
-			j := strings.Index(rest, "-->")
-			if j < 0 {
-				return true
+// pageWalk carries the state of one walk over a page's CommonMark tree.
+type pageWalk struct {
+	src        []byte
+	firstLine  int   // index in the file of the first line of src
+	lineStarts []int // byte offset of each line of src
+	page       *Page
+	body       []string
+	heading    string
+	consumed   map[ast.Node]bool // paragraphs already taken as claim text
+}
+
+func (w *pageWalk) run() (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("markdown parser: %v", r)
+		}
+	}()
+	doc := goldmark.New().Parser().Parse(text.NewReader(w.src))
+	return ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		switch n := n.(type) {
+		case *ast.HTMLBlock:
+			w.htmlBlock(n)
+			return ast.WalkSkipChildren, nil
+		case *ast.Heading:
+			t := w.inlineText(n)
+			w.heading = strings.TrimSpace(t)
+			if w.page.Title == "" && n.Level == 1 {
+				w.page.Title = w.heading
 			}
-			rest, inComment = rest[j+len("-->"):], false
-			continue
-		}
-		j := strings.Index(rest, "<!--")
-		if j < 0 {
-			if out != nil {
-				out.WriteString(rest)
+			w.add(t)
+			return ast.WalkSkipChildren, nil
+		case *ast.Paragraph, *ast.TextBlock:
+			if !w.consumed[n] {
+				w.add(w.inlineText(n))
 			}
-			return false
+			return ast.WalkSkipChildren, nil
+		case *ast.FencedCodeBlock, *ast.CodeBlock:
+			w.add(w.blockLines(n))
+			return ast.WalkSkipChildren, nil
 		}
-		if out != nil {
-			out.WriteString(rest[:j])
-		}
-		rest, inComment = rest[j+len("<!--"):], true
+		return ast.WalkContinue, nil
+	})
+}
+
+func (w *pageWalk) add(s string) {
+	if strings.TrimSpace(s) != "" {
+		w.body = append(w.body, s)
 	}
+}
+
+// lineOf is the index, within src, of the line holding byte offset off.
+func (w *pageWalk) lineOf(off int) int {
+	return sort.Search(len(w.lineStarts), func(i int) bool { return w.lineStarts[i] > off }) - 1
+}
+
+// span returns the first and last line (within src) a block occupies.
+func (w *pageWalk) span(n ast.Node) (first, last int) {
+	first, last = -1, -1
+	see := func(seg text.Segment) {
+		if seg.Start < 0 {
+			return
+		}
+		a, z := w.lineOf(seg.Start), w.lineOf(max(seg.Start, seg.Stop-1))
+		if first < 0 || a < first {
+			first = a
+		}
+		if z > last {
+			last = z
+		}
+	}
+	ls := n.Lines()
+	for i := 0; i < ls.Len(); i++ {
+		see(ls.At(i))
+	}
+	if h, ok := n.(*ast.HTMLBlock); ok && h.HasClosure() {
+		see(h.ClosureLine)
+	}
+	return first, last
+}
+
+// htmlBlock handles an HTML block: it contributes no body text. A one-line block at the top
+// level of the page that reads as a claim comment starts a claim.
+func (w *pageWalk) htmlBlock(n *ast.HTMLBlock) {
+	first, last := w.span(n)
+	if first < 0 {
+		return
+	}
+	meta := strings.TrimSpace(string(n.Text(w.src)))
+	if !IsClaimComment(meta) {
+		return
+	}
+	line := w.firstLine + first + 1
+	if first != last || !isCompleteClaimComment(meta) || n.Parent() == nil || n.Parent().Kind() != ast.KindDocument {
+		w.page.Findings = append(w.page.Findings, Finding{line, "claim comment is not a complete one-line comment at the top level; ignored"})
+		return
+	}
+	b := Block{MetaLine: meta, Line: line, Heading: w.heading}
+	b.Claim, b.Err = ParseComment(meta)
+	b.Text = w.claimText(n, last)
+	if b.Text == "" {
+		w.page.Findings = append(w.page.Findings, Finding{line, "claim comment has no claim text; skipped"})
+		return
+	}
+	if b.Err != nil {
+		w.page.Findings = append(w.page.Findings, Finding{b.Line, b.Err.Error()})
+	}
+	w.page.Blocks = append(w.page.Blocks, b)
 }
 
 // isCompleteClaimComment reports whether a line is one whole claim comment: the claim prefix,
-// one closing marker as the last thing on the line, and no other comment marker. Anything else
-// that merely starts like a claim comment must go through the comment scan, or an unclosed
-// opener would hide nothing from the index while Markdown hides everything after it.
+// one closing marker as the last thing on the line, and no other comment marker.
 func isCompleteClaimComment(line string) bool {
 	s := strings.TrimSpace(line)
 	return IsClaimComment(s) && strings.HasSuffix(s, "-->") &&
 		strings.Count(s, "<!--") == 1 && strings.Count(s, "-->") == 1
 }
 
-func isHeading(s string) bool {
-	n := 0
-	for n < len(s) && s[n] == '#' {
-		n++
+// claimText collects the paragraphs that follow a claim comment with no blank line between
+// them. Other HTML blocks in between (editor notes) are skipped and do not end the claim; a
+// blank line, a claim comment, a heading or anything else does.
+func (w *pageWalk) claimText(claimNode ast.Node, prevEnd int) string {
+	var paras []string
+	for n := claimNode.NextSibling(); n != nil; n = n.NextSibling() {
+		first, last := w.span(n)
+		if first != prevEnd+1 {
+			break
+		}
+		switch n := n.(type) {
+		case *ast.Paragraph:
+			w.consumed[n] = true
+			paras = append(paras, w.rawParagraph(n))
+		case *ast.HTMLBlock:
+			if m := strings.TrimSpace(string(n.Text(w.src))); isCompleteClaimComment(m) && first == last {
+				return strings.Join(paras, "\n")
+			}
+		default:
+			return strings.Join(paras, "\n")
+		}
+		prevEnd = last
 	}
-	return n >= 1 && n <= 6 && len(s) > n && s[n] == ' '
+	return strings.Join(paras, "\n")
+}
+
+// rawParagraph returns a paragraph's source lines, right-trimmed, with any raw inline HTML
+// (comments inside the paragraph) cut out.
+func (w *pageWalk) rawParagraph(p *ast.Paragraph) string {
+	var cut []text.Segment
+	_ = ast.Walk(p, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if r, ok := n.(*ast.RawHTML); ok && entering {
+			for i := 0; i < r.Segments.Len(); i++ {
+				cut = append(cut, r.Segments.At(i))
+			}
+		}
+		return ast.WalkContinue, nil
+	})
+	var out []string
+	ls := p.Lines()
+	for i := 0; i < ls.Len(); i++ {
+		seg := ls.At(i)
+		var sb []byte
+		for off := seg.Start; off < seg.Stop; off++ {
+			inCut := false
+			for _, c := range cut {
+				if off >= c.Start && off < c.Stop {
+					inCut = true
+					break
+				}
+			}
+			if !inCut {
+				sb = append(sb, w.src[off])
+			}
+		}
+		if line := strings.TrimRight(string(sb), " \t\r\n"); strings.TrimSpace(line) != "" {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// inlineText is the text a renderer shows for a block's inline content: text, code spans and
+// the text of emphasis and links. Images, raw HTML, autolinks and every other node are left
+// out.
+func (w *pageWalk) inlineText(n ast.Node) string {
+	var sb strings.Builder
+	var walk func(ast.Node)
+	walk = func(n ast.Node) {
+		for c := n.FirstChild(); c != nil; c = c.NextSibling() {
+			switch c := c.(type) {
+			case *ast.Text:
+				sb.Write(visible(c.Segment.Value(w.src)))
+				if c.SoftLineBreak() || c.HardLineBreak() {
+					sb.WriteByte('\n')
+				}
+			case *ast.String:
+				sb.Write(visible(c.Value))
+			case *ast.CodeSpan, *ast.Emphasis, *ast.Link:
+				walk(c)
+			}
+		}
+	}
+	walk(n)
+	return sb.String()
+}
+
+// blockLines is the text of a code block's lines (the info string is not shown).
+func (w *pageWalk) blockLines(n ast.Node) string {
+	var sb strings.Builder
+	ls := n.Lines()
+	for i := 0; i < ls.Len(); i++ {
+		seg := ls.At(i)
+		sb.Write(seg.Value(w.src))
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// visible resolves backslash escapes and character references the way a renderer does.
+func visible(b []byte) []byte {
+	return util.ResolveEntityNames(util.ResolveNumericReferences(util.UnescapePunctuations(b)))
 }
 
 // parseFrontmatter fills page fields and returns the first body line index.

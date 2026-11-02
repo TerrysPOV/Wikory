@@ -23,4 +23,12 @@ import (
 	// golang.org/x/text: Unicode NFC for the canonical claim text that th hashes (spec 5.3).
 	// Not in the original allow-list; see plan adjudication Q4.
 	_ "golang.org/x/text/unicode/norm"
+
+	// github.com/yuin/goldmark v1.8.6 (MIT, pure Go, no further dependencies): a real
+	// CommonMark parser, used by internal/claim to build the indexed page body from the text a
+	// renderer shows. Added under spec 10.5 (minimal dependencies) because three rounds of
+	// hand-written stripping of comments and link reference definitions were each bypassed in
+	// review; the failure direction of any approximation of CommonMark is hidden text reaching
+	// the index. Pinned to a release more than two weeks old when chosen.
+	_ "github.com/yuin/goldmark"
 )

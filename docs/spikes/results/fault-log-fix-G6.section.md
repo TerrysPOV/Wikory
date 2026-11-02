@@ -11,3 +11,14 @@
 | G6-2d | the `.git` file is no longer required to name the git directory | RED as predicted (`a .git file naming a different directory was accepted`) |
 | G6-2e | the entry's `gitdir` file is no longer required to name `top/.git` | RED as predicted (`an entry whose gitdir file names another directory was accepted`) |
 | G6-2f | `confirm` returns true for any listed path (no binding check at all) | RED as predicted (`a worktree whose .git file no longer names its own entry was confirmed`) |
+| G6-1* | rows G6-1a to G6-1g above fault the hand-written comment and definition stripper, which was deleted when the body moved to a CommonMark parse (orchestrator ruling); they are kept as history and are SUPERSEDED by rows G6-1h to G6-1q | SUPERSEDED |
+| G6-1h | the body builder replaced by raw page text (`w.add(string(w.src))`) | RED as predicted (`hidden payload reached the body`, for the comment, unterminated comment and half-open claim shapes) |
+| G6-1i | HTML blocks added to the body | RED as predicted (`hidden payload reached the body`) |
+| G6-1j | raw inline HTML added to the body | RED as predicted (`hidden payload reached the body`, inline comment shapes) |
+| G6-1k | image alt text added to the body | RED as predicted (`HIDDEN-16 alt`) |
+| G6-1l | the top-level-only test for a claim dropped | RED as predicted (`in a blockquote: made a claim`). It SURVIVED the first version of the test, whose fixture left the claim text outside the quote; the fixture now keeps it inside |
+| G6-1m | the complete-comment test for a claim line dropped | RED as predicted (`nested opener: made a claim block`, and the two other shapes) |
+| G6-1n | the nesting budget disabled | RED as predicted (`quotes: finding=false`, `list markers: finding=false`); unguarded, a 1 MiB page of quote marks takes 9 s to parse and one of list markers 18 s |
+| G6-1o | inline comments no longer cut from a claim's paragraph | RED as predicted (`Before <!-- HIDDEN-C --> after,` in the claim text) |
+| G6-1p | claim line numbers ignore the frontmatter offset | RED as predicted (`Line:4`, want 7) |
+| G6-1q | backslash escapes no longer resolved in the body | RED as predicted (`"Escaped * star and & entity." missing from body`) |
