@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/TerrysPOV/Wikory/internal/confine"
 )
 
 var (
@@ -180,22 +182,105 @@ func containsDir(top, dir string) bool {
 // directory whose .git file merely names another clone's git directory is reported by
 // rev-parse as a worktree of that clone, so rev-parse alone proves nothing. Either Top is the
 // parent of the common directory (the main work tree), or `git worktree list`, run in the
-// common directory, names it: git records each linked worktree there when it creates it.
-// Any failure is "not confirmed".
+// common directory, names it and the two files git keeps for a linked worktree agree: Top's
+// .git file names <common>/worktrees/<id>, and <common>/worktrees/<id>/gitdir names
+// Top/.git. Any failure is "not confirmed".
 func (r *Repo) confirm(ctx context.Context) bool {
 	if filepath.Base(r.CommonDir) == ".git" && samePath(r.Top, filepath.Dir(r.CommonDir)) {
 		return true
 	}
-	out, err := run(ctx, r.CommonDir, r.neutralise, nil, "worktree", "list", "--porcelain")
+	listed, err := listWorktrees(ctx, r.CommonDir, r.neutralise)
 	if err != nil {
 		return false
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if p, ok := strings.CutPrefix(strings.TrimRight(line, "\r"), "worktree "); ok && samePath(r.Top, p) {
-			return true
+	for _, p := range listed {
+		if samePath(r.Top, p) {
+			return worktreeBound(r.Top, r.CommonDir, r.GitDir)
 		}
 	}
 	return false
+}
+
+// listWorktrees returns the paths `git worktree list` reports for the clone whose common
+// directory is commonDir, leaving out the entries git marks prunable.
+func listWorktrees(ctx context.Context, commonDir string, neutralise [][2]string) ([]string, error) {
+	out, err := run(ctx, commonDir, neutralise, nil, "worktree", "list", "--porcelain", "-z")
+	if err != nil {
+		return nil, err
+	}
+	return parseWorktrees(out), nil
+}
+
+// parseWorktrees reads the NUL-separated porcelain form. Fields end at a NUL and records at an
+// empty field, so a directory name holding a newline cannot start a second entry the way it
+// can in the newline-separated form.
+func parseWorktrees(out []byte) []string {
+	var paths []string
+	cur, prunable := "", false
+	flush := func() {
+		if cur != "" && !prunable {
+			paths = append(paths, cur)
+		}
+		cur, prunable = "", false
+	}
+	for _, f := range strings.Split(string(out), "\x00") {
+		switch {
+		case f == "":
+			flush()
+		case strings.HasPrefix(f, "worktree "):
+			flush()
+			cur = strings.TrimPrefix(f, "worktree ")
+		case f == "prunable" || strings.HasPrefix(f, "prunable "):
+			prunable = true
+		}
+	}
+	flush()
+	return paths
+}
+
+// worktreeBound reports whether top's .git file names gitDir, gitDir is an entry directly
+// under <commonDir>/worktrees, and that entry's gitdir file names top/.git. Both files are
+// read through confine, which accepts regular files only.
+func worktreeBound(top, commonDir, gitDir string) bool {
+	if !samePath(filepath.Dir(gitDir), filepath.Join(commonDir, "worktrees")) {
+		return false
+	}
+	named, ok := readPointer(top, ".git", "gitdir:", top)
+	if !ok || !samePath(named, gitDir) {
+		return false
+	}
+	back, ok := readPointer(gitDir, "gitdir", "", gitDir)
+	return ok && samePath(back, filepath.Join(top, ".git"))
+}
+
+// readPointer reads the one-line file name in dir, drops the keyword if given, and resolves a
+// relative result against base.
+func readPointer(dir, name, keyword, base string) (string, bool) {
+	root, err := confine.Open(dir)
+	if err != nil {
+		return "", false
+	}
+	defer root.Close()
+	data, err := root.ReadFile(name, 4096)
+	if err != nil {
+		return "", false
+	}
+	line := strings.TrimRight(string(data), "\r\n")
+	if keyword != "" {
+		rest, ok := strings.CutPrefix(line, keyword)
+		if !ok {
+			return "", false
+		}
+		line = strings.TrimSpace(rest)
+	}
+	if line == "" {
+		return "", false
+	}
+	line = filepath.FromSlash(line)
+	if !filepath.IsAbs(line) {
+		line = filepath.Join(base, line)
+	}
+	return line, true
 }
 
 // samePath reports whether a and b name the same existing directory.

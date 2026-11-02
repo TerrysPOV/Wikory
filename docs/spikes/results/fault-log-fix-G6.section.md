@@ -5,3 +5,9 @@
 | G6-1e | the dropped run ends after one line (`else if inDef` without the blank-line test), so a payload line after an escaped title delimiter is indexed | RED as predicted (`a payload behind a link definition reached the body`) |
 | G6-1f | comment markers inside a dropped run are no longer scanned (`_ = scanComments(...)`) | RED as predicted (`body: "PAYLOAD-AFTER-BLANK ...`) |
 | G6-1g | the finding for a dropped run is not recorded | RED as predicted (`no finding for the dropped run`) |
+| G6-2a | `git worktree list` run without `-z` (newline-separated porcelain), so a worktree directory name holding a newline can forge an entry | RED as predicted (`want exactly 2 entries (main and the newline-named one), got 1`). The Discover-level forged-line test alone SURVIVES this fault, because the binding check (G6-2c to G6-2f) also refuses the forged directory; the parser-level test covers the `-z` layer |
+| G6-2b | prunable entries kept (`!prunable` made unconditional) | RED as predicted (`got ["/a" "/gone" "/b" "/bare-prunable"], want [/a /b]`) |
+| G6-2c | the "entry is directly under `<common>/worktrees`" test disabled | RED as predicted (`a git directory outside <common>/worktrees was accepted`) |
+| G6-2d | the `.git` file is no longer required to name the git directory | RED as predicted (`a .git file naming a different directory was accepted`) |
+| G6-2e | the entry's `gitdir` file is no longer required to name `top/.git` | RED as predicted (`an entry whose gitdir file names another directory was accepted`) |
+| G6-2f | `confirm` returns true for any listed path (no binding check at all) | RED as predicted (`a worktree whose .git file no longer names its own entry was confirmed`) |
