@@ -68,19 +68,15 @@ func ParsePage(rel string, data []byte) Page {
 			cut = 0
 		}
 		src, headingsOnly = src[:cut], true
-		p.Findings = append(p.Findings, Finding{start + 1, "page is larger than 256 KiB; only its title and the headings in its first 256 KiB are indexed"})
+		p.Findings = append(p.Findings, Finding{start + 1, "page is larger than 64 KiB; only its title and the headings in its first 64 KiB are indexed"})
 	}
 	if tooNested(strings.Split(string(src), "\n")) {
 		// The parser's cost grows with the square of a line's container depth. A page built to
 		// stall the indexer is indexed by its title alone; nothing hidden can leak that way.
-		p.Findings = append(p.Findings, Finding{start + 1, "page nesting too deep; only its title is indexed"})
-		if p.ID == "" {
-			p.ID = strings.TrimSuffix(path.Base(rel), path.Ext(rel))
-		}
-		if p.Title == "" {
-			p.Title = p.ID
-		}
-		return p
+		return p.titleOnly(rel, start, "page nesting too deep; only its title is indexed")
+	}
+	if tooComplex(src) {
+		return p.titleOnly(rel, start, "inline structure too complex; only its title is indexed")
 	}
 	w := &pageWalk{src: src, firstLine: start, page: &p, consumed: map[ast.Node]bool{}, headingsOnly: headingsOnly}
 	w.lineStarts = append(w.lineStarts, 0)
@@ -103,10 +99,63 @@ func ParsePage(rel string, data []byte) Page {
 	return p
 }
 
+// titleOnly finishes a page that is indexed by its title alone, with the reason as a finding.
+func (p Page) titleOnly(rel string, start int, why string) Page {
+	p.Findings = append(p.Findings, Finding{start + 1, why})
+	p.Blocks, p.Body = nil, ""
+	if p.ID == "" {
+		p.ID = strings.TrimSuffix(path.Base(rel), path.Ext(rel))
+	}
+	if p.Title == "" {
+		p.Title = p.ID
+	}
+	return p
+}
+
+// ParsePageTitleOnly reads only the frontmatter of a page and indexes the rest as nothing,
+// with why recorded as a finding. The indexer uses it for pages it has no parse time left for.
+func ParsePageTitleOnly(rel string, data []byte, why string) Page {
+	lines := strings.Split(normaliseNewlines(string(data)), "\n")
+	p := Page{RelPath: rel, Type: "concept"}
+	start := p.parseFrontmatter(lines)
+	return p.titleOnly(rel, start, why)
+}
+
+// Bounds on the inline structure the parser is given. goldmark's time grows with the square of
+// the number of link and emphasis delimiters, so these are checked before it runs. Measured at
+// the limits all together, a page parses in well under 250 ms; the review's inputs (`[a](`
+// repeated, `*a_` repeated) took 7 s at 80 KB and over a minute at 240 KB.
+const (
+	maxBrackets  = 1500 // '[' characters, and separately "](" pairs
+	maxEmphasis  = 4000 // '*' and '_' characters together
+	maxBackticks = 2000
+)
+
+// tooComplex reports whether src holds more link, emphasis or code-span delimiters than the
+// bounds allow. It counts every byte, code blocks included: it is a cost bound, not a parse.
+func tooComplex(src []byte) bool {
+	brackets, closeOpen, emphasis, ticks := 0, 0, 0, 0
+	for i, c := range src {
+		switch c {
+		case '[':
+			brackets++
+		case ']':
+			if i+1 < len(src) && src[i+1] == '(' {
+				closeOpen++
+			}
+		case '*', '_':
+			emphasis++
+		case '`':
+			ticks++
+		}
+	}
+	return brackets > maxBrackets || closeOpen > maxBrackets || emphasis > maxEmphasis || ticks > maxBackticks
+}
+
 const (
 	// maxParseBytes is the most page text the parser sees. A larger page is indexed by its
 	// title and headings from the first maxParseBytes only.
-	maxParseBytes = 256 << 10
+	maxParseBytes = 64 << 10
 	// maxNesting is the deepest container nesting a line may open: quote marks, bullet and
 	// ordered list markers, and indentation (four columns count as one level). The parser's cost
 	// grows with the square of this depth on every line, so a page beyond it is not parsed.
@@ -189,11 +238,7 @@ func (w *pageWalk) run() (err error) {
 		}
 		if w.headingsOnly {
 			if h, ok := n.(*ast.Heading); ok {
-				t := w.inlineText(h)
-				if w.page.Title == "" && h.Level == 1 {
-					w.page.Title = strings.TrimSpace(t)
-				}
-				w.add(t)
+				w.heading_(h)
 			}
 			return ast.WalkContinue, nil
 		}
@@ -202,17 +247,18 @@ func (w *pageWalk) run() (err error) {
 			w.htmlBlock(n)
 			return ast.WalkSkipChildren, nil
 		case *ast.Heading:
-			t := w.inlineText(n)
-			w.heading = strings.TrimSpace(t)
-			if w.page.Title == "" && n.Level == 1 {
-				w.page.Title = w.heading
-			}
-			w.add(t)
+			w.heading_(n)
 			return ast.WalkSkipChildren, nil
 		case *ast.Paragraph, *ast.TextBlock:
-			if !w.consumed[n] {
-				w.add(w.inlineText(n))
+			if w.consumed[n] {
+				return ast.WalkSkipChildren, nil
 			}
+			if hasRawHTML(n) {
+				first, _ := w.span(n)
+				w.page.Findings = append(w.page.Findings, Finding{w.firstLine + first + 1, "a paragraph with inline HTML is omitted from the index"})
+				return ast.WalkSkipChildren, nil
+			}
+			w.add(w.inlineText(n))
 			return ast.WalkSkipChildren, nil
 		case *ast.FencedCodeBlock, *ast.CodeBlock:
 			w.add(w.blockLines(n))
@@ -220,6 +266,39 @@ func (w *pageWalk) run() (err error) {
 		}
 		return ast.WalkContinue, nil
 	})
+}
+
+// heading_ records a heading as the current heading, the title when it is the first top-level
+// one, and body text. A heading holding raw inline HTML is recorded as "[heading omitted]",
+// with a finding, and never becomes the title.
+func (w *pageWalk) heading_(h *ast.Heading) {
+	if hasRawHTML(h) {
+		first, _ := w.span(h)
+		w.page.Findings = append(w.page.Findings, Finding{w.firstLine + first + 1, "a heading with inline HTML is omitted from the index"})
+		w.heading = "[heading omitted]"
+		w.add(w.heading)
+		return
+	}
+	t := w.inlineText(h)
+	w.heading = strings.TrimSpace(t)
+	if w.page.Title == "" && h.Level == 1 {
+		w.page.Title = w.heading
+	}
+	w.add(t)
+}
+
+// hasRawHTML reports whether a block's inline content holds raw inline HTML, whose tags can
+// hide the text between them from a reader while CommonMark shows it.
+func hasRawHTML(n ast.Node) bool {
+	found := false
+	_ = ast.Walk(n, func(c ast.Node, entering bool) (ast.WalkStatus, error) {
+		if _, ok := c.(*ast.RawHTML); ok && entering {
+			found = true
+			return ast.WalkStop, nil
+		}
+		return ast.WalkContinue, nil
+	})
+	return found
 }
 
 func (w *pageWalk) add(s string) {
@@ -362,23 +441,29 @@ func hiddenCarrier(p *ast.Paragraph) string {
 // out.
 func (w *pageWalk) inlineText(n ast.Node) string {
 	var sb strings.Builder
-	var walk func(ast.Node)
-	walk = func(n ast.Node) {
+	var walk func(n ast.Node, literal bool)
+	walk = func(n ast.Node, literal bool) {
 		for c := n.FirstChild(); c != nil; c = c.NextSibling() {
 			switch c := c.(type) {
 			case *ast.Text:
-				sb.Write(visible(c.Segment.Value(w.src)))
+				v := c.Segment.Value(w.src)
+				if !literal {
+					v = visible(v)
+				}
+				sb.Write(v)
 				if c.SoftLineBreak() || c.HardLineBreak() {
 					sb.WriteByte('\n')
 				}
 			case *ast.String:
 				sb.Write(visible(c.Value))
-			case *ast.CodeSpan, *ast.Emphasis, *ast.Link:
-				walk(c)
+			case *ast.CodeSpan:
+				walk(c, true) // a code span is shown literally: no entities, no escapes
+			case *ast.Emphasis, *ast.Link:
+				walk(c, literal)
 			}
 		}
 	}
-	walk(n)
+	walk(n, false)
 	return sb.String()
 }
 

@@ -212,12 +212,112 @@ func TestClaimLookingLinesThatAreNotCompleteMakeNoBlockAndNoClaimText(t *testing
 	}
 }
 
-// Residual, recorded in known-limits: text between inline HTML tags is text to CommonMark, so
-// it is indexed even though a browser would hide it.
-func TestTextBetweenInlineHTMLTagsIsIndexedAsCommonMarkSeesIt(t *testing.T) {
-	p := ParsePage("x.md", []byte("a <span hidden>INLINE-TEXT</span> b\n"))
-	if !strings.Contains(p.Body, "INLINE-TEXT") || strings.Contains(p.Body, "<span") {
+// Review M1: text between inline HTML tags can be hidden by a browser (`<span hidden>`), so a
+// paragraph or heading holding raw inline HTML is left out of the body, and said so.
+func TestParagraphsAndHeadingsWithInlineHTMLAreOmitted(t *testing.T) {
+	for name, md := range map[string]string{
+		"paragraph":        "Para <span hidden>HIDDEN-X</span> words.",
+		"atx heading":      "# Head <span hidden>HIDDEN-X</span>",
+		"setext heading":   "Head <span hidden>HIDDEN-X</span>\n=====",
+		"inline comment":   "Para <!-- HIDDEN-X --> words.",
+		"list item":        "- item <b hidden>HIDDEN-X</b>",
+		"quoted paragraph": "> quote <i hidden>HIDDEN-X</i>",
+	} {
+		p := ParsePage("x.md", []byte("# Real title\n\nVISIBLE-PARA\n\n"+md+"\n\nVISIBLE-AFTER\n"))
+		if strings.Contains(p.Body, "HIDDEN") || strings.Contains(p.Title, "HIDDEN") {
+			t.Errorf("%s: hidden text reached the index: title %q body %q", name, p.Title, p.Body)
+		}
+		if !strings.Contains(p.Body, "VISIBLE-PARA") || !strings.Contains(p.Body, "VISIBLE-AFTER") {
+			t.Errorf("%s: visible text lost: %q", name, p.Body)
+		}
+		found := false
+		for _, f := range p.Findings {
+			found = found || strings.Contains(f.Msg, "inline HTML")
+		}
+		if !found {
+			t.Errorf("%s: the omission was silent: %+v", name, p.Findings)
+		}
+	}
+	p := ParsePage("x.md", []byte("# T <span hidden>HIDDEN-X</span>\n\ntext\n"))
+	if p.Title == "" || strings.Contains(p.Title, "HIDDEN") || !strings.Contains(p.Body, "[heading omitted]") {
+		t.Errorf("title %q body %q", p.Title, p.Body)
+	}
+	q := ParsePage("x.md", []byte("# H <span hidden>HIDDEN-X</span>\n\n<!-- claim kind=intent status=unverified -->\nClaim.\n"))
+	if len(q.Blocks) != 1 || q.Blocks[0].Heading != "[heading omitted]" {
+		t.Errorf("claim heading: %+v", q.Blocks)
+	}
+}
+
+// Review L4: a code span is displayed literally, so entities and escapes in it are not decoded.
+func TestCodeSpanTextIsIndexedLiterally(t *testing.T) {
+	p := ParsePage("x.md", []byte("Use `&lt;x&gt; and \\* here` and &lt;y&gt; outside.\n"))
+	if !strings.Contains(p.Body, "&lt;x&gt; and \\* here") || !strings.Contains(p.Body, "<y> outside") {
 		t.Errorf("body %q", p.Body)
+	}
+}
+
+// Review H1: goldmark's time is quadratic in the number of link and emphasis delimiters. The
+// bounds are checked before the parser runs. Every input below EXCEEDS its bound.
+func TestInlineStructureBeyondTheBoundsIsRefusedWithoutParsing(t *testing.T) {
+	for name, md := range map[string]string{
+		"links 240 KB":       strings.Repeat(strings.Repeat("[a](", 20)+"\n", 3000),
+		"emphasis 255 KB":    strings.Repeat(strings.Repeat("*a_", 28)+"\n", 3040),
+		"brackets 1501":      strings.Repeat("[", 1501),
+		"close-open 1501":    strings.Repeat("a](", 1501),
+		"delimiters 4001":    strings.Repeat("*", 4001),
+		"underscores 4001":   strings.Repeat("_", 4001),
+		"mixed delims 4001":  strings.Repeat("*_", 2000) + "*",
+		"backticks 2001":     strings.Repeat("`", 2001),
+		"links in a heading": "# " + strings.Repeat("[a](", 1501),
+	} {
+		start := time.Now()
+		p := ParsePage("x.md", []byte("# Title\n\n"+md+"\n"))
+		found := false
+		for _, f := range p.Findings {
+			found = found || strings.Contains(f.Msg, "inline structure too complex")
+		}
+		if !found || p.Body != "" || p.Title == "" {
+			t.Errorf("%s: finding=%v body length %d title %q", name, found, len(p.Body), p.Title)
+		}
+		if el := time.Since(start); el > time.Second*slack() {
+			t.Errorf("%s: took %v", name, el)
+		}
+	}
+}
+
+// The review's two shapes as one unbroken line: the page is over the size cap, the line is cut
+// out of the parsed prefix, and nothing slow runs.
+func TestOneHugeLineOfDelimitersIsFast(t *testing.T) {
+	for name, line := range map[string]string{
+		"links":    strings.Repeat("[a](", 60000),
+		"emphasis": strings.Repeat("*a_", 85000),
+	} {
+		start := time.Now()
+		p := ParsePage("x.md", []byte("# Title\n\n"+line+"\n"))
+		if el := time.Since(start); el > time.Second*slack() || p.Title != "Title" {
+			t.Errorf("%s: took %v, title %q", name, el, p.Title)
+		}
+	}
+}
+
+// The worst page the bounds still allow parses quickly: every bound at its limit at once.
+func TestWorstAllowedPageParsesWithinTheBudget(t *testing.T) {
+	md := "# Title\n\n" + strings.Repeat("[a](", 750) + strings.Repeat("![a](", 750) +
+		strings.Repeat("*a_", 2000) + strings.Repeat("`a", 2000) + "\n"
+	start := time.Now()
+	p := ParsePage("x.md", []byte(md))
+	el := time.Since(start)
+	for _, f := range p.Findings {
+		if strings.Contains(f.Msg, "too complex") {
+			t.Fatalf("the allowed page was refused: %+v (size %d)", f, len(md))
+		}
+	}
+	// The race detector slows the parser several-fold, so the budget is measured without it.
+	if limit := 250 * time.Millisecond * slack(); el > limit && !raceEnabled {
+		t.Errorf("worst allowed page took %v, limit %v", el, limit)
+	}
+	if p.Body == "" {
+		t.Errorf("an allowed page was not indexed")
 	}
 }
 
@@ -338,18 +438,18 @@ func TestPathologicalNestingIsRefusedNotParsed(t *testing.T) {
 	}
 }
 
-// Over 256 KiB the parser is not run over the whole page: its title and headings are indexed
-// from the first 256 KiB, and the page says so.
+// Over 64 KiB the parser is not run over the whole page: its title and headings are indexed
+// from the first 64 KiB, and the page says so.
 func TestOversizePageIsIndexedAsTitleAndHeadingsOnly(t *testing.T) {
 	big := "# Big page\n\n## Early heading\n\nEARLY-PARAGRAPH\n\n<!--\n## HIDDEN-HEADING\n-->\n\n" +
-		strings.Repeat("filler line of ordinary text\n\n", 12000) + "## Late heading\n"
+		strings.Repeat("filler line of ordinary text\n\n", 3000) + "## Late heading\n"
 	p := ParsePage("x.md", []byte(big))
-	if len(big) <= 256<<10 {
+	if len(big) <= 64<<10 {
 		t.Fatalf("fixture too small: %d", len(big))
 	}
 	found := false
 	for _, f := range p.Findings {
-		found = found || strings.Contains(f.Msg, "larger than 256 KiB")
+		found = found || strings.Contains(f.Msg, "larger than 64 KiB")
 	}
 	if !found {
 		t.Errorf("no finding: %+v", p.Findings)
