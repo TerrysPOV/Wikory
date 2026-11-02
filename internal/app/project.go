@@ -125,6 +125,14 @@ func readCloneID(commonDir string) string {
 // written. A failure before the transaction commits changes nothing, and the old record no
 // longer matches the file; a failure after it leaves a nonce the file does not carry.
 func ensureCloneID(ctx context.Context, st *store.Store, commonDir string) (cloneID string, revoked bool, err error) {
+	// One setup of a clone at a time: reading the nonce, rebinding the store and writing the
+	// file are a single sequence, and two interleaved ones leave the store and the file
+	// naming different ids.
+	unlock, err := st.LockClone()
+	if err != nil {
+		return "", false, fmt.Errorf("waiting for another setup of this clone: %w", err)
+	}
+	defer unlock()
 	want, known, err := st.CloneID(ctx, commonDir)
 	if err != nil {
 		return "", false, err

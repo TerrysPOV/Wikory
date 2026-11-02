@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"path/filepath"
 	"slices"
+	"time"
 )
 
 // maxManifestRead bounds the manifest read while looking for the checkout a job belonged to.
@@ -73,3 +75,13 @@ func (s *Store) purgeCheckoutFiles(oldIDs []string) {
 }
 
 func isGone(err error) bool { return errors.Is(err, fs.ErrNotExist) }
+
+// cloneIDLockWait bounds the wait for another process setting up the same clone.
+const cloneIDLockWait = 10 * time.Second
+
+// LockClone takes the store's clone-setup lock, held across reading the clone's nonce,
+// rebinding the store and writing the nonce file, so two setups of one clone cannot
+// interleave and leave the store and the file naming different ids.
+func (s *Store) LockClone() (func(), error) {
+	return Lock(filepath.Join(s.Dir, "locks", "clone-id.lock"), cloneIDLockWait)
+}
