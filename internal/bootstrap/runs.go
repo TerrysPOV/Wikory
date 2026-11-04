@@ -37,8 +37,8 @@ const (
 
 // Item is one leased or stored unit of model work.
 type Item struct {
-	ID, RunID, Stage, Ref, InputHash, State string
-	Epoch, Attempts                         int
+	ID, RunID, Stage, Ref, InputHash, State, Batch string
+	Epoch, Attempts                                int
 }
 
 // Batch is the items handed out by one Next call.
@@ -49,7 +49,10 @@ type Batch struct {
 
 // Usage is what the driver says a submission cost. The binary cannot measure it, so it is
 // recorded and reported as asserted.
-type Usage struct{ InputTokens, OutputTokens int }
+type Usage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}
 
 // Run is one bootstrap run.
 type Run struct {
@@ -64,6 +67,8 @@ type Run struct {
 	Sample    int    `json:"sample"`
 	TokensIn  int    `json:"tokens_in"`
 	TokensOut int    `json:"tokens_out"`
+	Accepted  int    `json:"claims_accepted"`
+	Rejected  int    `json:"claims_rejected"`
 }
 
 // RunStatus is a run with its item and source counts.
@@ -72,6 +77,7 @@ type RunStatus struct {
 	Items        map[string]map[string]int
 	Dispositions map[string]int
 	Components   int
+	Claims       map[string]int
 }
 
 // Runs stores bootstrap runs for one checkout. Every write runs in one transaction under the
@@ -177,11 +183,11 @@ func boolInt(b bool) int {
 	return 0
 }
 
-const runCols = `run_id,state,plan_hash,scope,head_commit,sample,end_marker,tokens_in,tokens_out,created_at,updated_at`
+const runCols = `run_id,state,plan_hash,scope,head_commit,sample,end_marker,tokens_in,tokens_out,accepted,rejected,created_at,updated_at`
 
 func scanRun(row interface{ Scan(...any) error }) (Run, error) {
 	var x Run
-	err := row.Scan(&x.ID, &x.State, &x.PlanHash, &x.Scope, &x.Head, &x.Sample, &x.EndMarker, &x.TokensIn, &x.TokensOut, &x.CreatedAt, &x.UpdatedAt)
+	err := row.Scan(&x.ID, &x.State, &x.PlanHash, &x.Scope, &x.Head, &x.Sample, &x.EndMarker, &x.TokensIn, &x.TokensOut, &x.Accepted, &x.Rejected, &x.CreatedAt, &x.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return x, ErrNoRun
 	}
@@ -298,6 +304,7 @@ func (r *Runs) Next(ctx context.Context, id string, max int) (Batch, error) {
 		now := r.ts()
 		for i := range picked {
 			picked[i].Epoch++
+			picked[i].Batch = b.ID
 			if _, err := tx.ExecContext(ctx, `UPDATE bs_items SET state='leased', epoch=?, batch=?, leased_at=? WHERE item_id=?`, picked[i].Epoch, b.ID, now, picked[i].ID); err != nil {
 				return err
 			}
@@ -310,8 +317,8 @@ func (r *Runs) Next(ctx context.Context, id string, max int) (Batch, error) {
 
 func loadItem(ctx context.Context, tx *sql.Tx, id, checkout string) (Item, error) {
 	it := Item{ID: id}
-	err := tx.QueryRowContext(ctx, `SELECT run_id,stage,ref,input_hash,state,epoch,attempts FROM bs_items WHERE item_id=? AND checkout_id=?`, id, checkout).
-		Scan(&it.RunID, &it.Stage, &it.Ref, &it.InputHash, &it.State, &it.Epoch, &it.Attempts)
+	err := tx.QueryRowContext(ctx, `SELECT run_id,stage,ref,input_hash,state,epoch,attempts,batch FROM bs_items WHERE item_id=? AND checkout_id=?`, id, checkout).
+		Scan(&it.RunID, &it.Stage, &it.Ref, &it.InputHash, &it.State, &it.Epoch, &it.Attempts, &it.Batch)
 	if errors.Is(err, sql.ErrNoRows) {
 		return it, ErrNoItem
 	}
@@ -396,7 +403,7 @@ func settleSample(ctx context.Context, tx *sql.Tx, runID, now string) error {
 
 // Status counts a run's items by stage and state and its sources by disposition.
 func (r *Runs) Status(ctx context.Context, id string) (RunStatus, error) {
-	st := RunStatus{Items: map[string]map[string]int{}, Dispositions: map[string]int{}}
+	st := RunStatus{Items: map[string]map[string]int{}, Dispositions: map[string]int{}, Claims: map[string]int{}}
 	run, err := r.Get(ctx, id)
 	if err != nil {
 		return st, err
@@ -431,6 +438,20 @@ func (r *Runs) Status(ctx context.Context, id string) (RunStatus, error) {
 			return st, err
 		}
 		st.Dispositions[d] = n
+	}
+	rows.Close()
+	rows, err = r.DB.QueryContext(ctx, `SELECT status,count(*) FROM bs_claims WHERE run_id=? AND checkout_id=? GROUP BY status`, id, r.CheckoutID)
+	if err != nil {
+		return st, err
+	}
+	for rows.Next() {
+		var s string
+		var n int
+		if err := rows.Scan(&s, &n); err != nil {
+			rows.Close()
+			return st, err
+		}
+		st.Claims[s] = n
 	}
 	rows.Close()
 	err = r.DB.QueryRowContext(ctx, `SELECT count(*) FROM bs_components WHERE run_id=? AND checkout_id=?`, id, r.CheckoutID).Scan(&st.Components)
@@ -481,4 +502,24 @@ func (r *Runs) Components(ctx context.Context, id string) ([]Component, error) {
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Rank < out[j].Rank })
 	return out, rows.Err()
+}
+
+// Item returns one item of this checkout.
+func (r *Runs) Item(ctx context.Context, id string) (Item, error) {
+	it := Item{ID: id}
+	err := r.DB.QueryRowContext(ctx, `SELECT run_id,stage,ref,input_hash,state,epoch,attempts,batch FROM bs_items WHERE item_id=? AND checkout_id=?`, id, r.CheckoutID).
+		Scan(&it.RunID, &it.Stage, &it.Ref, &it.InputHash, &it.State, &it.Epoch, &it.Attempts, &it.Batch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return it, ErrNoItem
+	}
+	return it, err
+}
+
+// AddCounts adds to a run's accepted and rejected claim counts, for a submission that was
+// requeued and so never reached Complete.
+func (r *Runs) AddCounts(ctx context.Context, runID string, accepted, rejected int) error {
+	return r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE bs_runs SET accepted=accepted+?, rejected=rejected+? WHERE run_id=? AND checkout_id=?`, accepted, rejected, runID, r.CheckoutID)
+		return err
+	})
 }

@@ -119,6 +119,7 @@ type statusReport struct {
 	Items        map[string]map[string]int `json:"items"`
 	Dispositions map[string]int            `json:"sources"`
 	Components   int                       `json:"components"`
+	Claims       map[string]int            `json:"claims"`
 	Summary      string                    `json:"summary"`
 	TokensNote   string                    `json:"tokens_note"`
 }
@@ -141,7 +142,7 @@ func bootstrapStatus(ctx context.Context, env *Env, args []string) (Result, erro
 	if err != nil {
 		return Result{}, err
 	}
-	rep := statusReport{Run: st.Run, Items: st.Items, Dispositions: st.Dispositions, Components: st.Components, Summary: statusLine(st),
+	rep := statusReport{Run: st.Run, Items: st.Items, Dispositions: st.Dispositions, Components: st.Components, Claims: st.Claims, Summary: statusLine(st),
 		TokensNote: "token counts are asserted by the driver; the binary cannot measure them"}
 	text := fmt.Sprintf("%s\ntokens (asserted): %d in, %d out\n", rep.Summary, st.Run.TokensIn, st.Run.TokensOut)
 	return Result{Data: rep, Text: text}, nil
