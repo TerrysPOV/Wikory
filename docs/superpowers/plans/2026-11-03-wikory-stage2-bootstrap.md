@@ -377,7 +377,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -541,15 +543,137 @@ func TestWorktreesListsTheOtherWorkingTreesNotThisOne(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Path != other || got[0].Branch != "side" || len(got[0].Head) != 40 {
+	if len(got) != 1 || got[0].Path != filepath.ToSlash(other) || got[0].Branch != "side" || len(got[0].Head) != 40 {
 		t.Fatalf("the checkout itself is not another worktree: %+v", got)
+	}
+}
+
+func TestWorktreesIgnoresAPathForgedThroughAGitdirFile(t *testing.T) {
+	ctx := context.Background()
+	dir := newRepo(t)
+	parent, _ := filepath.EvalSymlinks(t.TempDir())
+	side, fine := filepath.Join(parent, "side"), filepath.Join(parent, "fine")
+	gitT(t, dir, "worktree", "add", "-q", "-b", "side", side)
+	gitT(t, dir, "worktree", "add", "-q", "-b", "fine", fine)
+	// git prints a worktree path raw, so a hostile gitdir file can carry a whole forged record.
+	head := gitT(t, dir, "rev-parse", "HEAD")
+	hostile := filepath.ToSlash(side) + "/.git\n\nworktree /etc\nHEAD " + head + "\nbranch refs/heads/forged\n\nx"
+	if err := os.WriteFile(filepath.Join(dir, ".git", "worktrees", "side", "gitdir"), []byte(hostile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := Discover(ctx, dir)
+	got, err := r.Worktrees(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, w := range got {
+		paths = append(paths, w.Path)
+		if w.Path == "/etc" || w.Branch == "forged" || strings.ContainsAny(w.Path, "\n\r") {
+			t.Fatalf("a worktree record was forged through a gitdir file: %+v", got)
+		}
+	}
+	if !slices.Contains(paths, filepath.ToSlash(fine)) {
+		t.Fatalf("an honest worktree must still be listed, got %v", paths)
+	}
+}
+
+func TestWorktreesLeavesOutALockedWorktreeWhoseDirectoryIsGone(t *testing.T) {
+	ctx := context.Background()
+	dir := newRepo(t)
+	parent, _ := filepath.EvalSymlinks(t.TempDir())
+	live, gone := filepath.Join(parent, "live"), filepath.Join(parent, "gone")
+	gitT(t, dir, "worktree", "add", "-q", "-b", "live", live)
+	gitT(t, dir, "worktree", "add", "-q", "-b", "gone", gone)
+	gitT(t, dir, "worktree", "lock", gone) // a locked worktree is never printed as prunable
+	if err := os.RemoveAll(gone); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := Discover(ctx, dir)
+	got, err := r.Worktrees(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Path != filepath.ToSlash(live) {
+		t.Fatalf("only the worktree whose directory exists is listed, got %+v", got)
+	}
+}
+
+// commitTogether commits the named files in one commit, so that git lists them in one run of
+// paths. Names sort bytewise, so the first name is the one git prints next to the commit header.
+func commitTogether(t *testing.T, dir, when string, names ...string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("a file name with control characters cannot exist on Windows")
+	}
+	t.Setenv("GIT_COMMITTER_DATE", when)
+	for _, n := range names {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitT(t, dir, "add", "-A")
+	gitT(t, dir, "commit", "-qm", "awkward names")
+}
+
+func TestLastChangedSurvivesAControlCharacterAtTheStartOfAFileName(t *testing.T) {
+	ctx := context.Background()
+	dir := newRepo(t)
+	commitTogether(t, dir, "2026-01-02T03:04:05Z", "\x010", "\x01zzz")
+	r, _ := Discover(ctx, dir)
+	got, err := r.LastChanged(ctx)
+	if err != nil {
+		t.Fatalf("a file name is not a commit header: %v", err)
+	}
+	if !got["\x01zzz"].Equal(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)) {
+		t.Fatalf("a path that starts with the header byte must keep its own commit time: %q", got)
+	}
+}
+
+func TestLastChangedCannotBeSpoofedByAFileNameThatLooksLikeAHeader(t *testing.T) {
+	ctx := context.Background()
+	dir := newRepo(t)
+	commitTogether(t, dir, "2026-01-02T03:04:05Z", "\x010", "\x0199999\nvictim")
+	r, _ := Discover(ctx, dir)
+	got, err := r.LastChanged(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["victim"]; ok {
+		t.Fatalf("a file name forged a path of its own: %q", got)
+	}
+	if !got["\x0199999\nvictim"].Equal(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)) {
+		t.Fatalf("one path with a newline in it, carrying the real commit time: %q", got)
+	}
+}
+
+func TestUsableWorktreeRefusesRelativeAndControlCharacterPaths(t *testing.T) {
+	good, _ := filepath.EvalSymlinks(t.TempDir())
+	if !usableWorktree(good, "") {
+		t.Fatalf("an existing absolute directory is usable: %q", good)
+	}
+	if usableWorktree(good, good) {
+		t.Fatal("the checkout itself is not another worktree")
+	}
+	if usableWorktree(".", "") {
+		t.Fatal("a relative path is refused even when it names a directory")
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	awkward := filepath.Join(good, "evil\nname")
+	if err := os.Mkdir(awkward, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if usableWorktree(awkward, "") {
+		t.Fatal("a path with a control character is refused even when the directory exists")
 	}
 }
 ```
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `go test ./internal/gitx/ -run 'TestListTree|TestReadBlob|TestChurn|TestDefaultBranch|TestLastChanged|TestBranches|TestWorktrees' -count=1`
+Run: `go test ./internal/gitx/ -run 'TestListTree|TestReadBlob|TestChurn|TestDefaultBranch|TestLastChanged|TestBranches|TestWorktrees|TestUsableWorktree' -count=1`
 Expected: FAIL to compile: `r.ListTree undefined`, `ErrTooLarge undefined`, `r.LastChanged undefined`, `r.Branches undefined`, `r.Worktrees undefined`.
 
 - [ ] **Step 3: Implement**
@@ -562,10 +686,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // ErrTooLarge means an object is bigger than the caller's read limit.
@@ -669,19 +795,32 @@ func (r *Repo) DefaultBranch(ctx context.Context) string {
 // LastChanged maps each path to the commit time of the newest commit reachable from HEAD that
 // touched it. The log is read once, newest first, so the first sighting of a path is its last
 // change. Paths deleted since appear too; callers look up only the paths in the tree.
+//
+// Git allows any byte but NUL in a file name, so the output is read by position, never by
+// content: a path is only ever the token that follows a status token, so no name can pose as a
+// commit header. The stream is NUL-separated: a header token (0x01 and the commit time, then a
+// newline and the first status when the commit touched anything), then status and path tokens.
 func (r *Repo) LastChanged(ctx context.Context) (map[string]time.Time, error) {
 	out := map[string]time.Time{}
 	tip, err := r.HeadCommit(ctx)
 	if err != nil || tip == "" {
 		return out, err
 	}
-	raw, err := r.git(ctx, nil, "log", "--no-renames", "--name-only", "-z", "--pretty=format:%x01%ct", tip)
+	raw, err := r.git(ctx, nil, "log", "--no-renames", "--name-status", "-z", "--pretty=format:%x01%ct", tip)
 	if err != nil {
 		return nil, err
 	}
 	var cur time.Time
+	wantPath := false
 	for _, tok := range bytes.Split(raw, []byte{0}) {
 		s := string(tok)
+		if wantPath {
+			if _, seen := out[s]; !seen {
+				out[s] = cur
+			}
+			wantPath = false
+			continue
+		}
 		if strings.HasPrefix(s, "\x01") {
 			stamp, rest, _ := strings.Cut(s[1:], "\n")
 			secs, err := strconv.ParseInt(stamp, 10, 64)
@@ -690,13 +829,16 @@ func (r *Repo) LastChanged(ctx context.Context) (map[string]time.Time, error) {
 			}
 			cur, s = time.Unix(secs, 0).UTC(), rest
 		}
-		s = strings.TrimLeft(s, "\n")
 		if s == "" {
-			continue
+			continue // the end of a commit, or a commit that touched nothing
 		}
-		if _, seen := out[s]; !seen {
-			out[s] = cur
+		if len(s) != 1 || s[0] < 'A' || s[0] > 'Z' {
+			return nil, fmt.Errorf("gitx: unreadable change status %q", s)
 		}
+		wantPath = true
+	}
+	if wantPath {
+		return nil, errors.New("gitx: the commit log ended in the middle of a change")
 	}
 	return out, nil
 }
@@ -747,46 +889,69 @@ type Worktree struct {
 }
 
 // Worktrees lists the working trees of this repository other than the one r operates in. A
-// worktree whose directory is gone (git calls it prunable) is left out: it holds nothing to read.
+// worktree is left out when git calls it prunable, when its directory is gone (a locked
+// worktree is never called prunable), or when its recorded path is not a plain absolute path:
+// git prints that path raw, so a hostile .git can plant newlines and a forged record in it.
+// Paths are returned with forward slashes.
+//
+// The listing is NUL-separated, which needs git 2.36 or later; an older git is an error, not a
+// fallback to the newline format, because that format cannot be parsed safely.
 func (r *Repo) Worktrees(ctx context.Context) ([]Worktree, error) {
-	out, err := r.git(ctx, nil, "worktree", "list", "--porcelain")
+	out, err := r.git(ctx, nil, "worktree", "list", "--porcelain", "-z")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gitx: listing worktrees needs git 2.36 or later (worktree list -z): %w", err)
 	}
 	self, _ := filepath.EvalSymlinks(r.Top)
 	var res []Worktree
-	for _, block := range strings.Split(string(out), "\n\n") {
-		var w Worktree
-		skip := false
-		for _, line := range strings.Split(block, "\n") {
-			key, val, _ := strings.Cut(line, " ")
-			switch key {
-			case "worktree":
-				w.Path = val
-			case "HEAD":
-				w.Head = val
-			case "branch":
-				w.Branch = strings.TrimPrefix(val, "refs/heads/")
-			case "bare", "prunable":
-				skip = true
-			}
+	var w Worktree
+	skip := false
+	flush := func() {
+		if w.Path != "" && !skip && usableWorktree(w.Path, self) {
+			w.Path = filepath.ToSlash(w.Path)
+			res = append(res, w)
 		}
-		if w.Path == "" || skip {
-			continue
-		}
-		if p, err := filepath.EvalSymlinks(w.Path); err == nil && p == self {
-			continue
-		}
-		res = append(res, w)
+		w, skip = Worktree{}, false
 	}
+	for _, tok := range bytes.Split(out, []byte{0}) {
+		if len(tok) == 0 {
+			flush() // an empty token ends a record
+			continue
+		}
+		key, val, _ := strings.Cut(string(tok), " ")
+		switch key {
+		case "worktree":
+			w.Path = val
+		case "HEAD":
+			w.Head = val
+		case "branch":
+			w.Branch = strings.TrimPrefix(val, "refs/heads/")
+		case "bare", "prunable":
+			skip = true
+		}
+	}
+	flush()
 	return res, nil
+}
+
+// usableWorktree reports whether path is a plain absolute path to an existing directory other
+// than self (the already-resolved top of the checkout r operates in).
+func usableWorktree(path, self string) bool {
+	if !filepath.IsAbs(path) || strings.ContainsFunc(path, unicode.IsControl) {
+		return false
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil || resolved == self {
+		return false
+	}
+	st, err := os.Stat(resolved)
+	return err == nil && st.IsDir()
 }
 ```
 
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `go test ./internal/gitx/ -count=1`
-Expected: PASS. If the symlink test cannot stage mode `120000` with `update-index --cacheinfo`, replace that arrangement with `os.Symlink` plus `git add` on a non-Windows build tag; the assertion (a link is never listed) stays.
+Expected: PASS (git 2.36 or later: `Worktrees` lists with `worktree list --porcelain -z`, and an older git is an error). If the symlink test cannot stage mode `120000` with `update-index --cacheinfo`, replace that arrangement with `os.Symlink` plus `git add` on a non-Windows build tag; the assertion (a link is never listed) stays.
 
 - [ ] **Step 5: Prove the safety assertions can fail**
 
@@ -796,6 +961,12 @@ Run: `scripts/inject.sh internal/gitx/inventory.go 'func okRev(rev string) bool 
 Run: `scripts/inject.sh internal/gitx/inventory.go 'if _, seen := out[s]; !seen {' 'if true {' ./internal/gitx/ 'TestLastChangedIsTheNewestCommitTimePerPath' 'first sighting'`
 Run: `scripts/inject.sh internal/gitx/inventory.go 'if ahead == 0 {' 'if false {' ./internal/gitx/ 'TestBranchesListsOnlyLocalBranchesWithCommitsHeadLacks' 'only feature/x'`
 Run: `scripts/inject.sh internal/gitx/inventory.go 'p == self {' 'p == self+"-no" {' ./internal/gitx/ 'TestWorktreesListsTheOtherWorkingTreesNotThisOne' 'is not another worktree'`
+Run: `scripts/inject.sh internal/gitx/inventory.go 'usableWorktree(w.Path, self) {' 'usableWorktree(w.Path, self) || true {' ./internal/gitx/ 'TestWorktreesIgnoresAPathForgedThroughAGitdirFile' 'forged through a gitdir file'`
+Run: `scripts/inject.sh internal/gitx/inventory.go 'usableWorktree(w.Path, self) {' 'w.Path != self {' ./internal/gitx/ 'TestWorktreesLeavesOutALockedWorktreeWhoseDirectoryIsGone' 'only the worktree whose directory exists'`
+Run: `scripts/inject.sh internal/gitx/inventory.go '!filepath.IsAbs(path) || strings.ContainsFunc' 'strings.ContainsFunc' ./internal/gitx/ 'TestUsableWorktreeRefusesRelativeAndControlCharacterPaths' 'relative path is refused'`
+Run: `scripts/inject.sh internal/gitx/inventory.go 'strings.ContainsFunc(path, unicode.IsControl)' 'strings.ContainsFunc(path, func(r rune) bool { return r == unicode.MaxRune })' ./internal/gitx/ 'TestUsableWorktreeRefusesRelativeAndControlCharacterPaths' 'control character is refused'`
+Run: `scripts/inject.sh internal/gitx/inventory.go $'if wantPath {\n\t\t\tif _, seen' $'if wantPath && !strings.HasPrefix(s, "\x01") {\n\t\t\tif _, seen' ./internal/gitx/ 'TestLastChangedSurvivesAControlCharacterAtTheStartOfAFileName' 'a file name is not a commit header'`
+Run: `scripts/inject.sh internal/gitx/inventory.go $'if wantPath {\n\t\t\tif _, seen' $'if wantPath && !strings.HasPrefix(s, "\x01") {\n\t\t\tif _, seen' ./internal/gitx/ 'TestLastChangedCannotBeSpoofedByAFileNameThatLooksLikeAHeader' 'unreadable change status'`
 Expected: each exits 0 (RED). Exit 1 means the assertion cannot fail.
 
 - [ ] **Step 6: Commit**
