@@ -1,0 +1,82 @@
+# Bootstrap dry run on this repository (2026-11-04)
+
+A free run of `wikory bootstrap plan --sample 5` on a throwaway clone of `main`, with the binary built from the `feat/stage2-bootstrap` branch at `b520cb9` plus the Task 16 test files. `plan` is deterministic and sends nothing to a model. No `confirm`, `next`, `submit` or `finish` was run, so nothing paid started and no model saw any source text.
+
+## Setup
+
+The clone was of `main` (stages 0 and 1a), with `origin/HEAD` pointed at `main` so that the branch check passed. The committed `project-memory/` was removed first, because `init` records a pre-existing `project-memory/` as untrusted and there is no trust command until stage 1d; a project that has never run Wikory has none. `wikory init` then wrote a fresh one, and that was committed so that the tree was clean. The data directory was a scratch directory. The clone, the binary and the data directory were all outside the working tree and were removed afterwards.
+
+## Result
+
+| Measure | Value |
+|---|---|
+| Wall time of `plan` | 7.4 s (3.9 s user, 2.5 s system) |
+| Slowest stage | Inventory: 3.8 s to read and scan 311 files (the progress lines on stderr) |
+| Sources queued | 288 (203 implementation, 85 attributed) |
+| Sources skipped | 23: `secret` 16, `wikory` 5, `generated` 1, `oversize` 1 |
+| Components | 23 found, 12 inspected (to be verified) |
+| Extract stage | 97 items, about 200,696 input and 67,900 output tokens |
+| Verify stage | 12 items, about 72,000 input and 9,600 output tokens |
+| Batches | 15 |
+| Sample | 5 of the 97 extract items |
+| Price | None shown: no price is configured and a subscription plan has none |
+| Plan hash | `d94951563a99ba0c63fffcf6e20b6bb13126a27677a4b99ce056facf71b1ccc7` |
+
+Token figures are estimates (bytes divided by four), labelled as such in the output, and not yet measured. The plan hash was the same on a second `plan` run (`--json`), which made a new run id: the hash depends on what would be done, not on the run.
+
+The plan said, as it must: "Nothing has been sent to a model. A person must say yes before any paid step."
+
+## Checks the brief names
+
+- `Components` includes `internal/store` (rank 4), `internal/app` (rank 2), `plugins` (rank 14, not inspected) and `scripts` (rank 8).
+- `Sources` shows `project-memory/` as `skipped:wikory`: five files (`.gitattributes`, `config.toml`, `log.md`, `schema/claims.md`, `wiki/README.md`).
+- No secret text appeared: `rg -c 'hunter|AKIA|BEGIN'` over stdout and stderr printed nothing (exit 1, no match).
+- The run was on the default branch with a clean tree, as `plan` requires.
+
+## Components by rank
+
+| Rank | Component | Score | Inspected |
+|---|---|---|---|
+| 1 | docs | 52 | yes |
+| 2 | internal/app | 42 | yes |
+| 3 | internal/decode | 33 | yes |
+| 4 | internal/store | 32 | yes |
+| 5 | internal/spikes | 27 | yes |
+| 6 | cmd/wikory | 24 | yes |
+| 7 | internal/spikes/recorder | 23 | yes |
+| 8 | scripts | 23 | yes |
+| 9 | internal/retrieve | 19 | yes |
+| 10 | internal/confine | 15 | yes |
+| 11 | internal/capture | 14 | yes |
+| 12 | internal/publish | 12 | yes |
+| 13 | internal/gitx | 11 | no |
+| 14 | plugins | 8 | no |
+| 15 | internal/claim | 7 | no |
+| 16 | internal/validate | 5 | no |
+| 17 | internal/decode/claude | 4 | no |
+| 18 | internal/ids | 2 | no |
+| 19 | internal/injectcheck | 2 | no |
+| 20 | internal/redact | 2 | no |
+| 21 | . | 1 | no |
+| 22 | .github | 1 | no |
+| 23 | internal/deps | 1 | no |
+
+## What was skipped for secret-shaped text, and why it deserves a look
+
+Sixteen files were skipped as `secret`, which matches the reference run in the plan (16). Ten are expected: seven documents that quote secret-shaped fixtures (six spike results and `docs/verified-capabilities.md`), and three source files that define or exercise the redaction patterns (`internal/redact/redact.go`, `internal/redact/redact_test.go`, `internal/capture/capture_test.go`). The other six hold no secret at all. The detector is shape-based (Known limit 17 in the plan), and these lines match the assignment shape because a name contains "token":
+
+| File | Line | Shape that matched (the line is ordinary code) |
+|---|---|---|
+| `internal/store/schema.go` | 51 | `tokenize = 'unicode61');` in the FTS5 table definition |
+| `internal/app/project.go` | 68 | `c.Retrieval.BudgetTokens = defaultBudgetTokens` |
+| `internal/app/init_cmd.go` | 76 | `cfg.Retrieval.BudgetTokens = defaultBudgetTokens` |
+| `internal/app/briefing.go` | 127 | `BudgetTokens: p.Config.Retrieval.BudgetTokens,` |
+| `internal/publish/publish.go` | 600 | `token := []byte("job=" + m.JobID)` |
+| `internal/spikes/fts5_spike_test.go` | 40 | `... fts5(title, body, tokenize='unicode61')` |
+
+This is safe (a skipped file is never read by a model and the coverage report lists it) but it costs coverage: the `internal/store`, `internal/app` and `internal/publish` components lose core files (`schema.go`, `project.go`, `init_cmd.go`, `briefing.go`, `publish.go`) from their digests and from extraction, so a real bootstrap of this repository would know less about them than the component ranking suggests. Nothing was changed here; this is a finding for Terry to rule on (for example, treating a name that merely contains "token" as a secret key only when the value looks like one).
+
+## Not done
+
+- No sample, no extraction, no verification, no finish: all of those are paid or follow a paid step.
+- The manual check `V-bootstrap-1` (subagent access to the private store path) is not part of this task and is not recorded here.
