@@ -36,6 +36,17 @@ What remains is that the reference came from a scratch copy taken while the plan
 
 The plan said, as it must: "Nothing has been sent to a model. A person must say yes before any paid step."
 
+### Rerun after the final-review fixes (2026-11-04)
+
+The same procedure was repeated on a fresh throwaway clone of `main` (`769110d`), with a binary built from this branch after the final-review fixes. The counts are unchanged: 288 queued, 16 skipped for secret, 5 `wikory`, 1 generated, 1 oversize, 23 components, 12 inspected, 97 extract items, 12 verify items, 15 batches. The hash-rocket redaction rule added in that round changed no disposition in this repository (a scan of every tracked file gave the same files before and after). Two figures moved, both by design:
+
+| Measure | Before | After | Why |
+|---|---|---|---|
+| Extract input tokens | 200,696 | 201,929 | a component digest's estimate now counts its header lines, which the digest itself now counts against its 60 KiB bound |
+| Plan hash | `d949...1ccc7` | `84522dfbfab84e0e93bec5e6d9cb90895002eb803f0a792cf6b2694b14063891` | the hash version is 3: other branches and worktrees are no longer hashed, churn is counted back from HEAD's commit time, and the estimates changed |
+
+A second `plan` gave the same hash. `plan` took 4.8 s. No secret text appeared (`rg -c 'hunter|AKIA|BEGIN'` over stdout and stderr: no match).
+
 ## Checks the brief names
 
 - `Components` includes `internal/store` (rank 4), `internal/app` (rank 2), `plugins` (rank 14, not inspected) and `scripts` (rank 8).
