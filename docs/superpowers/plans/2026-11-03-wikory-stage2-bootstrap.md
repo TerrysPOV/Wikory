@@ -10637,8 +10637,9 @@ const MaxPageBytes = 48 << 10   // the budget for a WHOLE page: frontmatter, int
 const MaxListedBytes = 16 << 10 // the most a component listing may take of a page
 const Origin = "bootstrap"
 type RenderModel struct{ Run Run; Date string; Components []Component; Sources []Source; Claims []StoredClaim }
-type PageOut struct{ Path, ID string; Content []byte }
+type PageOut struct{ Path, ID string; Content []byte; Unrenderable []string } // Unrenderable: claims on this page that the indexer's parser still cannot read
 func RenderPages(m RenderModel) []PageOut
+func Unrenderable(pages []PageOut) []string // every such claim id, in page order; the caller must report them
 type PageSecret struct{ Path string; Kinds []string } // a rendered page that holds secret-shaped text; never the text
 func ScanPages(pages []PageOut) []PageSecret
 func PlanOps(pages []PageOut, current func(path string) (data []byte, exists bool, err error), recorded func(path string) (hash string, ok bool)) (ops []publish.Op, conflicts, unchanged []string, err error)
@@ -10649,6 +10650,10 @@ func (r *Runs) RecordPublished(ctx, runID string, hashes map[string]string) erro
 Rendering rules (design 4.4): templates only, no model prose. A claim appears on exactly one page. Claim placement: a `conflicting` claim goes to **Known issues**; a claim from a handoff or an outside source goes to **Unfinished work**; `intent` and `rationale` claims go to **Constraints and intent**; `hypothesis` claims go to **Known issues**; a `current-impl` claim goes to the page of the highest-ranked inspected component it belongs to (its digest, or the first whose path its text names), else to **Architecture**. `MaxPageBytes` is the budget for the whole page, not just its claims: frontmatter, title, banner, introduction and links count against it, the component listing on the architecture page is cut at `MaxListedBytes` (it says how many entries it left out), and a split page links only to its first, previous and next part, so the head of a page does not grow with the number of parts. A page that would pass the budget splits into numbered pages, because the indexer parses only the first 64 KiB of a page and a claim past that point would be invisible to retrieval. Every page carries `origin: bootstrap` in its frontmatter and a banner that says what the page is.
 
 A page is overwritten only when its current content is what the previous bootstrap wrote (`bs_pages` holds the hash it wrote). Anything else is a human edit and is reported as a conflict, never replaced.
+
+Review round 1 changed this task as follows (the code blocks below are the tree as committed in `fix: verify rendered pages with the real parser and harden page names`). The byte budget was not the parser's only bound: `claim.ParsePage` refuses a page with more than 2000 backticks, 1500 `[` or `](`, or 4000 `*`/`_`, indexing it by its title alone, so a page of 400 claims with eight code spans each was inside `MaxPageBytes` and yet every claim on it was invisible to retrieval. `pageSpec.pages` now packs claims to the byte budget (`group`), then **verifies each part with the real parser** (`pageSpec.sound`: not degraded, exactly as many blocks as claims placed, every block parsed) and halves any part that fails, repeating until every part parses whole. A single claim that still fails alone (for example one with 2001 backticks, or an image or inline HTML in its text) cannot be helped by splitting: it is placed alone on its own page, its id is in that `PageOut.Unrenderable`, and `Unrenderable(pages)` lists them all, so nothing is dropped silently. Task 13's `finish` must call `bootstrap.Unrenderable(pages)` on the slice it scans and publishes and put the ids in its report (a claim on such a page is in the repository but not in the index). The byte packing stays because halving alone would leave parts over `MaxPageBytes` that the parser still reads (`TestPartsAreFilledToTheByteBudgetBeforeTheParserIsAsked`).
+
+The fold-ins: (2) the determinism test also renders the model with `Claims` reversed (production passes them ordered by `claim_id`) and compares bytes, so the sort in `place` is pinned; (3) `linksFor` is tested on a four-part split (first, previous and next only); (4) a `comp:` claim whose component is not inspected falls back to the architecture page instead of vanishing (`componentFor` checks the inspected list); (5) components are sorted by rank in `RenderPages` and `place` (`byRank`), whatever order the caller used; (6) the readable part of a component page's file name is cut to `maxSlugBytes` (80), the hash of the full prefix keeps it unique; (7) a backtick, `<` or `>` in a component name shows as an apostrophe, a single left angle quotation mark or a single right angle quotation mark in titles, headings, the introduction and the listing (`displayName`), so a name such as ``a`<b>x`` no longer makes the indexer omit a heading; (8) the overview counts `DispRead` and `DispQueued` sources as sources and says "queued" when only queued sources exist, "read" when only read ones do, and "read or queued" for a mix, because inventory only ever queues a source.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -10683,6 +10688,7 @@ package bootstrap
 import (
 	"bytes"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -10909,6 +10915,311 @@ func TestEverySplitPageIsWithinTheBudgetIncludingItsHeader(t *testing.T) {
 		}
 	}
 }
+
+// intentModel is a model whose only claims are n intent claims, all bound for Constraints. text
+// builds the text of claim i.
+func intentModel(t *testing.T, n int, text func(i int) string) RenderModel {
+	t.Helper()
+	m := renderModel(t)
+	m.Claims = nil
+	for i := 0; i < n; i++ {
+		m.Claims = append(m.Claims, stored(t, "src:repo:docs/decisions/0001.md", "intent", "unverified", text(i), i))
+	}
+	return m
+}
+
+// requireEveryClaimIndexed parses every page with the indexer's own parser and requires that
+// each claim of the model is on exactly one page that parses whole: nothing degraded, every
+// claim a block, none dropped or doubled.
+func requireEveryClaimIndexed(t *testing.T, m RenderModel, pages []PageOut) {
+	t.Helper()
+	seen := map[string]string{}
+	for _, pg := range pages {
+		parsed := claim.ParsePage(pg.Path, pg.Content)
+		if parsed.Degraded != "" {
+			t.Errorf("%s would be indexed in part: %s", pg.Path, parsed.Degraded)
+		}
+		for _, b := range parsed.Blocks {
+			if b.Err != nil {
+				t.Errorf("%s: a rendered claim did not parse: %v", pg.Path, b.Err)
+			}
+			if prev, dup := seen[b.Claim.ID]; dup {
+				t.Errorf("claim %s on both %s and %s", b.Claim.ID, prev, pg.Path)
+			}
+			seen[b.Claim.ID] = pg.Path
+		}
+	}
+	missing := 0
+	for _, c := range m.Claims {
+		if _, ok := seen[c.ClaimID]; !ok {
+			missing++
+		}
+	}
+	if missing > 0 {
+		t.Errorf("%d of %d claims are on no page the indexer can read", missing, len(m.Claims))
+	}
+}
+
+// Review finding 1: a page inside the byte budget can still be refused by the parser's
+// structure bounds (more than 2000 backticks, 1500 "[" or "](", 4000 "*" or "_"), which indexes
+// it by its title alone. Each model below stays inside the byte budget on every page that a
+// byte-only split produces and still passes a bound.
+func TestPagesTheParserWouldRefuseForStructureAreSplitUntilItReadsEveryClaim(t *testing.T) {
+	cases := map[string]struct {
+		n    int
+		text func(i int) string
+	}{
+		"code spans": {400, func(i int) string {
+			return fmt.Sprintf("`a%d` calls `b` then `c` and `d` with `e`, `f`, `g` and `h`.", i)
+		}},
+		"emphasis marks": {300, func(i int) string {
+			return fmt.Sprintf("Marks %d %s", i, strings.Repeat("a_", 40))
+		}},
+		"link marks": {300, func(i int) string {
+			return fmt.Sprintf("See %d %s", i, strings.Repeat("[a](b) ", 10))
+		}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := intentModel(t, tc.n, tc.text)
+			pages := RenderPages(m)
+			requireEveryClaimIndexed(t, m, pages)
+			parts := 0
+			for _, pg := range pages {
+				if strings.Contains(pg.Path, "constraints") {
+					parts++
+				}
+				if len(pg.Content) > MaxPageBytes {
+					t.Errorf("%s is %d bytes", pg.Path, len(pg.Content))
+				}
+			}
+			if parts < 2 {
+				t.Fatalf("a page the parser refuses must split, got %d part(s)", parts)
+			}
+			if got := Unrenderable(pages); len(got) != 0 {
+				t.Errorf("every claim here can be rendered, got %v", got)
+			}
+		})
+	}
+}
+
+// A claim the parser cannot read even alone must neither loop the splitter nor vanish: it is
+// placed alone on its own page and named.
+func TestAClaimTheParserCannotReadEvenAloneIsPlacedAloneAndReported(t *testing.T) {
+	m := intentModel(t, 6, func(i int) string { return fmt.Sprintf("Plain intent number %d.", i) })
+	m.Claims[3] = stored(t, "src:repo:docs/decisions/0001.md", "intent", "unverified", strings.Repeat("`a`", 1100), 3)
+	bad := m.Claims[3].ClaimID
+	pages := RenderPages(m)
+	got := Unrenderable(pages)
+	if !slices.Equal(got, []string{bad}) {
+		t.Fatalf("the unrenderable claim must be reported, got %v want [%s]", got, bad)
+	}
+	var alone *PageOut
+	for i := range pages {
+		if strings.Contains(string(pages[i].Content), "c="+bad) {
+			alone = &pages[i]
+		}
+	}
+	if alone == nil || strings.Count(string(alone.Content), "<!-- claim ") != 1 || !strings.Contains(string(alone.Content), strings.Repeat("`a`", 1100)) {
+		t.Fatalf("the claim is placed alone on a page that still holds its text")
+	}
+	seen := 0
+	for _, pg := range pages {
+		parsed := claim.ParsePage(pg.Path, pg.Content)
+		if parsed.Degraded != "" && pg.Path != alone.Path {
+			t.Errorf("%s would be indexed in part: %s", pg.Path, parsed.Degraded)
+		}
+		seen += len(parsed.Blocks)
+	}
+	if seen != 5 {
+		t.Fatalf("the five readable claims must all be indexed, got %d", seen)
+	}
+}
+
+func TestRenderingTwiceGivesTheSamePagesWhateverOrderTheClaimsArriveIn(t *testing.T) {
+	m := renderModel(t)
+	for i := 2; i < 8; i++ {
+		m.Claims = append(m.Claims, stored(t, "src:repo:docs/decisions/0001.md", "intent", "unverified", fmt.Sprintf("Further intent %d.", i), i))
+	}
+	for i := 0; i < 3; i++ {
+		m.Claims = append(m.Claims, stored(t, "src:repo:docs/other.md", "intent", "unverified", fmt.Sprintf("Tied intent %d.", i), 0))
+	}
+	reversed := m
+	reversed.Claims = slices.Clone(m.Claims)
+	slices.Reverse(reversed.Claims)
+	a, b := RenderPages(m), RenderPages(reversed)
+	if len(a) != len(b) {
+		t.Fatalf("page count differs: %d and %d", len(a), len(b))
+	}
+	for i := range a {
+		if a[i].Path != b[i].Path || !bytes.Equal(a[i].Content, b[i].Content) {
+			t.Fatalf("page %s depends on the order the claims were handed in (production passes them ordered by claim_id)", a[i].Path)
+		}
+	}
+}
+
+func TestComponentsAreRankedHoweverTheCallerOrderedThem(t *testing.T) {
+	m := renderModel(t)
+	m.Components = []Component{
+		{Name: "pkg/a", Prefix: "pkg/a", Rank: 1, Inspected: true, Files: 2},
+		{Name: "pkg/b", Prefix: "pkg/b", Rank: 2, Inspected: true, Files: 2},
+		{Name: "pkg/c", Prefix: "pkg/c", Rank: 3, Inspected: true, Files: 2},
+		{Name: "pkg/d", Prefix: "pkg/d", Rank: 4, Inspected: false, Files: 2},
+		{Name: "pkg/e", Prefix: "pkg/e", Rank: 5, Inspected: false, Files: 2},
+	}
+	m.Claims = []StoredClaim{
+		stored(t, "src:repo:docs/design.md", "current-impl", "unverified", "pkg/c is where it ends.", 0),
+		stored(t, "src:repo:docs/design.md", "current-impl", "unverified", "pkg/b and pkg/c are siblings.", 1),
+	}
+	shuffled := m
+	shuffled.Components = []Component{m.Components[4], m.Components[2], m.Components[0], m.Components[3], m.Components[1]}
+	a, b := RenderPages(m), RenderPages(shuffled)
+	if len(a) != len(b) {
+		t.Fatalf("page count differs: %d and %d", len(a), len(b))
+	}
+	for i := range a {
+		if a[i].Path != b[i].Path || !bytes.Equal(a[i].Content, b[i].Content) {
+			t.Fatalf("page %s depends on the order the components were handed in", a[i].Path)
+		}
+	}
+	var comps []string
+	for _, pg := range a {
+		if strings.Contains(pg.Path, "/component-") {
+			comps = append(comps, pg.Path[strings.LastIndex(pg.Path, "/component-")+1:])
+		}
+	}
+	if len(comps) != 3 || !strings.HasPrefix(comps[0], "component-pkg-a-") || !strings.HasPrefix(comps[1], "component-pkg-b-") || !strings.HasPrefix(comps[2], "component-pkg-c-") {
+		t.Fatalf("component pages follow rank: %v", comps)
+	}
+	// "pkg/b and pkg/c" names two inspected components: the higher-ranked one gets the claim,
+	// which only holds if the search runs in rank order.
+	if pg := pageByBase(a, "component-pkg-b-"+shortSlugHash("pkg/b")); pg == nil || !strings.Contains(string(pg.Content), "pkg/b and pkg/c are siblings.") {
+		t.Fatalf("a claim naming two components goes to the higher-ranked one")
+	}
+}
+
+func TestEachPartOfASplitPageLinksOnlyToItsFirstPreviousAndNextPart(t *testing.T) {
+	ps := pageSpec{base: "constraints", links: []string{"bootstrap-overview"}}
+	cases := []struct {
+		i    int
+		want []string
+	}{
+		{0, []string{"bootstrap-overview", "bootstrap-constraints-2"}},
+		{1, []string{"bootstrap-overview", "bootstrap-constraints", "bootstrap-constraints-3"}},
+		{2, []string{"bootstrap-overview", "bootstrap-constraints", "bootstrap-constraints-2", "bootstrap-constraints-4"}},
+		{3, []string{"bootstrap-overview", "bootstrap-constraints", "bootstrap-constraints-3"}},
+	}
+	for _, c := range cases {
+		if got := ps.linksFor(c.i, 4); !slices.Equal(got, c.want) {
+			t.Errorf("part %d of 4 links to %v, want %v", c.i+1, got, c.want)
+		}
+	}
+}
+
+func TestAClaimAboutAnUninspectedComponentFallsBackToTheGeneralPage(t *testing.T) {
+	m := renderModel(t)
+	m.Claims = []StoredClaim{stored(t, "comp:internal/other", "current-impl", "unverified", "The other package is not looked at.", 0)}
+	pages := RenderPages(m)
+	arch := pageByBase(pages, "architecture")
+	if arch == nil || !strings.Contains(string(arch.Content), "The other package is not looked at.") {
+		t.Fatal("a claim about a component with no page of its own is on the architecture page, not dropped")
+	}
+	requireEveryClaimIndexed(t, m, pages)
+}
+
+func TestAVeryDeepPrefixStillGivesAUsableFileName(t *testing.T) {
+	m := renderModel(t)
+	deepA := strings.Repeat("deep/", 80) + "pkga"
+	deepB := strings.Repeat("deep/", 80) + "pkgb"
+	m.Components = []Component{
+		{Name: deepA, Prefix: deepA, Rank: 1, Inspected: true, Files: 1},
+		{Name: deepB, Prefix: deepB, Rank: 2, Inspected: true, Files: 1},
+	}
+	m.Claims = []StoredClaim{
+		stored(t, "comp:"+deepA, "current-impl", "verified", "The first deep package works.", 0),
+		stored(t, "comp:"+deepB, "current-impl", "verified", "The second deep package works.", 0),
+	}
+	pages := RenderPages(m)
+	paths := map[string]bool{}
+	for _, pg := range pages {
+		base := pg.Path[strings.LastIndex(pg.Path, "/")+1:]
+		if len(base) > 255 {
+			t.Errorf("file name of %d bytes", len(base))
+		}
+		if paths[pg.Path] {
+			t.Errorf("%s is used twice", pg.Path)
+		}
+		paths[pg.Path] = true
+	}
+	requireEveryClaimIndexed(t, m, pages)
+}
+
+func TestAComponentNameWithMarkupStillRendersPagesTheParserReadsWhole(t *testing.T) {
+	for _, odd := range []string{"a`<b>x", "a`x", "a<b>x", "a<x", "a>x"} {
+		m := renderModel(t)
+		m.Components = []Component{{Name: odd, Prefix: odd, Rank: 1, Inspected: true, Files: 1}}
+		m.Claims = []StoredClaim{stored(t, "comp:"+odd, "current-impl", "verified", "The odd package works.", 0)}
+		pages := RenderPages(m)
+		for _, pg := range pages {
+			parsed := claim.ParsePage(pg.Path, pg.Content)
+			if len(parsed.Findings) != 0 || parsed.Degraded != "" {
+				t.Errorf("%q: %s: findings %+v, degraded %q", odd, pg.Path, parsed.Findings, parsed.Degraded)
+			}
+			if bytes.Contains(pg.Content, []byte(odd)) {
+				t.Errorf("%q: %s shows the name's markup unchanged", odd, pg.Path)
+			}
+		}
+		requireEveryClaimIndexed(t, m, pages)
+	}
+}
+
+// The parser check can only halve a part; it does not know the byte budget. A model of about
+// 100 KiB of claims would halve into two parts of 50 KiB, each readable and each over budget,
+// so the sizes must be packed to the budget first.
+func TestPartsAreFilledToTheByteBudgetBeforeTheParserIsAsked(t *testing.T) {
+	m := intentModel(t, 0, nil)
+	total := 0
+	for i := 0; total < 100<<10; i++ {
+		c := stored(t, "src:repo:docs/decisions/0001.md", "intent", "unverified", fmt.Sprintf("Intent number %d: %s", i, strings.Repeat("x", 300)), i)
+		m.Claims = append(m.Claims, c)
+		total += len(c.Meta) + len(c.Text) + 3
+	}
+	pages := RenderPages(m)
+	parts := 0
+	for _, pg := range pages {
+		if strings.Contains(pg.Path, "constraints") {
+			parts++
+		}
+		if len(pg.Content) > MaxPageBytes {
+			t.Errorf("%s is %d bytes, over the %d byte budget", pg.Path, len(pg.Content), MaxPageBytes)
+		}
+	}
+	if parts != 3 {
+		t.Errorf("100 KiB of claims fill three parts of the budget, got %d", parts)
+	}
+	requireEveryClaimIndexed(t, m, pages)
+}
+
+func TestOverviewCountsReadAndQueuedSourcesAndNamesWhichItIs(t *testing.T) {
+	src := func(d string) Source { return Source{Name: "repo", Path: d + ".md", Tier: TierIntent, Disposition: d} }
+	cases := []struct {
+		name    string
+		sources []Source
+		want    string
+	}{
+		{"queued only", []Source{src(DispQueued), src(DispQueued), src(DispOtherWorktree), src(DispLink)}, "built from 2 source files that were queued (1 more were skipped)"},
+		{"read only", []Source{src(DispRead), src(DispRead), src(DispRead), src(DispLink)}, "built from 3 source files that were read (1 more were skipped)"},
+		{"both", []Source{src(DispRead), src(DispQueued), src(DispLink)}, "built from 2 source files that were read or queued (1 more were skipped)"},
+	}
+	for _, c := range cases {
+		m := renderModel(t)
+		m.Sources = c.sources
+		ov := pageByBase(RenderPages(m), "overview")
+		if ov == nil || !strings.Contains(string(ov.Content), c.want) {
+			t.Errorf("%s: overview does not say %q", c.name, c.want)
+		}
+	}
+}
 ```
 
 `internal/bootstrap/pages_test.go`:
@@ -11013,8 +11324,8 @@ func TestPublishedHashesAreRecordedPerCheckout(t *testing.T) {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `go test ./internal/claim/ ./internal/bootstrap/ -run 'TestPageOrigin|TestEveryClaimIs|TestClaimsLand|TestPagesAreDeterministic|TestEmptySections|TestAPageOverTheBudget|TestPlanOps|TestPublishedHashes' -count=1`
-Expected: FAIL: `p.Origin undefined`; `undefined: RenderPages`, `PlanOps`, `shortSlugHash`.
+Run: `go test ./internal/claim/ ./internal/bootstrap/ -run 'TestPageOrigin|TestEveryClaimIs|TestClaimsLand|TestPagesAreDeterministic|TestEmptySections|TestAPageOverTheBudget|TestPlanOps|TestPublishedHashes|TestPagesTheParser|TestAClaimTheParser|TestRenderingTwice|TestComponentsAreRanked|TestEachPartOf|TestAClaimAboutAnUninspected|TestAVeryDeep|TestAComponentNameWithMarkup|TestPartsAreFilled|TestOverviewCounts' -count=1`
+Expected: FAIL: `p.Origin undefined`; `undefined: RenderPages`, `PlanOps`, `shortSlugHash`. (Against the first-round tree with only `Unrenderable` stubbed, the parser-structure, unrenderable-claim, component-order, uninspected-component, deep-prefix, markup-name and overview tests fail; the reversed-claims and link tests pass there because the code already did that, and are proved by injection below.)
 
 - [ ] **Step 3: Implement**
 
@@ -11038,6 +11349,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/TerrysPOV/Wikory/internal/claim"
 	"github.com/TerrysPOV/Wikory/internal/ids"
 )
 
@@ -11050,7 +11362,11 @@ const (
 	MaxListedBytes = 16 << 10
 	// minClaimBudget keeps a page from splitting into one claim per part if its head is huge.
 	minClaimBudget = 4 << 10
-	Origin         = "bootstrap"
+	// maxSlugBytes bounds the readable part of a component page's file name, so a deep prefix
+	// cannot push the name past the 255 bytes a file system allows. The hash that follows it
+	// keeps two cut prefixes apart.
+	maxSlugBytes = 80
+	Origin       = "bootstrap"
 )
 
 // RenderModel is everything the templates need. Date comes from the run, not the clock, so a
@@ -11063,10 +11379,29 @@ type RenderModel struct {
 	Claims     []StoredClaim
 }
 
-// PageOut is one rendered page.
+// PageOut is one rendered page. Unrenderable names the claims on it that the indexer's parser
+// still cannot see (a single claim whose own text is too complex or hides text), each placed
+// alone on its page. The caller must report them: the page holds them, the index does not.
 type PageOut struct {
-	Path, ID string
-	Content  []byte
+	Path, ID     string
+	Content      []byte
+	Unrenderable []string
+}
+
+// Unrenderable lists the claim ids that some page holds but the indexer cannot parse, in page
+// order.
+func Unrenderable(pages []PageOut) []string {
+	var out []string
+	for _, pg := range pages {
+		out = append(out, pg.Unrenderable...)
+	}
+	return out
+}
+
+type item struct {
+	heading string
+	text    string
+	claimID string
 }
 
 type section struct {
@@ -11094,8 +11429,17 @@ func componentBase(prefix string) string {
 	if slug == "" {
 		slug = "root"
 	}
+	if len(slug) > maxSlugBytes {
+		slug = strings.TrimRight(slug[:maxSlugBytes], "-")
+	}
 	return "component-" + slug + "-" + shortSlugHash(prefix)
 }
+
+// displayName is a component name as it is shown in a title, heading or listing. A backtick,
+// "<" or ">" in a name would open a code span or read as inline HTML and the indexer would
+// leave that heading out, so each shows as a harmless look-alike. The real prefix stays in the
+// claim-bearing references and in the file name's hash.
+var displayName = strings.NewReplacer("`", "'", "<", "\u2039", ">", "\u203a").Replace
 
 var statusOrder = []string{"verified", "conflicting", "unverified", "historical", "superseded"}
 
@@ -11128,9 +11472,26 @@ func outsideOrHandoff(ref string) bool {
 	return ok && (name != "repo" || IsHandoff(p))
 }
 
+// byRank is the components in rank order, whatever order the caller held them in.
+func byRank(cs []Component) []Component {
+	out := append([]Component(nil), cs...)
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Rank != out[j].Rank {
+			return out[i].Rank < out[j].Rank
+		}
+		return out[i].Prefix < out[j].Prefix
+	})
+	return out
+}
+
+// componentFor names the inspected component a claim belongs to, or "" for the general page. A
+// claim about a component that was not inspected has no page of its own to land on.
 func componentFor(c StoredClaim, inspected []Component) string {
 	if prefix, ok := strings.CutPrefix(c.Ref, "comp:"); ok {
-		return prefix
+		if slices.ContainsFunc(inspected, func(comp Component) bool { return comp.Prefix == prefix }) {
+			return prefix
+		}
+		return ""
 	}
 	for _, comp := range inspected {
 		if comp.Prefix != "." && strings.Contains(c.Text, comp.Prefix) {
@@ -11142,13 +11503,13 @@ func componentFor(c StoredClaim, inspected []Component) string {
 
 type placement struct {
 	intent, rationale, conflicting, hypotheses, unfinished, general []StoredClaim
-	byComponent                                                    map[string][]StoredClaim
+	byComponent                                                     map[string][]StoredClaim
 }
 
 func place(m RenderModel) placement {
 	pl := placement{byComponent: map[string][]StoredClaim{}}
 	var inspected []Component
-	for _, c := range m.Components {
+	for _, c := range byRank(m.Components) {
 		if c.Inspected {
 			inspected = append(inspected, c)
 		}
@@ -11201,16 +11562,20 @@ func RenderPages(m RenderModel) []PageOut {
 	for _, c := range m.Claims {
 		counts[c.Status]++
 	}
-	read, skipped := 0, 0
+	read, queued, skipped := 0, 0, 0
 	for _, s := range m.Sources {
-		if s.Disposition == DispQueued {
+		switch s.Disposition {
+		case DispQueued:
+			queued++
+		case DispRead:
 			read++
-		} else if s.Disposition != DispUnmergedBranch && s.Disposition != DispOtherWorktree {
-			skipped++ // a branch or worktree is not a source file
+		case DispUnmergedBranch, DispOtherWorktree: // a branch or worktree is not a source file
+		default:
+			skipped++
 		}
 	}
 	var inspected, rest []Component
-	for _, c := range m.Components {
+	for _, c := range byRank(m.Components) {
 		if c.Inspected {
 			inspected = append(inspected, c)
 		} else {
@@ -11225,8 +11590,8 @@ func RenderPages(m RenderModel) []PageOut {
 	}
 	specs = append(specs, pageSpec{base: "overview", typ: "concept", title: "Project overview (bootstrap baseline)",
 		intro: []string{
-			fmt.Sprintf("This section is a starting point for an existing project. It was built from %d source files that were read (%d more were skipped) and holds %d claims: %d verified, %d conflicting, %d not yet checked and %d historical.",
-				read, skipped, len(m.Claims), counts["verified"], counts["conflicting"], counts["unverified"], counts["historical"]),
+			fmt.Sprintf("This section is a starting point for an existing project. It was built from %d source files that were %s (%d more were skipped) and holds %d claims: %d verified, %d conflicting, %d not yet checked and %d historical.",
+				read+queued, sourceVerb(read, queued), skipped, len(m.Claims), counts["verified"], counts["conflicting"], counts["unverified"], counts["historical"]),
 			"- `bootstrap-architecture`: the components found and how they were ranked\n- `bootstrap-constraints`: stated intent, constraints and rationale\n- `bootstrap-known-issues`: open questions and conflicting claims\n- `bootstrap-unfinished-work`: what handoffs and notes say was in progress",
 		},
 		links: append([]string{"bootstrap-architecture", "bootstrap-constraints", "bootstrap-known-issues", "bootstrap-unfinished-work"}, compBases...)})
@@ -11239,10 +11604,10 @@ func RenderPages(m RenderModel) []PageOut {
 		if c.Entry {
 			entry = ", entry point"
 		}
-		lines = append(lines, fmt.Sprintf("- `%s`: rank %d, %d files%s, checked against code", c.Prefix, c.Rank, c.Files, entry))
+		lines = append(lines, fmt.Sprintf("- `%s`: rank %d, %d files%s, checked against code", displayName(c.Prefix), c.Rank, c.Files, entry))
 	}
 	for _, c := range rest {
-		lines = append(lines, fmt.Sprintf("- `%s`: rank %d, %d files, not checked; claims about it stay unverified", c.Prefix, c.Rank, c.Files))
+		lines = append(lines, fmt.Sprintf("- `%s`: rank %d, %d files, not checked; claims about it stay unverified", displayName(c.Prefix), c.Rank, c.Files))
 	}
 	if len(lines) > 0 {
 		archIntro = append(archIntro, capListing(lines, MaxListedBytes, "components"))
@@ -11271,11 +11636,11 @@ func RenderPages(m RenderModel) []PageOut {
 		for _, x := range cs {
 			hasRationale = hasRationale || x.Kind == "rationale"
 		}
-		intro := []string{fmt.Sprintf("Component `%s`: rank %d of %d, %d files.", c.Prefix, c.Rank, len(m.Components), c.Files)}
+		intro := []string{fmt.Sprintf("Component `%s`: rank %d of %d, %d files.", displayName(c.Prefix), c.Rank, len(m.Components), c.Files)}
 		if !hasRationale {
 			intro = append(intro, "No rationale was found for this component in the sources.")
 		}
-		specs = append(specs, pageSpec{base: componentBase(c.Prefix), typ: "component", title: "Component: " + c.Prefix, intro: intro, secs: secs,
+		specs = append(specs, pageSpec{base: componentBase(c.Prefix), typ: "component", title: "Component: " + displayName(c.Prefix), intro: intro, secs: secs,
 			empty: "No implementation claims were extracted for this component.", links: []string{"bootstrap-overview", "bootstrap-architecture"}})
 	}
 
@@ -11286,10 +11651,16 @@ func RenderPages(m RenderModel) []PageOut {
 	return out
 }
 
-type atom struct {
-	text    string
-	heading bool
-	claim   bool
+// sourceVerb says what happened to the counted sources. Inventory only queues a source; a
+// source is "read" only if something recorded that it was.
+func sourceVerb(read, queued int) string {
+	switch {
+	case queued == 0:
+		return "read"
+	case read == 0:
+		return "queued"
+	}
+	return "read or queued"
 }
 
 // capListing joins lines but stops before maxBytes and says how many it left out, so a project
@@ -11342,22 +11713,87 @@ func (ps pageSpec) head(banner string, i int, links []string) string {
 	return b.String()
 }
 
-func (ps pageSpec) pages(banner string) []PageOut {
-	var atoms []atom
-	n := 0
+// itemsOf is the claims of a page in order, each with the heading it sits under.
+func (ps pageSpec) itemsOf() []item {
+	var items []item
 	for _, s := range ps.secs {
-		if len(s.claims) == 0 {
-			continue
-		}
-		atoms = append(atoms, atom{text: "## " + s.heading + "\n\n", heading: true})
 		for _, c := range s.claims {
-			atoms = append(atoms, atom{text: c.Meta + "\n" + c.Text + "\n\n", claim: true})
-			n++
+			items = append(items, item{heading: s.heading, text: c.Meta + "\n" + c.Text + "\n\n", claimID: c.ClaimID})
 		}
 	}
-	if n == 0 && ps.empty != "" {
-		atoms = append(atoms, atom{text: ps.empty + "\n\n"})
+	return items
+}
+
+// body writes the claims of one part. A part starts with the heading of its first claim, so a
+// continuation page keeps every claim under a heading.
+func (ps pageSpec) body(g []item) string {
+	if len(g) == 0 {
+		return ps.empty + "\n\n"
 	}
+	var b strings.Builder
+	prev := ""
+	for _, it := range g {
+		if it.heading != prev {
+			b.WriteString("## " + it.heading + "\n\n")
+			prev = it.heading
+		}
+		b.WriteString(it.text)
+	}
+	return b.String()
+}
+
+func (ps pageSpec) pageFile(i int) string {
+	return strings.TrimPrefix(ps.idOf(i), "bootstrap-") + ".md"
+}
+
+func (ps pageSpec) content(banner string, i, parts int, g []item) []byte {
+	return []byte(ps.head(banner, i, ps.linksFor(i, parts)) + ps.body(g))
+}
+
+// sound reports whether the indexer's own parser sees every claim of a part: the page is not
+// degraded and it yields exactly the claims placed on it, each of which parses.
+func (ps pageSpec) sound(banner string, i, parts int, g []item) bool {
+	pg := claim.ParsePage(WikiDir+"/"+ps.pageFile(i), ps.content(banner, i, parts, g))
+	if pg.Degraded != "" || len(pg.Blocks) != len(g) {
+		return false
+	}
+	for _, b := range pg.Blocks {
+		if b.Err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// headingCost is what a heading adds to a part that starts a section with it.
+func headingCost(it item) int { return len("## ") + len(it.heading) + len("\n\n") }
+
+// group packs claims into parts by size alone. The parser has limits that bytes do not show
+// (code spans, links and emphasis marks per page), so pages() checks each part afterwards.
+func group(items []item, budget int) [][]item {
+	var groups [][]item
+	var cur []item
+	size := 0
+	for _, it := range items {
+		cost := len(it.text)
+		if len(cur) == 0 || cur[len(cur)-1].heading != it.heading {
+			cost += headingCost(it)
+		}
+		if size+cost > budget && len(cur) > 0 {
+			groups = append(groups, cur)
+			cur, size, cost = nil, 0, len(it.text)+headingCost(it)
+		}
+		cur = append(cur, it)
+		size += cost
+	}
+	if len(cur) > 0 || len(groups) == 0 {
+		groups = append(groups, cur)
+	}
+	return groups
+}
+
+func (ps pageSpec) pages(banner string) []PageOut {
+	items := ps.itemsOf()
 	// The whole page has to fit MaxPageBytes, not just its claims. What claims may use is what
 	// the widest head leaves: the first part, with its introduction, a full link list and a
 	// long part number (the slack covers " (part 99999)" in a later title).
@@ -11366,36 +11802,32 @@ func (ps pageSpec) pages(banner string) []PageOut {
 	if budget < minClaimBudget {
 		budget = minClaimBudget
 	}
-	var groups [][]atom
-	var cur []atom
-	size := 0
-	var last atom
-	for _, a := range atoms {
-		if size+len(a.text) > budget && len(cur) > 0 {
-			groups = append(groups, cur)
-			cur, size = nil, 0
-			if a.claim && last.text != "" {
-				cur, size = append(cur, last), len(last.text)
-			}
+	groups := group(items, budget)
+	// Verify each part with the real parser and halve any that it does not see whole. A part
+	// that holds a single claim and still fails cannot be helped by splitting: it stays alone
+	// on its page and is reported, never dropped.
+	var bad []string // claim ids, in page order
+	for i := 0; i < len(groups); {
+		g := groups[i]
+		switch {
+		case len(g) == 0 || ps.sound(banner, i, len(groups), g):
+			i++
+		case len(g) == 1:
+			bad = append(bad, g[0].claimID)
+			i++
+		default:
+			mid := len(g) / 2
+			groups = slices.Insert(groups, i+1, slices.Clone(g[mid:]))
+			groups[i] = slices.Clone(g[:mid])
 		}
-		cur = append(cur, a)
-		size += len(a.text)
-		if a.heading {
-			last = a
-		}
-	}
-	if len(cur) > 0 || len(groups) == 0 {
-		groups = append(groups, cur)
 	}
 	var out []PageOut
 	for i, g := range groups {
-		var b strings.Builder
-		b.WriteString(ps.head(banner, i, ps.linksFor(i, len(groups))))
-		for _, a := range g {
-			b.WriteString(a.text)
+		pg := PageOut{Path: WikiDir + "/" + ps.pageFile(i), ID: ps.idOf(i), Content: ps.content(banner, i, len(groups), g)}
+		if len(g) == 1 && slices.Contains(bad, g[0].claimID) {
+			pg.Unrenderable = []string{g[0].claimID}
 		}
-		file := strings.TrimPrefix(ps.idOf(i), "bootstrap-") + ".md"
-		out = append(out, PageOut{Path: WikiDir + "/" + file, ID: ps.idOf(i), Content: []byte(b.String())})
+		out = append(out, pg)
 	}
 	return out
 }
@@ -11512,11 +11944,26 @@ Expected: PASS. If `TestEveryClaimIsRenderedOnExactlyOnePageAndParsesBack` repor
 
 Run: `scripts/inject.sh internal/bootstrap/pages.go 'if rec, ok := recorded(pg.Path); ok && rec == cur {' 'if true {' ./internal/bootstrap/ 'TestPlanOpsCreatesUnchangedAndConflictRules' 'only the new page'`
 Run: `scripts/inject.sh internal/bootstrap/render.go 'case c.Status == "conflicting":' 'case false:' ./internal/bootstrap/ 'TestClaimsLandWhereTheRulesSendThem' 'known-issues'`
-Run: `scripts/inject.sh internal/bootstrap/render.go 'if size+len(a.text) > budget && len(cur) > 0 {' 'if false {' ./internal/bootstrap/ 'TestAPageOverTheBudgetSplitsIntoNumberedPagesKeepingHeadings' 'split'`
+Run: `scripts/inject.sh internal/bootstrap/render.go 'if size+cost > budget && len(cur) > 0 {' 'if false {' ./internal/bootstrap/ 'TestPartsAreFilledToTheByteBudgetBeforeTheParserIsAsked' 'over the'`
 Run: `scripts/inject.sh internal/bootstrap/render.go 'if !hasRationale {' 'if false {' ./internal/bootstrap/ 'TestEmptySectionsSayNothingWasFoundInsteadOfStayingBlank' 'rationale'`
 Run: `scripts/inject.sh internal/bootstrap/render.go 'if used+len(l)+1 > maxBytes {' 'if false {' ./internal/bootstrap/ 'TestEveryRenderedPageFitsTheParseCapWhateverTheComponentCount' 'indexed in part'`
 Run: `scripts/inject.sh internal/bootstrap/render.go 'budget := MaxPageBytes - len(ps.head(banner, 0, worst)) - 32' 'budget := MaxPageBytes - 32 + 0*len(worst)' ./internal/bootstrap/ 'TestEverySplitPageIsWithinTheBudgetIncludingItsHeader' 'head of the page was not counted'`
 Run: `scripts/inject.sh internal/bootstrap/pages.go 'if len(spans) == 0 {' 'if false {' ./internal/bootstrap/ 'TestScanPagesNamesThePageAndKindNeverTheText' 'only the page with a secret-shaped value'`
+Run: `scripts/inject.sh internal/bootstrap/render.go 'case len(g) == 0 || ps.sound(banner, i, len(groups), g):' 'case true:' ./internal/bootstrap/ 'TestPagesTheParserWouldRefuseForStructureAreSplitUntilItReadsEveryClaim' 'would be indexed in part'`
+Run: `scripts/inject.sh internal/bootstrap/render.go 'case len(g) == 1:' 'case len(g) >= 1:' ./internal/bootstrap/ 'TestPagesTheParserWouldRefuseForStructureAreSplitUntilItReadsEveryClaim' 'would be indexed in part'`
+Run: `scripts/inject.sh internal/bootstrap/render.go 'bad = append(bad, g[0].claimID)' '_ = g' ./internal/bootstrap/ 'TestAClaimTheParserCannotReadEvenAloneIsPlacedAloneAndReported' 'must be reported'`
+Run: `scripts/inject.sh internal/bootstrap/render.go 'sort.SliceStable(cs, func(i, j int) bool {' 'sort.SliceStable(cs, func(i, j int) bool {
+		return false' ./internal/bootstrap/ 'TestRenderingTwiceGivesTheSamePagesWhateverOrderTheClaimsArriveIn' 'depends on the order the claims were handed in'`
+Run: `scripts/inject.sh internal/bootstrap/render.go 'for _, j := range []int{0, i - 1, i + 1} {' 'for j := 0; j < parts; j++ {' ./internal/bootstrap/ 'TestEachPartOfASplitPageLinksOnlyToItsFirstPreviousAndNextPart' 'links to'`
+Run: `scripts/inject.sh internal/bootstrap/render.go 'if slices.ContainsFunc(inspected, func(comp Component) bool { return comp.Prefix == prefix }) {' 'if true {' ./internal/bootstrap/ 'TestAClaimAboutAnUninspectedComponentFallsBackToTheGeneralPage' 'not dropped'`
+Run: `scripts/inject.sh internal/bootstrap/render.go 'sort.SliceStable(out, func(i, j int) bool {' 'sort.SliceStable(out, func(i, j int) bool {
+		return false' ./internal/bootstrap/ 'TestComponentsAreRankedHoweverTheCallerOrderedThem' 'depends on the order the components were handed in'`
+Run: `scripts/inject.sh internal/bootstrap/render.go 'if len(slug) > maxSlugBytes {' 'if false {' ./internal/bootstrap/ 'TestAVeryDeepPrefixStillGivesAUsableFileName' 'file name of'`
+Run: `scripts/inject.sh internal/bootstrap/render.go 'NewReplacer("`", "' 'NewReplacer("~", "' ./internal/bootstrap/ 'TestAComponentNameWithMarkupStillRendersPagesTheParserReadsWhole' 'shows the name'`
+Run: `scripts/inject.sh internal/bootstrap/render.go '"<", "' '"~", "' ./internal/bootstrap/ 'TestAComponentNameWithMarkupStillRendersPagesTheParserReadsWhole' 'shows the name'`
+Run: `scripts/inject.sh internal/bootstrap/render.go '">", "' '"~", "' ./internal/bootstrap/ 'TestAComponentNameWithMarkupStillRendersPagesTheParserReadsWhole' 'shows the name'`
+Run: `scripts/inject.sh internal/bootstrap/render.go 'case DispRead:' 'case "never-read":' ./internal/bootstrap/ 'TestOverviewCountsReadAndQueuedSourcesAndNamesWhichItIs' 'overview does not say'`
+Run: `scripts/inject.sh internal/bootstrap/render.go 'case read == 0:' 'case false:' ./internal/bootstrap/ 'TestOverviewCountsReadAndQueuedSourcesAndNamesWhichItIs' 'overview does not say'`
 Expected: each exits 0 (RED).
 
 - [ ] **Step 6: Commit**
