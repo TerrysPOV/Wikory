@@ -1241,6 +1241,24 @@ git commit -m "feat: add redact.Scan reporting secret spans with offsets"
 
 ---
 
+#### Final whole-branch review fixes (2026-11-04)
+
+A2 (`91d4d46`): secrets written with a PHP or Ruby hash rocket were not redacted or scanned (`'db_password' => 'Hunter2Hunter2xyz'`, `:secret_key => "abcdEFGH12345678"`, `password => s3cr3tvaluehere` all gave `Scan` = []), because the two assignment rules read `=>` with spaces as a comparison. A third `assignment` rule follows them:
+
+```go
+{"assignment", regexp.MustCompile(`(?i)` + keywords + `[A-Za-z0-9_-]*["']?\s*=>[ \t]*(?P<secret>"[^"\n]{8,}"|'[^'\n]{8,}'|[^\s"'.()\[\]{},;<>=!&|$]{8,})(?:["'\s,;)\]}]|\z)`), rocketValue},
+```
+
+`rule` gains `accept func(secret string) bool` (nil for every other rule); `String` and `Scan` both skip a span `accept` refuses. `rocketValue` accepts a quoted literal, or a bare value that mixes letters and digits; a bare value must also end at a space, a separator or the end of the text, so `x1234567.trim()` is an expression. `token => token.trim()`, `x => x.token`, `password => some_function_name` (the comparison test above still pins it), `'password' => env('DB_PASSWORD')` and `'password' => $password` stay clean. Tests (split-literal fixtures): `TestHashRocketAssignmentsAreRedactedAndScanned`, `TestArrowFunctionsAndExpressionsAfterARocketStayClean` (arrow_test.go). A scan of every tracked file of this repository listed the same files with secret spans before and after, so the dry run's dispositions are unchanged.
+
+Run: `scripts/inject.sh internal/redact/redact.go '=>[ \t]*(?P<secret>' '=>NEVER[ \t]*(?P<secret>' ./internal/redact/ 'HashRocket' 'String left the secret'`
+Run: `scripts/inject.sh internal/redact/redact.go 'return strings.ContainsAny(v, "0123456789") && strings.IndexFunc(v, unicode.IsLetter) >= 0' 'return unicode.IsLetter(rune(v[0])) || true' ./internal/redact/ 'ArrowFunctions' 'String rewrote ordinary code'`
+Run: `scripts/inject.sh internal/redact/redact.go 'if r.accept != nil && !r.accept(m[loc[2*secret]:loc[2*secret+1]]) {' 'if false && r.accept != nil {' ./internal/redact/ 'ArrowFunctions' 'String rewrote ordinary code'`
+Run: `scripts/inject.sh internal/redact/scan.go 'if r.accept != nil && !r.accept(s[start:end]) {' 'if false && r.accept != nil {' ./internal/redact/ 'ArrowFunctions' 'want none'`
+Run: `scripts/inject.sh internal/redact/redact.go '{8,})(?:["'"'"'\s,;)\]}]|\z)`)' '{8,})`)' ./internal/redact/ 'ArrowFunctions' 'String rewrote ordinary code'`
+
+Expected: each exits 0 (RED).
+
 ### Task 4: Exclusions, tiers, source readers
 
 **Files:**
