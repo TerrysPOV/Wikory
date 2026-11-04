@@ -2304,6 +2304,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -2508,15 +2509,15 @@ func TestUnreadSourcesNameBranchesAndWorktreesAndInventoryNeverReadsThem(t *test
 	tip := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 	un := UnreadSources("main",
 		[]gitx.Branch{{Name: "feature/x", Ahead: 3, Tip: tip}},
-		[]gitx.Worktree{{Path: "/w/side", Branch: "side", Head: strings.Repeat("c", 40)}, {Path: "/w/old", Head: strings.Repeat("d", 40)}, {Path: "/w/node_modules/deps", Branch: "deps", Head: strings.Repeat("e", 40)}})
+		[]gitx.Worktree{{Path: "/w/side", Branch: "side", Head: strings.Repeat("c", 40)}, {Path: "/w/old", Head: strings.Repeat("d", 40)}, {Path: "/w/deps", Branch: "x/node_modules/deps", Head: strings.Repeat("e", 40)}})
 	if len(un) != 4 || un[0].Disposition != DispUnmergedBranch || un[1].Disposition != DispOtherWorktree || un[2].Disposition != DispOtherWorktree {
 		t.Fatalf("%+v", un)
 	}
 	if !strings.Contains(un[0].Path, "feature/x") || !strings.Contains(un[0].Path, "3 commit") || un[0].Date != "2026-03-04T05:06:07Z" {
 		t.Fatalf("a branch is named with how far ahead it is, and dated: %+v", un[0])
 	}
-	if !strings.Contains(un[2].Path, "detached at dddddddddddd") {
-		t.Fatalf("a detached worktree says so: %+v", un[2])
+	if un[1].Path != "worktree:side" || un[2].Path != "worktree:dddddddddddd" {
+		t.Fatalf("a worktree is labelled by its branch, or by a short head id when detached, never by its directory: %+v %+v", un[1], un[2])
 	}
 	repo := &memReader{name: "repo", files: map[string]string{"a.go": "package a\n"}}
 	res, err := Inventory(ctx, []Reader{repo}, Options{Budget: 5, Unread: un})
@@ -2530,11 +2531,25 @@ func TestUnreadSourcesNameBranchesAndWorktreesAndInventoryNeverReadsThem(t *test
 		t.Fatalf("the file and four unread records: %+v", res.Sources)
 	}
 	if got := srcBy(res, un[3].Path); got.Disposition != DispOtherWorktree {
-		t.Fatalf("a recorded disposition is never replaced by an exclusion rule (this path has a node_modules segment): %+v", got)
+		t.Fatalf("a recorded disposition is never replaced by an exclusion rule (this label has a node_modules segment): %+v", got)
 	}
 	for _, p := range repo.reads {
 		if strings.HasPrefix(p, "branch:") || strings.HasPrefix(p, "worktree:") {
 			t.Fatalf("%s was read", p)
+		}
+	}
+}
+
+func TestUnreadWorktreeRecordsDoNotDependOnWhereTheWorktreeLives(t *testing.T) {
+	head := strings.Repeat("c", 40)
+	a := UnreadSources("main", nil, []gitx.Worktree{{Path: "/Users/a/side", Branch: "side", Head: head}, {Path: "/Users/a/old", Head: head}})
+	b := UnreadSources("main", nil, []gitx.Worktree{{Path: "/srv/ci/elsewhere/side", Branch: "side", Head: head}, {Path: "/srv/ci/moved/old", Head: head}})
+	if !reflect.DeepEqual(a, b) {
+		t.Fatalf("the same worktrees in other directories must give identical records, so a plan hash is portable:\n%+v\n%+v", a, b)
+	}
+	for _, s := range a {
+		if strings.Contains(s.Path, "/") {
+			t.Fatalf("an absolute directory leaked into a record: %+v", s)
 		}
 	}
 }
@@ -3066,7 +3081,7 @@ import (
 // say they were not read. A bootstrap baselines the default branch at HEAD only, so work that
 // lives somewhere else is not in the baseline; listing it keeps the plan and the coverage
 // report from implying otherwise. Worktrees are brought in by refresh after a merge, not by
-// bootstrap (architecture spec section 9). The records carry no content and no hash.
+// bootstrap (architecture spec section 9). The records carry no content and no hash, and no machine-specific path.
 func UnreadSources(def string, branches []gitx.Branch, trees []gitx.Worktree) []Source {
 	var out []Source
 	for _, b := range branches {
@@ -3074,15 +3089,17 @@ func UnreadSources(def string, branches []gitx.Branch, trees []gitx.Worktree) []
 			Tier: TierAttributed, Disposition: DispUnmergedBranch, Date: dateOf(b.Tip)})
 	}
 	for _, w := range trees {
-		on := w.Branch
-		if on == "" {
-			head := w.Head
-			if len(head) > 12 {
-				head = head[:12]
+		// The label is the branch (git lets one worktree hold a branch, so it is unique) or a
+		// short head id when detached. The directory is left out on purpose: it differs by
+		// machine and moves with the worktree, and the plan hash covers this path.
+		label := w.Branch
+		if label == "" {
+			label = w.Head
+			if len(label) > 12 {
+				label = label[:12]
 			}
-			on = "detached at " + head
 		}
-		out = append(out, Source{Name: "repo", Path: fmt.Sprintf("worktree:%s (%s)", w.Path, on), Tier: TierAttributed, Disposition: DispOtherWorktree})
+		out = append(out, Source{Name: "repo", Path: "worktree:" + label, Tier: TierAttributed, Disposition: DispOtherWorktree})
 	}
 	return out
 }
@@ -3101,6 +3118,7 @@ Run: `scripts/inject.sh internal/bootstrap/rank.go 's := float64(capAt(c.Churn, 
 Run: `scripts/inject.sh internal/bootstrap/inventory.go 'if sk, ok := r.(Skipper); ok {' 'if sk, ok := r.(Skipper); ok && false {' ./internal/bootstrap/ 'TestInventoryRecordsWhatADirectoryReaderDroppedInsteadOfLosingIt' 'must appear as'`
 Run: `scripts/inject.sh internal/bootstrap/inventory.go 'all = append(all, listed{s: u})' '_ = u' ./internal/bootstrap/ 'TestUnreadSourcesNameBranchesAndWorktreesAndInventoryNeverReadsThem' 'listed as not read'`
 Run: `scripts/inject.sh internal/bootstrap/inventory.go 'continue // a reader already recorded why this was not read' '_ = s' ./internal/bootstrap/ 'TestUnreadSourcesNameBranchesAndWorktreesAndInventoryNeverReadsThem' 'never replaced by an exclusion rule'`
+Run: `scripts/inject.sh internal/bootstrap/unread.go 'Path: "worktree:" + label,' 'Path: "worktree:" + w.Path + " " + label,' ./internal/bootstrap/ 'TestUnreadWorktreeRecordsDoNotDependOnWhereTheWorktreeLives' 'must give identical records'`
 Run: `scripts/inject.sh internal/bootstrap/inventory.go 'date = dateOf(opt.LastChanged[e.Path])' 'date = ""' ./internal/bootstrap/ 'TestInventoryDatesRepositoryFilesByCommitTimeAndDirectoryFilesByModificationTime' 'last commit'`
 Run: `scripts/inject.sh internal/bootstrap/inventory.go 's.Disposition, s.SecretSpans = "skipped:secret", len(spans)' 's.Disposition, s.SecretSpans, s.Hash = "skipped:secret", len(spans), ids.SHA256Hex(data)' ./internal/bootstrap/ 'TestInventoryDisposesEachSourceAndNeverKeepsSecretText' 'carries no content hash'`
 Run: `scripts/inject.sh internal/bootstrap/inventory.go 'if i > 0 && !strings.ContainsRune(boundaryBefore' 'if false && i > 0 && !strings.ContainsRune(boundaryBefore' ./internal/bootstrap/ 'TestCountMentionsNamesAComponentOnlyAtAPathBoundary' 'want false'`
@@ -3144,6 +3162,8 @@ package bootstrap
 import (
 	"slices"
 	"testing"
+
+	"github.com/TerrysPOV/Wikory/internal/gitx"
 )
 
 func sampleResult() Result {
@@ -3234,6 +3254,29 @@ func TestPlanHashIsStableAndSensitive(t *testing.T) {
 	}
 	if a.Batches != 1+1 {
 		t.Fatalf("batches = %d, want 2 (one extract batch of up to %d, one verify batch)", a.Batches, BatchSize)
+	}
+}
+
+func withWorktrees(trees ...gitx.Worktree) Result {
+	r := sampleResult()
+	r.Sources = append(r.Sources, UnreadSources("main", nil, trees)...)
+	return r
+}
+
+func TestPlanHashDoesNotDependOnWhereAWorktreeLives(t *testing.T) {
+	head := "0123456789abcdef0123456789abcdef01234567"
+	here := BuildPlan(withWorktrees(gitx.Worktree{Path: "/Users/a/repo-side", Branch: "side", Head: head}), "repo", "abc123", 0)
+	there := BuildPlan(withWorktrees(gitx.Worktree{Path: "/srv/ci/moved/elsewhere", Branch: "side", Head: head}), "repo", "abc123", 0)
+	if here.Hash != there.Hash {
+		t.Fatalf("the same repository state must hash the same in another directory or on another machine: %s vs %s", here.Hash, there.Hash)
+	}
+	other := BuildPlan(withWorktrees(gitx.Worktree{Path: "/Users/a/repo-side", Branch: "other", Head: head}), "repo", "abc123", 0)
+	if other.Hash == here.Hash {
+		t.Fatal("a different branch checked out elsewhere is a different repository state, so it must change the hash")
+	}
+	none := BuildPlan(sampleResult(), "repo", "abc123", 0)
+	if none.Hash == here.Hash {
+		t.Fatal("having another worktree at all must change the hash")
 	}
 }
 ```
@@ -3917,6 +3960,8 @@ Expected: PASS.
 
 Run: `scripts/inject.sh internal/bootstrap/estimate.go 'h.Sources = append(h.Sources, hashSource{s.Name, s.Path, s.Hash, s.Disposition})' 'h.Sources = append(h.Sources, hashSource{s.Name, s.Path, "", s.Disposition})' ./internal/bootstrap/ 'TestPlanHashIsStableAndSensitive' 'changed source'`
 Run: `scripts/inject.sh internal/bootstrap/estimate.go 'if total > DigestMaxBytes {' 'if false {' ./internal/bootstrap/ 'TestComponentDigestSpecIsBoundedAndHashesItsFiles' 'capped'`
+Run: `scripts/inject.sh internal/bootstrap/unread.go 'Path: "worktree:" + label,' 'Path: "worktree:" + w.Path + " " + label,' ./internal/bootstrap/ 'TestPlanHashDoesNotDependOnWhereAWorktreeLives' 'must hash the same'`
+Run: `scripts/inject.sh internal/bootstrap/estimate.go 'h.Sources = append(h.Sources, hashSource{s.Name, s.Path, s.Hash, s.Disposition})' 'h.Sources = append(h.Sources, hashSource{s.Name, "", s.Hash, s.Disposition})' ./internal/bootstrap/ 'TestPlanHashDoesNotDependOnWhereAWorktreeLives' 'different repository state'`
 Expected: each exits 0 (RED).
 
 - [ ] **Step 7: Commit the bootstrap half**
