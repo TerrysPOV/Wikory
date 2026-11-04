@@ -6789,6 +6789,8 @@ func (r *Runs) AddCounts(ctx, runID string, accepted, rejected int) error
 
 Review round 1 changed this task as follows (the code blocks below are the tree as committed). The item id in a proposal is subagent-chosen, so `Submit` names an item in its report only after the store has found it, and the verify path in Task 11 must do the same. Usage is checked (`Usage.Check`, `ErrBadUsage`) in `Submit` and, before any result is submitted, in `bootstrapSubmit`. `Runs.FailCounted` (Task 8) takes the attempt's `Usage` and adds it to the run's tokens in the same transaction as the sample settle. Only typed refusals (`validate.ErrConfinement`, `validate.ErrAmbiguousID`, `ErrRefused`; see `IsRefusal`) count as claim rejects; any other `Admit` error is returned from `Submit` with the item still leased and nothing stored. `CheckText` also refuses leading or trailing whitespace, an underscore thematic break, a link reference definition and U+2028/U+2029. `bootstrapSubmit` decodes and checks every result of the batch (shape, usage, and that the item belongs to `--run`) before submitting any, and refuses data after the JSON object.
 
+Review round 2 changed this task as follows. `CheckText` refuses any text that opens with `[` and has `]:` after it (`startsLinkDefinition`) instead of matching CommonMark's label rules, which an escaped bracket got past; the dead ` {0,3}` indent allowance is gone from `underscoreRule`. When `Admit` fails with an infrastructure error, `Submit` returns a clean report (the item id and empty `Rejected` and `Findings`), so no reject that was never recorded is printed or counted twice on retry. `MaxUsageTokens` is compared as an `int64` so the package builds on 32-bit targets, and `ErrBadUsage` names the bound from the constant.
+
 First apply these edits to `internal/bootstrap/runs.go` (they are small and the tests below need them). Run `gofmt -w` afterwards.
 
 1. `Item` gains a `Batch` field: add `Batch string` to the first line of the struct, so it reads `ID, RunID, Stage, Ref, InputHash, State, Batch string`.
@@ -6800,17 +6802,18 @@ First apply these edits to `internal/bootstrap/runs.go` (they are small and the 
    }
 
    // MaxUsageTokens bounds what one submission may claim to have cost. It is far above any real
-   // item and far below anything that could overflow a counter.
+   // item and far below anything that could overflow a counter. It is compared as an int64, so
+   // the package builds where int is 32 bits wide.
    const MaxUsageTokens = 1 << 31
 
    // ErrBadUsage is what a usage figure outside 0..MaxUsageTokens is refused with.
-   var ErrBadUsage = errors.New("bootstrap: usage figures must be between 0 and 2147483648 tokens")
+   var ErrBadUsage = fmt.Errorf("bootstrap: usage figures must be between 0 and %d tokens", int64(MaxUsageTokens))
 
    // Check refuses usage the driver asserts that cannot be real. The figures feed the cost the
    // go-ahead rests on, so a negative one must never lower them.
    func (u Usage) Check() error {
    	for _, n := range [...]int{u.InputTokens, u.OutputTokens} {
-   		if n < 0 || n > MaxUsageTokens {
+   		if n < 0 || int64(n) > MaxUsageTokens {
    			return ErrBadUsage
    		}
    	}
@@ -6937,6 +6940,9 @@ func TestCheckProposalRejections(t *testing.T) {
 		{"spaced underscore thematic break", mut(func(c *ProposedClaim) { c.Text = "_ _ _" }), "bad-text"},
 		{"link reference definition", mut(func(c *ProposedClaim) { c.Text = "[ref]: https://example.com/page" }), "bad-text"},
 		{"link reference definition with spaces", mut(func(c *ProposedClaim) { c.Text = "[some ref]: /docs/page.md" }), "bad-text"},
+		{"link reference definition with an escaped bracket in the label", mut(func(c *ProposedClaim) { c.Text = `[a\]b]: http://x` }), "bad-text"},
+		{"link reference definition, short", mut(func(c *ProposedClaim) { c.Text = "[x]: y" }), "bad-text"},
+		{"link reference definition, empty destination", mut(func(c *ProposedClaim) { c.Text = "[ref]:" }), "bad-text"},
 		{"line separator", mut(func(c *ProposedClaim) { c.Text = "Jobs are\u2028acknowledged late." }), "bad-text"},
 		{"paragraph separator", mut(func(c *ProposedClaim) { c.Text = "Jobs are\u2029acknowledged late." }), "bad-text"},
 		{"empty text", mut(func(c *ProposedClaim) { c.Text = "  " }), "bad-text"},
@@ -6980,6 +6986,10 @@ func TestCheckTextStillAcceptsProseThatOnlyLooksLikeAMarker(t *testing.T) {
 		"_internal helpers are private to the package.",
 		"[draft] is the status a new claim starts in.",
 		"Underscores such as ___ are not a rule when they sit inside a sentence.",
+		"The [config] file lives in the data directory.",
+		"[draft] is a status and [final] is another, with a colon here: it is prose.",
+		"A claim that ends with a bracket [x] and no definition.",
+		"The key[0]: first entry is the default, which only a leading bracket would make a definition.",
 	} {
 		if code, why := CheckText(text); code != "" {
 			t.Errorf("%q was refused (%s: %s)", text, code, why)
@@ -7126,6 +7136,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -7296,6 +7307,12 @@ func TestSubmitRefusesUsageThatIsNegativeOrAbsurdBeforeStoringAnything(t *testin
 	}
 }
 
+func TestTheBadUsageMessageNamesTheBound(t *testing.T) {
+	if want := strconv.FormatInt(MaxUsageTokens, 10); !strings.Contains(ErrBadUsage.Error(), want) {
+		t.Fatalf("the message must name the bound %s: %v", want, ErrBadUsage)
+	}
+}
+
 func TestUsageCheckAcceptsTheBoundsAndNothingBeyond(t *testing.T) {
 	for _, u := range []Usage{{}, {InputTokens: MaxUsageTokens, OutputTokens: MaxUsageTokens}} {
 		if err := u.Check(); err != nil {
@@ -7326,13 +7343,17 @@ func TestSubmitReturnsAnInfrastructureFailureAndChangesNothing(t *testing.T) {
 	ctx := context.Background()
 	s := newSubmitRig(t)
 	infra := errors.New("git: exit status 128: fatal: unable to read tree")
+	// The first claim is rejected by CheckProposal before the second reaches the validator and
+	// fails there, so a report built so far would already hold a reject that was never recorded.
+	badLocator := ProposedClaim{Text: "Handlers may run twice after a crash.", Kind: "current-impl",
+		Excerpt: "acknowledged only after the handler returns", Locator: "L99-L99"}
 	rep, err := Submit(ctx, SubmitInput{Runs: s.r, Env: failingEnv{envWith("docs/decisions/0001.md"), infra}, Work: s.w, Mint: ids.NewULID, Batch: s.batch,
-		P: Proposal{Item: s.item.ID, Epoch: s.item.Epoch, Claims: []ProposedClaim{good()}, Usage: Usage{InputTokens: 1000, OutputTokens: 100}}})
+		P: Proposal{Item: s.item.ID, Epoch: s.item.Epoch, Claims: []ProposedClaim{badLocator, good()}, Usage: Usage{InputTokens: 1000, OutputTokens: 100}}})
 	if !errors.Is(err, infra) {
 		t.Fatalf("an infrastructure failure is returned, not turned into a reject: %v", err)
 	}
-	if rep.Requeued || len(rep.Rejected) != 0 {
-		t.Fatalf("nothing was judged, so nothing is rejected or requeued: %+v", rep)
+	if rep.Requeued || rep.Accepted != 0 || len(rep.Rejected) != 0 || len(rep.Findings) != 0 || rep.Rejected == nil || rep.Findings == nil {
+		t.Fatalf("nothing was judged, so nothing is rejected or requeued and the report is empty: %+v", rep)
 	}
 	it, _ := s.r.Item(ctx, s.item.ID)
 	run, _ := s.r.Get(ctx, s.run.ID)
@@ -7346,8 +7367,9 @@ func TestSubmitReturnsAnInfrastructureFailureAndChangesNothing(t *testing.T) {
 	}
 }
 
-// What a validator refusal says can carry text the subagent chose (an evidence path, say), so
-// Safe is the last thing between it and the working agent's transcript.
+// Evidence paths are chosen by the binary, so a secret shape should never reach a validator
+// refusal. This is defence in depth: if one ever did, Safe is the last thing between the
+// message and the working agent's transcript.
 func TestSubmitRedactsASecretShapeInAValidatorRefusal(t *testing.T) {
 	s := newSubmitRig(t)
 	key := "AK" + "IAABCDEFGHIJKLMNOP"
@@ -7886,10 +7908,17 @@ var (
 	badLead  = regexp.MustCompile("^\\s{0,3}([#>*+|-]|[0-9]+[.)]|```|~~~|<)")
 	inlineHT = regexp.MustCompile(`<[A-Za-z/!?]`)
 	// underscoreRule is a thematic break written with underscores, which badLead does not cover.
-	underscoreRule = regexp.MustCompile(`^ {0,3}(_[ \t]*){3,}$`)
-	// linkRefDef is a link reference definition, which a renderer swallows instead of showing.
-	linkRefDef = regexp.MustCompile(`^ {0,3}\[[^\]]*\]:`)
+	// CheckText has already refused leading space, so no indent is allowed for.
+	underscoreRule = regexp.MustCompile(`^(_[ \t]*){3,}$`)
 )
+
+// startsLinkDefinition reports text that could be read as a link reference definition, which a
+// renderer swallows instead of showing. CommonMark's label rules (escaped brackets, nesting) are
+// too fiddly to follow exactly, so any text that opens with "[" and has "]:" anywhere after it
+// is refused. Ordinary prose that merely opens with a bracket has no "]:" and passes.
+func startsLinkDefinition(t string) bool {
+	return strings.HasPrefix(t, "[") && strings.Contains(t, "]:")
+}
 
 // CheckText is the shared rule for claim text, used for extracted claims and for the corrected
 // claim of a contradicting verdict. It returns an empty code when the text is acceptable.
@@ -7909,7 +7938,7 @@ func CheckText(t string) (code, why string) {
 		return "bad-text", "the text has leading or trailing whitespace"
 	case strings.Contains(t, "<!--") || strings.Contains(t, "-->"):
 		return "bad-text", "the text contains comment markers"
-	case badLead.MatchString(t) || underscoreRule.MatchString(t) || linkRefDef.MatchString(t):
+	case badLead.MatchString(t) || underscoreRule.MatchString(t) || startsLinkDefinition(t):
 		return "bad-text", "the text would render as a heading, quote, list, table, rule, link definition or code, not a paragraph"
 	case inlineHT.MatchString(t):
 		return "bad-text", "the text contains inline HTML, which the index would drop"
@@ -8252,8 +8281,9 @@ func Submit(ctx context.Context, in SubmitInput) (SubmitReport, error) {
 		if err != nil {
 			if !IsRefusal(err) {
 				// A git or environment failure says nothing about the claim: leave the item leased
-				// and untouched so the same submission can be retried.
-				return rep, err
+				// and untouched so the same submission can be retried. Nothing was recorded, so the
+				// report must not name rejects (earlier ones included) that a retry would count again.
+				return SubmitReport{Item: it.ID, Rejected: []Reject{}, Findings: []string{}}, err
 			}
 			rep.Rejected = append(rep.Rejected, Reject{Index: a.Index, Code: "validator", Why: Safe(err.Error())})
 			continue
@@ -8511,11 +8541,14 @@ Run: `scripts/inject.sh internal/app/bootstrap_submit.go 'return "an unknown fie
 Run: `scripts/inject.sh internal/bootstrap/submit.go 'rep := SubmitReport{Rejected: []Reject{}, Findings: []string{}}' 'rep := SubmitReport{Item: Safe(in.P.Item), Rejected: []Reject{}, Findings: []string{}}' ./internal/bootstrap/ 'TestSubmitDoesNotRepeatAnItemIDItWasGiven' 'the item id the subagent supplied was echoed'`
 Run: `scripts/inject.sh internal/bootstrap/submit.go 'rep := SubmitReport{Rejected: []Reject{}, Findings: []string{}}' 'rep := SubmitReport{Item: Safe(in.P.Item), Rejected: []Reject{}, Findings: []string{}}' ./internal/app/ 'TestSubmitNeverEchoesHostileTextFromTheSubagent' 'hostile text was echoed'`
 Run: `scripts/inject.sh internal/bootstrap/submit.go 'if err := in.P.Usage.Check(); err != nil {' 'if err := in.P.Usage.Check(); err != nil && false {' ./internal/bootstrap/ 'TestSubmitRefusesUsageThatIsNegativeOrAbsurdBeforeStoringAnything' 'was accepted'`
-Run: `scripts/inject.sh internal/bootstrap/runs.go 'n < 0 || n > MaxUsageTokens' 'n > MaxUsageTokens' ./internal/bootstrap/ 'TestUsageCheckAcceptsTheBoundsAndNothingBeyond' 'was accepted'`
-Run: `scripts/inject.sh internal/bootstrap/runs.go 'n < 0 || n > MaxUsageTokens' 'n < 0' ./internal/bootstrap/ 'TestUsageCheckAcceptsTheBoundsAndNothingBeyond' 'was accepted'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'n < 0 || int64(n) > MaxUsageTokens' 'int64(n) > MaxUsageTokens' ./internal/bootstrap/ 'TestUsageCheckAcceptsTheBoundsAndNothingBeyond' 'was accepted'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'n < 0 || int64(n) > MaxUsageTokens' 'n < 0' ./internal/bootstrap/ 'TestUsageCheckAcceptsTheBoundsAndNothingBeyond' 'was accepted'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'tokens", int64(MaxUsageTokens))' 'tokens", int64(MaxUsageTokens)-1)' ./internal/bootstrap/ 'TestTheBadUsageMessageNamesTheBound' 'must name the bound'`
 Run: `scripts/inject.sh internal/app/bootstrap_submit.go 'if err := prop.Usage.Check(); err != nil {' 'if err := prop.Usage.Check(); err != nil && false {' ./internal/app/ 'TestSubmitRefusesUsageThatCannotBeRealAndStoresNothing' 'want usage'`
 Run: `scripts/inject.sh internal/bootstrap/submit.go 'len(rep.Rejected), in.P.Usage)' 'len(rep.Rejected), Usage{})' ./internal/bootstrap/ 'TestSubmitWithNoUsableClaimRequeuesTheItem' 'a requeued attempt still cost tokens'`
 Run: `scripts/inject.sh internal/bootstrap/submit.go 'if !IsRefusal(err) {' 'if !IsRefusal(err) && false {' ./internal/bootstrap/ 'TestSubmitReturnsAnInfrastructureFailureAndChangesNothing' 'an infrastructure failure is returned'`
+Run: `scripts/inject.sh internal/bootstrap/submit.go 'return SubmitReport{Item: it.ID, Rejected: []Reject{}, Findings: []string{}}, err' 'return rep, err' ./internal/bootstrap/ 'TestSubmitReturnsAnInfrastructureFailureAndChangesNothing' 'the report is empty'`
+Run: `scripts/inject.sh internal/bootstrap/submit.go 'return SubmitReport{Item: it.ID, Rejected: []Reject{}, Findings: []string{}}, err' 'return SubmitReport{Item: it.ID}, err' ./internal/bootstrap/ 'TestSubmitReturnsAnInfrastructureFailureAndChangesNothing' 'the report is empty'`
 Run: `scripts/inject.sh internal/bootstrap/admit.go 'errors.Is(err, validate.ErrConfinement) ||' 'false ||' ./internal/bootstrap/ 'TestSubmitCountsATypedValidatorRefusalAsAReject' 'confinement:'`
 Run: `scripts/inject.sh internal/bootstrap/admit.go 'errors.Is(err, validate.ErrAmbiguousID) ||' 'false ||' ./internal/bootstrap/ 'TestSubmitCountsATypedValidatorRefusalAsAReject' 'ambiguous:'`
 Run: `scripts/inject.sh internal/bootstrap/admit.go 'errors.Is(err, ErrRefused)' 'false' ./internal/bootstrap/ 'TestIsRefusalSeparatesVerdictsFromInfrastructureFailures' "admit's own"`
@@ -8523,9 +8556,11 @@ Run: `scripts/inject.sh internal/bootstrap/admit.go 'fmt.Errorf("%w: an extracte
 Run: `scripts/inject.sh internal/bootstrap/proposal.go 'case t != strings.TrimSpace(t):' 'case false:' ./internal/bootstrap/ 'TestCheckProposalRejections' 'leading space'`
 Run: `scripts/inject.sh internal/bootstrap/proposal.go 'strings.ContainsAny(t, "\r\n' 'strings.ContainsAny(t[:0], "\r\n' ./internal/bootstrap/ 'TestCheckProposalRejections' 'line separator'`
 Run: `scripts/inject.sh internal/bootstrap/proposal.go '|| underscoreRule.MatchString(t)' '|| false' ./internal/bootstrap/ 'TestCheckProposalRejections' 'underscore thematic break'`
-Run: `scripts/inject.sh internal/bootstrap/proposal.go '|| linkRefDef.MatchString(t)' '|| false' ./internal/bootstrap/ 'TestCheckProposalRejections' 'link reference definition'`
-Run: `scripts/inject.sh internal/bootstrap/proposal.go '^ {0,3}(_[ \t]*){3,}$' '^ {0,3}_' ./internal/bootstrap/ 'TestCheckTextStillAcceptsProseThatOnlyLooksLikeAMarker' 'was refused'`
-Run: `scripts/inject.sh internal/bootstrap/proposal.go '^ {0,3}\[[^\]]*\]:' '^ {0,3}\[' ./internal/bootstrap/ 'TestCheckTextStillAcceptsProseThatOnlyLooksLikeAMarker' 'was refused'`
+Run: `scripts/inject.sh internal/bootstrap/proposal.go '|| startsLinkDefinition(t):' ':' ./internal/bootstrap/ 'TestCheckProposalRejections' 'link reference definition'`
+Run: `scripts/inject.sh internal/bootstrap/proposal.go 'return strings.HasPrefix(t, "[") && strings.Contains(t, "]:")' 'return false' ./internal/bootstrap/ 'TestCheckProposalRejections' 'escaped bracket in the label'`
+Run: `scripts/inject.sh internal/bootstrap/proposal.go 'return strings.HasPrefix(t, "[") && strings.Contains(t, "]:")' 'return strings.Contains(t, "]:")' ./internal/bootstrap/ 'TestCheckTextStillAcceptsProseThatOnlyLooksLikeAMarker' 'was refused'`
+Run: `scripts/inject.sh internal/bootstrap/proposal.go 'return strings.HasPrefix(t, "[") && strings.Contains(t, "]:")' 'return strings.HasPrefix(t, "[") && strings.Contains(t, "]")' ./internal/bootstrap/ 'TestCheckTextStillAcceptsProseThatOnlyLooksLikeAMarker' 'was refused'`
+Run: `scripts/inject.sh internal/bootstrap/proposal.go '^(_[ \t]*){3,}$' '^_' ./internal/bootstrap/ 'TestCheckTextStillAcceptsProseThatOnlyLooksLikeAMarker' 'was refused'`
 Run: `scripts/inject.sh internal/app/bootstrap_submit.go 'return Result{}, &UsageError{Msg: "an extract result is not the expected JSON: " + jsonProblem(err)}' 'props = append(props, prop); continue' ./internal/app/ 'TestSubmitDecodesTheWholeBatchBeforeStoringAnything' 'want usage'`
 Run: `scripts/inject.sh internal/app/bootstrap_submit.go 'if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {' 'if err := dec.Decode(&extra); !errors.Is(err, io.EOF) && false {' ./internal/app/ 'TestSubmitRefusesDataAfterTheJSONObject' 'want usage'`
 Run: `scripts/inject.sh internal/app/bootstrap_submit.go 'err == nil && it.RunID != runID {' 'err == nil && it.RunID != runID && false {' ./internal/app/ 'TestSubmitRefusesAnItemThatBelongsToAnotherRun' 'want usage'`
