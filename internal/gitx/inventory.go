@@ -83,7 +83,7 @@ func (r *Repo) Churn(ctx context.Context, since time.Time) (map[string]int, erro
 	if err != nil || head == "" {
 		return counts, err
 	}
-	out, err := r.git(ctx, nil, "log", "--no-renames", "--name-only", "-z", "--pretty=format:",
+	out, err := r.git(ctx, nil, "log", "--no-show-signature", "--no-renames", "--name-only", "-z", "--pretty=format:",
 		"--since="+since.UTC().Format(time.RFC3339), head)
 	if err != nil {
 		return nil, err
@@ -125,7 +125,7 @@ func (r *Repo) LastChanged(ctx context.Context) (map[string]time.Time, error) {
 	if err != nil || tip == "" {
 		return out, err
 	}
-	raw, err := r.git(ctx, nil, "log", "--no-renames", "--name-status", "-z", "--pretty=format:%x01%ct", tip)
+	raw, err := r.git(ctx, nil, "log", "--no-show-signature", "--no-renames", "--name-status", "-z", "--pretty=format:%x01%ct", tip)
 	if err != nil {
 		return nil, err
 	}

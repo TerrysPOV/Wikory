@@ -50,8 +50,11 @@ type Repo struct {
 // safety applies to every invocation, whatever the repository's configuration says. Wikory
 // never widens safe.directory. Comparing like with like through the repository's clean
 // filters is deferred to the engine specification (spec 14.6): blobs are hashed raw.
+// log.showSignature=false keeps a repository's own log.showSignature from making every log
+// verify signatures, which runs whatever gpg.program its config names.
 var safety = []string{"-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "core.hooksPath=" + os.DevNull,
-	"-c", "core.attributesFile=" + os.DevNull, "-c", "core.excludesFile=", "-c", "diff.external=", "--no-optional-locks", "--literal-pathspecs"}
+	"-c", "core.attributesFile=" + os.DevNull, "-c", "core.excludesFile=", "-c", "diff.external=", "-c", "log.showSignature=false",
+	"--no-optional-locks", "--literal-pathspecs"}
 
 // baseConfig is applied to every invocation, after any environment config is cleared. It
 // keeps git from walking into submodules, which have config and attributes of their own that
@@ -60,7 +63,9 @@ var baseConfig = [][2]string{{"status.submoduleSummary", "false"}, {"submodule.r
 
 // gitEnv is the environment for one git invocation. The caller's GIT_CONFIG_COUNT and its
 // KEY and VALUE entries are dropped and replaced by baseConfig followed by extra, each key
-// and value in its own variable.
+// and value in its own variable. Lazy fetching (a partial clone reaching its promisor remote for
+// a missing object) and replace objects (refs/replace standing one object in for another) are
+// switched off.
 func gitEnv(extra [][2]string) []string {
 	all := append(append([][2]string{}, baseConfig...), extra...)
 	env := make([]string, 0, len(os.Environ())+2*len(all)+5)
@@ -76,7 +81,8 @@ func gitEnv(extra [][2]string) []string {
 	for i, o := range all {
 		env = append(env, "GIT_CONFIG_KEY_"+strconv.Itoa(i)+"="+o[0], "GIT_CONFIG_VALUE_"+strconv.Itoa(i)+"="+o[1])
 	}
-	return append(env, "GIT_TERMINAL_PROMPT=0", "LC_ALL=C", "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0")
+	return append(env, "GIT_TERMINAL_PROMPT=0", "LC_ALL=C", "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0",
+		"GIT_NO_LAZY_FETCH=1", "GIT_NO_REPLACE_OBJECTS=1")
 }
 
 var driverRe = regexp.MustCompile(`^(filter|diff)\.(.+)\.(clean|smudge|process|required|textconv|command)$`)
