@@ -3192,6 +3192,21 @@ git commit -m "feat: add bootstrap component detection, ranking and inventory"
 
 ---
 
+#### Final whole-branch review fixes (2026-11-04)
+
+- A6 (`3bb75c6`), a choice made without Terry: a component with no file to read gets no paid work. `Inventory` now sets each component's `Files` after the read loop to its queued implementation files, counted the way `ComponentFiles` groups them (detection counted files before any was read, so a component whose every file was skipped for a secret, oversize or exclusion kept a non-zero count). `Rank` marks the first `budget` components **that have files** as inspected and keeps ranking the rest, so the budget passes to the next component; the rule depends only on the sources and is in the plan hash through `Rank` and `Inspected`. Tests: `TestRankPassesTheBudgetOverAComponentWithNoFiles`, `TestInventorySpendsNoPaidWorkOnAComponentWhoseFilesWereAllSkipped` (empty_component_test.go). `TestRankOrdersByScoreThenNameAndMarksTheBudget` now gives each component `Files: 1`.
+- A3 (`403d1ef`): `UnreadSources` names its records `UnreadSourceName` ("git"), not "repo", so a tracked root file literally named `worktree:main` cannot share a `bs_sources` key with a worktree record. The worktree label uses `short()`.
+- B2 (`00b81da`): a path `confine.Split` refuses on every platform (a backslash, or a colon as the second byte) is recorded `skipped:bad-name` and never queued (`unconfinable` in digest.go); every claim from it would have failed confinement after its extraction was paid for. Windows reserved names are left out of the rule so the inventory is the same on every platform. Test: `TestInventoryRecordsUnconfinableNamesAsBadNames`.
+- B3 (`9937586`): `hasControl` now uses the shared `unprintable` rule (control, format, line and paragraph separator characters), so a name holding U+2028 or U+202E is a bad name. Test: `TestSeparatorsAndBidiOverridesInANameMakeItABadName`.
+- C3 (`0f2b764`): `owner` and `ownerOf` share `nearestDir(p, dirs)` for the walk up the directories.
+
+Run: `scripts/inject.sh internal/bootstrap/rank.go 'inspected < budget && out[i].Files > 0' 'inspected < budget' ./internal/bootstrap/ 'TestRankPassesTheBudget' 'not inspected'`
+Run: `scripts/inject.sh internal/bootstrap/inventory.go '		comps[i].Files = len(queued[comps[i].Prefix])' '		comps[i].Files += 0 * len(queued[comps[i].Prefix])' ./internal/bootstrap/ 'TestInventorySpendsNoPaidWork' 'has no files and is not inspected'`
+Run: `scripts/inject.sh internal/bootstrap/unread.go 'Source{Name: UnreadSourceName, Path: "worktree:"' 'Source{Name: "repo", Path: "worktree:"' ./internal/bootstrap/ 'TestUnreadRecordsCannotCollide' 'an unread record is named "repo"'`
+Run: `scripts/inject.sh internal/bootstrap/inventory.go '		if hasControl(s.Path) || unconfinable(s.Path) {' '		if hasControl(s.Path) {' ./internal/bootstrap/ 'TestInventoryRecordsUnconfinableNames' 'want "skipped:bad-name"'`
+
+Expected: each exits 0 (RED).
+
 ### Task 6: Estimator, plan hash and `bootstrap plan`
 
 **Files:**
