@@ -3160,6 +3160,7 @@ What an extract item is (a plan-level decision): one item per queued **intent or
 package bootstrap
 
 import (
+	"fmt"
 	"slices"
 	"testing"
 
@@ -3246,6 +3247,11 @@ func TestPlanHashIsStableAndSensitive(t *testing.T) {
 	if BuildPlan(mut, "repo", "abc123", 0).Hash == a.Hash {
 		t.Fatal("a changed source must change the plan hash")
 	}
+	un := sampleResult()
+	un.Sources[4].Hash = "other" // an uninspected component's file: in no work item, so only the source list covers it
+	if BuildPlan(un, "repo", "abc123", 0).Hash == a.Hash {
+		t.Fatal("a changed source in an uninspected component must change the plan hash")
+	}
 	if BuildPlan(sampleResult(), "repo", "def456", 0).Hash == a.Hash {
 		t.Fatal("a different HEAD must change the plan hash")
 	}
@@ -3277,6 +3283,75 @@ func TestPlanHashDoesNotDependOnWhereAWorktreeLives(t *testing.T) {
 	none := BuildPlan(sampleResult(), "repo", "abc123", 0)
 	if none.Hash == here.Hash {
 		t.Fatal("having another worktree at all must change the hash")
+	}
+}
+
+func TestEstimateStagesVerifyTokensScaleWithInspectedComponents(t *testing.T) {
+	r := sampleResult()
+	r.Components[1].Inspected = true
+	v := EstimateStages(r)[1]
+	if v.Stage != "verify" || v.Items != 2 {
+		t.Fatalf("verify items = %+v, want 2 (two inspected components)", v)
+	}
+	if v.InputTokens != 2*verifyInTokens || v.OutputTokens != 2*verifyOutTokens {
+		t.Fatalf("verify tokens = %d/%d, want %d/%d (they scale with the item count)", v.InputTokens, v.OutputTokens, 2*verifyInTokens, 2*verifyOutTokens)
+	}
+}
+
+func intentSources(n int) Result {
+	var r Result
+	for i := 0; i < n; i++ {
+		r.Sources = append(r.Sources, Source{Name: "repo", Path: fmt.Sprintf("docs/%d.md", i), Tier: TierIntent, Disposition: DispQueued, Hash: fmt.Sprintf("h%d", i), Size: 100})
+	}
+	return r
+}
+
+func TestBatchCountRoundsUpAtTheBatchBoundary(t *testing.T) {
+	for _, c := range []struct{ items, batches int }{{0, 0}, {BatchSize, 1}, {BatchSize + 1, 2}} {
+		if got := BuildPlan(intentSources(c.items), "repo", "abc123", 0).Batches; got != c.batches {
+			t.Fatalf("%d items give %d batches, want %d (batch size %d, rounded up)", c.items, got, c.batches, BatchSize)
+		}
+	}
+}
+
+func TestPlanHashCoversSourceTier(t *testing.T) {
+	a := BuildPlan(sampleResult(), "repo", "abc123", 0)
+	mut := sampleResult()
+	mut.Sources[2].Tier = TierIntent // the skipped source: no work list or estimate changes
+	b := BuildPlan(mut, "repo", "abc123", 0)
+	if !slices.Equal(b.Estimates, a.Estimates) || b.Batches != a.Batches {
+		t.Fatal("fixture error: the tier change must not move the estimates")
+	}
+	if b.Hash == a.Hash {
+		t.Fatal("a changed source tier must change the plan hash: tiers decide what is extracted")
+	}
+}
+
+func TestPlanHashCoversTheWorkListEstimatesAndBatches(t *testing.T) {
+	p := BuildPlan(sampleResult(), "repo", "abc123", 0)
+
+	work := p
+	work.Result.Sources = slices.Clone(p.Sources)
+	work.Result.Sources[0].Size++ // not an input to the hash; it changes only the work list
+	if planHash(work) == p.Hash {
+		t.Fatal("a changed work list must change the plan hash")
+	}
+
+	est := p
+	est.Estimates = slices.Clone(p.Estimates)
+	est.Estimates[0].InputTokens++ // what a changed estimate constant would do
+	if planHash(est) == p.Hash {
+		t.Fatal("changed estimates must change the plan hash")
+	}
+
+	bat := p
+	bat.Batches++
+	if planHash(bat) == p.Hash {
+		t.Fatal("a changed batch count must change the plan hash")
+	}
+
+	if planHash(p) != p.Hash {
+		t.Fatal("planHash must reproduce the hash BuildPlan stored")
 	}
 }
 ```
@@ -3517,7 +3592,7 @@ func TestBootstrapUsage(t *testing.T) {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `go test ./internal/bootstrap/ -run 'TestExtractSpecs|TestComponentDigest|TestSampleSet|TestEstimateStages|TestPlanHash' -count=1`
+Run: `go test ./internal/bootstrap/ -run 'TestExtractSpecs|TestComponentDigest|TestSampleSet|TestEstimateStages|TestBatchCount|TestPlanHash' -count=1`
 Expected: FAIL to compile: `undefined: ExtractSpecs`, `BuildPlan`, `DigestMaxBytes`. (The `internal/app/bootstrap_plan_test.go` file above is written now but only added to the tree in Task 8, because it needs `Runs.Create`.)
 
 - [ ] **Step 3: Implement the bootstrap package side**
@@ -3630,8 +3705,9 @@ type Estimate struct {
 	OutputTokens int    `json:"output_tokens"`
 }
 
-// EstimateStages sizes extract and verify from byte counts. Tokens are bytes divided by four
-// plus a fixed prompt overhead per item.
+// EstimateStages sizes extract and verify. Extract tokens come from each item's byte count:
+// bytes divided by bytesPerToken plus a fixed prompt overhead, with a fixed output per item.
+// Verify uses fixed per-item constants and does not look at byte counts.
 func EstimateStages(res Result) []Estimate {
 	specs := ExtractSpecs(res)
 	ex := Estimate{Stage: "extract", Items: len(specs), OutputTokens: len(specs) * extractOutPerItem}
@@ -3656,22 +3732,32 @@ type Plan struct {
 	Estimates []Estimate
 }
 
-type hashSource struct{ Name, Path, Hash, Disposition string }
+type hashSource struct{ Name, Path, Hash, Tier, Disposition string }
 type hashComponent struct {
 	Prefix    string
 	Rank      int
 	Inspected bool
 }
 
-// BuildPlan assembles the plan and its hash. The hash covers the scope, the HEAD commit, every
-// source's content hash and disposition, the component ranking and the constants above, so
-// anything that would change what is done changes the hash. It does not cover the sample size.
+// BuildPlan assembles the plan and its hash. The hash is built from the work and the numbers
+// Terry approves, not only from the inputs, so a change to anything that would change what is
+// done or what it is said to cost changes the hash. See planHash. It does not cover the sample
+// size or the Roots.
 func BuildPlan(res Result, scope, head string, sample int) Plan {
 	est := EstimateStages(res)
 	p := Plan{Scope: scope, Head: head, Sample: sample, Result: res, Estimates: est}
 	for _, e := range est {
 		p.Batches += (e.Items + BatchSize - 1) / BatchSize
 	}
+	p.Hash = planHash(p)
+	return p
+}
+
+// planHash hashes the plan's inputs (scope, HEAD, weights, limits, every source's content hash,
+// tier and disposition, the component ranking) together with what they produce: the ordered
+// extract work list and the estimates and batch count Terry sees. A changed estimate constant
+// or tier classifier therefore changes the hash even when the inputs do not.
+func planHash(p Plan) string {
 	h := struct {
 		V          int
 		Scope      string
@@ -3680,18 +3766,24 @@ func BuildPlan(res Result, scope, head string, sample int) Plan {
 		Constants  [4]int
 		Sources    []hashSource
 		Components []hashComponent
-	}{V: 1, Scope: scope, Head: head,
+		Work       []ItemSpec
+		Estimates  []Estimate
+		Batches    int
+	}{V: 2, Scope: p.Scope, Head: p.Head,
 		Weights:   [4]float64{WeightChurn, WeightDocRef, WeightHandoff, WeightEntry},
-		Constants: [4]int{BatchSize, DigestMaxBytes, InspectBudget, CapChurn}}
-	for _, s := range res.Sources {
-		h.Sources = append(h.Sources, hashSource{s.Name, s.Path, s.Hash, s.Disposition})
+		Constants: [4]int{BatchSize, DigestMaxBytes, InspectBudget, CapChurn},
+		Work:      ExtractSpecs(p.Result), Estimates: p.Estimates, Batches: p.Batches}
+	for _, s := range p.Sources {
+		h.Sources = append(h.Sources, hashSource{s.Name, s.Path, s.Hash, s.Tier, s.Disposition})
 	}
-	for _, c := range res.Components {
+	for _, c := range p.Components {
 		h.Components = append(h.Components, hashComponent{c.Prefix, c.Rank, c.Inspected})
 	}
-	b, _ := json.Marshal(h)
-	p.Hash = ids.SHA256Hex(b)
-	return p
+	b, err := json.Marshal(h)
+	if err != nil {
+		panic("bootstrap: plan hash input cannot be marshalled: " + err.Error()) // plain strings and numbers: cannot happen
+	}
+	return ids.SHA256Hex(b)
 }
 ```
 
@@ -3958,10 +4050,17 @@ Expected: PASS.
 
 - [ ] **Step 6: Prove the hash assertions can fail**
 
-Run: `scripts/inject.sh internal/bootstrap/estimate.go 'h.Sources = append(h.Sources, hashSource{s.Name, s.Path, s.Hash, s.Disposition})' 'h.Sources = append(h.Sources, hashSource{s.Name, s.Path, "", s.Disposition})' ./internal/bootstrap/ 'TestPlanHashIsStableAndSensitive' 'changed source'`
+Run: `scripts/inject.sh internal/bootstrap/estimate.go 'h.Sources = append(h.Sources, hashSource{s.Name, s.Path, s.Hash, s.Tier, s.Disposition})' 'h.Sources = append(h.Sources, hashSource{s.Name, s.Path, "", s.Tier, s.Disposition})' ./internal/bootstrap/ 'TestPlanHashIsStableAndSensitive' 'changed source'`
 Run: `scripts/inject.sh internal/bootstrap/estimate.go 'if total > DigestMaxBytes {' 'if false {' ./internal/bootstrap/ 'TestComponentDigestSpecIsBoundedAndHashesItsFiles' 'capped'`
 Run: `scripts/inject.sh internal/bootstrap/unread.go 'Path: "worktree:" + label,' 'Path: "worktree:" + w.Path + " " + label,' ./internal/bootstrap/ 'TestPlanHashDoesNotDependOnWhereAWorktreeLives' 'must hash the same'`
-Run: `scripts/inject.sh internal/bootstrap/estimate.go 'h.Sources = append(h.Sources, hashSource{s.Name, s.Path, s.Hash, s.Disposition})' 'h.Sources = append(h.Sources, hashSource{s.Name, "", s.Hash, s.Disposition})' ./internal/bootstrap/ 'TestPlanHashDoesNotDependOnWhereAWorktreeLives' 'different repository state'`
+Run: `scripts/inject.sh internal/bootstrap/estimate.go 'h.Sources = append(h.Sources, hashSource{s.Name, s.Path, s.Hash, s.Tier, s.Disposition})' 'h.Sources = append(h.Sources, hashSource{s.Name, "", s.Hash, s.Tier, s.Disposition})' ./internal/bootstrap/ 'TestPlanHashDoesNotDependOnWhereAWorktreeLives' 'different repository state'`
+Run: `scripts/inject.sh internal/bootstrap/estimate.go 'h.Sources = append(h.Sources, hashSource{s.Name, s.Path, s.Hash, s.Tier, s.Disposition})' 'h.Sources = append(h.Sources, hashSource{s.Name, s.Path, s.Hash, "", s.Disposition})' ./internal/bootstrap/ 'TestPlanHashCoversSourceTier' 'source tier'`
+Run: `scripts/inject.sh internal/bootstrap/estimate.go 'Work:      ExtractSpecs(p.Result), Estimates:' 'Estimates:' ./internal/bootstrap/ 'TestPlanHashCoversTheWorkListEstimatesAndBatches' 'work list'`
+Run: `scripts/inject.sh internal/bootstrap/estimate.go ' Estimates: p.Estimates, Batches' ' Batches' ./internal/bootstrap/ 'TestPlanHashCoversTheWorkListEstimatesAndBatches' 'changed estimates'`
+Run: `scripts/inject.sh internal/bootstrap/estimate.go ', Batches: p.Batches}' '}' ./internal/bootstrap/ 'TestPlanHashCoversTheWorkListEstimatesAndBatches' 'batch count'`
+Run: `scripts/inject.sh internal/bootstrap/estimate.go '(e.Items + BatchSize - 1) / BatchSize' 'e.Items / BatchSize' ./internal/bootstrap/ 'TestBatchCountRoundsUpAtTheBatchBoundary' 'batches, want'`
+Run: `scripts/inject.sh internal/bootstrap/estimate.go 'InputTokens: n * verifyInTokens' 'InputTokens: verifyInTokens' ./internal/bootstrap/ 'TestEstimateStagesVerifyTokensScaleWithInspectedComponents' 'verify tokens'`
+Run: `scripts/inject.sh internal/bootstrap/estimate.go 'OutputTokens: n * verifyOutTokens' 'OutputTokens: verifyOutTokens' ./internal/bootstrap/ 'TestEstimateStagesVerifyTokensScaleWithInspectedComponents' 'verify tokens'`
 Expected: each exits 0 (RED).
 
 - [ ] **Step 7: Commit the bootstrap half**
