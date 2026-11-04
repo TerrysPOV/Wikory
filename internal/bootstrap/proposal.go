@@ -90,6 +90,10 @@ func CheckText(t string) (code, why string) {
 		return "bad-text", "the text would render as a heading, quote, list, table, rule, link definition or code, not a paragraph"
 	case inlineHT.MatchString(t):
 		return "bad-text", "the text contains inline HTML, which the index would drop"
+	case strings.Contains(t, "](") || strings.Contains(t, "!["):
+		// Claim text is written into a page as it is, so link or image markup would render as a
+		// live link or an image pointing wherever the source said.
+		return "markup", "the text contains link or image markup, which a page would render as a link or an image"
 	}
 	for _, r := range t {
 		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
