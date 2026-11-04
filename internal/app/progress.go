@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -23,6 +24,9 @@ type Progress struct {
 	start    time.Time
 	noticed  bool
 	lastTick int
+
+	// lineWidth is the width of the last terminal line written, so a shorter line can be padded over it.
+	lineWidth int
 
 	stageName  string
 	stageIndex int
@@ -54,7 +58,10 @@ func (p *Progress) emit(event string, fields map[string]any) {
 			line += fmt.Sprintf(", about %.0fs left (estimate)", eta)
 		}
 		if p.tty {
-			fmt.Fprint(p.w, "\r"+line)
+			// Pad over the tail of a longer previous line; no escape sequences are used.
+			pad := strings.Repeat(" ", max(0, p.lineWidth-len(line)))
+			p.lineWidth = len(line)
+			fmt.Fprint(p.w, "\r"+line+pad)
 		} else {
 			fmt.Fprintln(p.w, line)
 		}
@@ -82,11 +89,19 @@ func IsTTY(w io.Writer) bool {
 // "stage 2 of 5: inventory" and JSON events carry the stage fields.
 func (p *Progress) BeginStage(index, count int, name string, total int, expected time.Duration, notice string) {
 	p.stageIndex, p.stageCount, p.stageName = index, count, name
-	p.Begin(fmt.Sprintf("stage %d of %d: %s", index, count, name), total, expected, notice)
+	p.begin(fmt.Sprintf("stage %d of %d: %s", index, count, name), total, expected, notice)
 }
 
-// Begin starts an operation. expected is the estimate; above the threshold the notice prints now.
+// Begin starts an operation outside any stage, clearing the stage fields of an earlier BeginStage.
+// expected is the estimate; above the threshold the notice prints now.
 func (p *Progress) Begin(label string, total int, expected time.Duration, notice string) {
+	p.stageName, p.stageIndex, p.stageCount = "", 0, 0
+	p.begin(label, total, expected, notice)
+}
+
+// begin leaves the stage fields alone: BeginStage sets them first and the notice carries them.
+func (p *Progress) begin(label string, total int, expected time.Duration, notice string) {
+	p.lineWidth = 0
 	p.label, p.total, p.notice, p.start, p.noticed, p.lastTick = label, total, notice, p.now(), false, -1
 	if expected > progressThreshold {
 		p.noticed = true
