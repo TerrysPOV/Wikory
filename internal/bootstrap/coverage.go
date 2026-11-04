@@ -98,6 +98,27 @@ type Coverage struct {
 	Unindexed []string `json:"unindexed_claims"`
 }
 
+// LabelList prints names taken from the project or a subagent (claim ids, paths) as one list: each
+// through safeLabel, at most shown of them, then "and K more". However many there are and
+// whatever they hold, the list cannot forge a line or flood a report.
+func LabelList(names []string, shown int) string {
+	out := make([]string, 0, min(len(names), shown))
+	for i, n := range names {
+		if i == shown {
+			break
+		}
+		out = append(out, safeLabel(n))
+	}
+	list := strings.Join(out, ", ")
+	if len(names) > shown {
+		list += fmt.Sprintf(" and %d more", len(names)-shown)
+	}
+	return list
+}
+
+// maxListed is how many names a report line lists before "and K more".
+const maxListed = 20
+
 // safeLabel makes a name taken from the project (a file, a branch, a directory) fit to print. A
 // name that is itself secret-shaped is withheld and shown only as a hash prefix. Otherwise each
 // control or invisible character, and each line or paragraph separator, shows as "?", so a name
@@ -408,11 +429,7 @@ func (c Coverage) Text() string {
 		}
 	}
 	if len(c.Unindexed) > 0 {
-		shown := make([]string, len(c.Unindexed))
-		for i, id := range c.Unindexed {
-			shown[i] = safeLabel(id)
-		}
-		fmt.Fprintf(&b, "%d claim(s) are on a page but the index cannot read them, so search will not find them: %s\n", len(c.Unindexed), strings.Join(shown, ", "))
+		fmt.Fprintf(&b, "%d claim(s) are on a page but the index cannot read them, so search will not find them: %s\n", len(c.Unindexed), LabelList(c.Unindexed, maxListed))
 	}
 	for _, r := range c.Retirement {
 		b.WriteString(r + "\n")

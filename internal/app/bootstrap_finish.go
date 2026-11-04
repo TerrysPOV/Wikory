@@ -24,6 +24,9 @@ const maxBytesPerJob = 2 << 20
 // step of finish, as a kill would.
 var killPoint = func(string) {}
 
+// maxNoticeIDs is how many claim ids a finish notice names before "and K more".
+const maxNoticeIDs = 10
+
 // buildCoverage is a test seam: a test makes it fail to show that a run whose report cannot be
 // built is not marked done.
 var buildCoverage = bootstrap.BuildCoverage
@@ -271,7 +274,7 @@ func storedFinishReport(ctx context.Context, runs *bootstrap.Runs, id string) (R
 func finishNotices(cov bootstrap.Coverage) []string {
 	var notices []string
 	if n := len(cov.Unindexed); n > 0 {
-		notices = append(notices, fmt.Sprintf("%d claim(s) are on a published page but the index cannot read them, so search will not find them: %s", n, strings.Join(cov.Unindexed, ", ")))
+		notices = append(notices, fmt.Sprintf("%d claim(s) are on a published page but the index cannot read them, so search will not find them: %s", n, bootstrap.LabelList(cov.Unindexed, maxNoticeIDs)))
 	}
 	if len(cov.StalePages) > 0 {
 		notices = append(notices, fmt.Sprintf("%d page(s) an earlier bootstrap wrote were not rendered this time and were left in place; the report lists them", len(cov.StalePages)))
