@@ -357,6 +357,16 @@ git commit -m "feat: add bootstrap run tables and purge them on clone rebind"
 
 ---
 
+#### Final whole-branch review fixes (2026-11-04)
+
+The schema in this task's code block gained four columns. The tables are new in this stage, so the `CREATE TABLE IF NOT EXISTS` statements are edited in place and `SchemaVersion` stays 1:
+
+- `bs_components`: `files INTEGER NOT NULL DEFAULT 0, entry INTEGER NOT NULL DEFAULT 0` (A9, `e5d3521`): the file count and entry-point mark a component page shows.
+- `bs_pages`: `pending TEXT NOT NULL DEFAULT ''` (A7, `8309d34`): the hash a publish job is about to write, recorded before the job begins. A row may now hold only a pending hash, with `hash` empty.
+- `bs_runs`: `coverage TEXT NOT NULL DEFAULT ''` (A8, `8ebf373`), the JSON coverage report stored in the same transaction as the move to `done`; and `branch TEXT NOT NULL DEFAULT ''` (B11, `02eb215`), the branch the run was planned on or `detached`.
+
+No new table carries a `checkout_id`, so `perCheckoutTables` is unchanged and `TestEveryCheckoutKeyedTableIsInThePurgeList` still holds.
+
 ### Task 2: gitx inventory functions
 
 **Files:**
