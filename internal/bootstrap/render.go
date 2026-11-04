@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/TerrysPOV/Wikory/internal/claim"
 	"github.com/TerrysPOV/Wikory/internal/ids"
 )
 
@@ -20,7 +21,11 @@ const (
 	MaxListedBytes = 16 << 10
 	// minClaimBudget keeps a page from splitting into one claim per part if its head is huge.
 	minClaimBudget = 4 << 10
-	Origin         = "bootstrap"
+	// maxSlugBytes bounds the readable part of a component page's file name, so a deep prefix
+	// cannot push the name past the 255 bytes a file system allows. The hash that follows it
+	// keeps two cut prefixes apart.
+	maxSlugBytes = 80
+	Origin       = "bootstrap"
 )
 
 // RenderModel is everything the templates need. Date comes from the run, not the clock, so a
@@ -33,10 +38,29 @@ type RenderModel struct {
 	Claims     []StoredClaim
 }
 
-// PageOut is one rendered page.
+// PageOut is one rendered page. Unrenderable names the claims on it that the indexer's parser
+// still cannot see (a single claim whose own text is too complex or hides text), each placed
+// alone on its page. The caller must report them: the page holds them, the index does not.
 type PageOut struct {
-	Path, ID string
-	Content  []byte
+	Path, ID     string
+	Content      []byte
+	Unrenderable []string
+}
+
+// Unrenderable lists the claim ids that some page holds but the indexer cannot parse, in page
+// order.
+func Unrenderable(pages []PageOut) []string {
+	var out []string
+	for _, pg := range pages {
+		out = append(out, pg.Unrenderable...)
+	}
+	return out
+}
+
+type item struct {
+	heading string
+	text    string
+	claimID string
 }
 
 type section struct {
@@ -64,8 +88,17 @@ func componentBase(prefix string) string {
 	if slug == "" {
 		slug = "root"
 	}
+	if len(slug) > maxSlugBytes {
+		slug = strings.TrimRight(slug[:maxSlugBytes], "-")
+	}
 	return "component-" + slug + "-" + shortSlugHash(prefix)
 }
+
+// displayName is a component name as it is shown in a title, heading or listing. A backtick,
+// "<" or ">" in a name would open a code span or read as inline HTML and the indexer would
+// leave that heading out, so each shows as a harmless look-alike. The real prefix stays in the
+// claim-bearing references and in the file name's hash.
+var displayName = strings.NewReplacer("`", "'", "<", "\u2039", ">", "\u203a").Replace
 
 var statusOrder = []string{"verified", "conflicting", "unverified", "historical", "superseded"}
 
@@ -98,9 +131,26 @@ func outsideOrHandoff(ref string) bool {
 	return ok && (name != "repo" || IsHandoff(p))
 }
 
+// byRank is the components in rank order, whatever order the caller held them in.
+func byRank(cs []Component) []Component {
+	out := append([]Component(nil), cs...)
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Rank != out[j].Rank {
+			return out[i].Rank < out[j].Rank
+		}
+		return out[i].Prefix < out[j].Prefix
+	})
+	return out
+}
+
+// componentFor names the inspected component a claim belongs to, or "" for the general page. A
+// claim about a component that was not inspected has no page of its own to land on.
 func componentFor(c StoredClaim, inspected []Component) string {
 	if prefix, ok := strings.CutPrefix(c.Ref, "comp:"); ok {
-		return prefix
+		if slices.ContainsFunc(inspected, func(comp Component) bool { return comp.Prefix == prefix }) {
+			return prefix
+		}
+		return ""
 	}
 	for _, comp := range inspected {
 		if comp.Prefix != "." && strings.Contains(c.Text, comp.Prefix) {
@@ -118,7 +168,7 @@ type placement struct {
 func place(m RenderModel) placement {
 	pl := placement{byComponent: map[string][]StoredClaim{}}
 	var inspected []Component
-	for _, c := range m.Components {
+	for _, c := range byRank(m.Components) {
 		if c.Inspected {
 			inspected = append(inspected, c)
 		}
@@ -171,16 +221,20 @@ func RenderPages(m RenderModel) []PageOut {
 	for _, c := range m.Claims {
 		counts[c.Status]++
 	}
-	read, skipped := 0, 0
+	read, queued, skipped := 0, 0, 0
 	for _, s := range m.Sources {
-		if s.Disposition == DispQueued {
+		switch s.Disposition {
+		case DispQueued:
+			queued++
+		case DispRead:
 			read++
-		} else if s.Disposition != DispUnmergedBranch && s.Disposition != DispOtherWorktree {
-			skipped++ // a branch or worktree is not a source file
+		case DispUnmergedBranch, DispOtherWorktree: // a branch or worktree is not a source file
+		default:
+			skipped++
 		}
 	}
 	var inspected, rest []Component
-	for _, c := range m.Components {
+	for _, c := range byRank(m.Components) {
 		if c.Inspected {
 			inspected = append(inspected, c)
 		} else {
@@ -195,8 +249,8 @@ func RenderPages(m RenderModel) []PageOut {
 	}
 	specs = append(specs, pageSpec{base: "overview", typ: "concept", title: "Project overview (bootstrap baseline)",
 		intro: []string{
-			fmt.Sprintf("This section is a starting point for an existing project. It was built from %d source files that were read (%d more were skipped) and holds %d claims: %d verified, %d conflicting, %d not yet checked and %d historical.",
-				read, skipped, len(m.Claims), counts["verified"], counts["conflicting"], counts["unverified"], counts["historical"]),
+			fmt.Sprintf("This section is a starting point for an existing project. It was built from %d source files that were %s (%d more were skipped) and holds %d claims: %d verified, %d conflicting, %d not yet checked and %d historical.",
+				read+queued, sourceVerb(read, queued), skipped, len(m.Claims), counts["verified"], counts["conflicting"], counts["unverified"], counts["historical"]),
 			"- `bootstrap-architecture`: the components found and how they were ranked\n- `bootstrap-constraints`: stated intent, constraints and rationale\n- `bootstrap-known-issues`: open questions and conflicting claims\n- `bootstrap-unfinished-work`: what handoffs and notes say was in progress",
 		},
 		links: append([]string{"bootstrap-architecture", "bootstrap-constraints", "bootstrap-known-issues", "bootstrap-unfinished-work"}, compBases...)})
@@ -209,10 +263,10 @@ func RenderPages(m RenderModel) []PageOut {
 		if c.Entry {
 			entry = ", entry point"
 		}
-		lines = append(lines, fmt.Sprintf("- `%s`: rank %d, %d files%s, checked against code", c.Prefix, c.Rank, c.Files, entry))
+		lines = append(lines, fmt.Sprintf("- `%s`: rank %d, %d files%s, checked against code", displayName(c.Prefix), c.Rank, c.Files, entry))
 	}
 	for _, c := range rest {
-		lines = append(lines, fmt.Sprintf("- `%s`: rank %d, %d files, not checked; claims about it stay unverified", c.Prefix, c.Rank, c.Files))
+		lines = append(lines, fmt.Sprintf("- `%s`: rank %d, %d files, not checked; claims about it stay unverified", displayName(c.Prefix), c.Rank, c.Files))
 	}
 	if len(lines) > 0 {
 		archIntro = append(archIntro, capListing(lines, MaxListedBytes, "components"))
@@ -241,11 +295,11 @@ func RenderPages(m RenderModel) []PageOut {
 		for _, x := range cs {
 			hasRationale = hasRationale || x.Kind == "rationale"
 		}
-		intro := []string{fmt.Sprintf("Component `%s`: rank %d of %d, %d files.", c.Prefix, c.Rank, len(m.Components), c.Files)}
+		intro := []string{fmt.Sprintf("Component `%s`: rank %d of %d, %d files.", displayName(c.Prefix), c.Rank, len(m.Components), c.Files)}
 		if !hasRationale {
 			intro = append(intro, "No rationale was found for this component in the sources.")
 		}
-		specs = append(specs, pageSpec{base: componentBase(c.Prefix), typ: "component", title: "Component: " + c.Prefix, intro: intro, secs: secs,
+		specs = append(specs, pageSpec{base: componentBase(c.Prefix), typ: "component", title: "Component: " + displayName(c.Prefix), intro: intro, secs: secs,
 			empty: "No implementation claims were extracted for this component.", links: []string{"bootstrap-overview", "bootstrap-architecture"}})
 	}
 
@@ -256,10 +310,16 @@ func RenderPages(m RenderModel) []PageOut {
 	return out
 }
 
-type atom struct {
-	text    string
-	heading bool
-	claim   bool
+// sourceVerb says what happened to the counted sources. Inventory only queues a source; a
+// source is "read" only if something recorded that it was.
+func sourceVerb(read, queued int) string {
+	switch {
+	case queued == 0:
+		return "read"
+	case read == 0:
+		return "queued"
+	}
+	return "read or queued"
 }
 
 // capListing joins lines but stops before maxBytes and says how many it left out, so a project
@@ -312,22 +372,87 @@ func (ps pageSpec) head(banner string, i int, links []string) string {
 	return b.String()
 }
 
-func (ps pageSpec) pages(banner string) []PageOut {
-	var atoms []atom
-	n := 0
+// itemsOf is the claims of a page in order, each with the heading it sits under.
+func (ps pageSpec) itemsOf() []item {
+	var items []item
 	for _, s := range ps.secs {
-		if len(s.claims) == 0 {
-			continue
-		}
-		atoms = append(atoms, atom{text: "## " + s.heading + "\n\n", heading: true})
 		for _, c := range s.claims {
-			atoms = append(atoms, atom{text: c.Meta + "\n" + c.Text + "\n\n", claim: true})
-			n++
+			items = append(items, item{heading: s.heading, text: c.Meta + "\n" + c.Text + "\n\n", claimID: c.ClaimID})
 		}
 	}
-	if n == 0 && ps.empty != "" {
-		atoms = append(atoms, atom{text: ps.empty + "\n\n"})
+	return items
+}
+
+// body writes the claims of one part. A part starts with the heading of its first claim, so a
+// continuation page keeps every claim under a heading.
+func (ps pageSpec) body(g []item) string {
+	if len(g) == 0 {
+		return ps.empty + "\n\n"
 	}
+	var b strings.Builder
+	prev := ""
+	for _, it := range g {
+		if it.heading != prev {
+			b.WriteString("## " + it.heading + "\n\n")
+			prev = it.heading
+		}
+		b.WriteString(it.text)
+	}
+	return b.String()
+}
+
+func (ps pageSpec) pageFile(i int) string {
+	return strings.TrimPrefix(ps.idOf(i), "bootstrap-") + ".md"
+}
+
+func (ps pageSpec) content(banner string, i, parts int, g []item) []byte {
+	return []byte(ps.head(banner, i, ps.linksFor(i, parts)) + ps.body(g))
+}
+
+// sound reports whether the indexer's own parser sees every claim of a part: the page is not
+// degraded and it yields exactly the claims placed on it, each of which parses.
+func (ps pageSpec) sound(banner string, i, parts int, g []item) bool {
+	pg := claim.ParsePage(WikiDir+"/"+ps.pageFile(i), ps.content(banner, i, parts, g))
+	if pg.Degraded != "" || len(pg.Blocks) != len(g) {
+		return false
+	}
+	for _, b := range pg.Blocks {
+		if b.Err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// headingCost is what a heading adds to a part that starts a section with it.
+func headingCost(it item) int { return len("## ") + len(it.heading) + len("\n\n") }
+
+// group packs claims into parts by size alone. The parser has limits that bytes do not show
+// (code spans, links and emphasis marks per page), so pages() checks each part afterwards.
+func group(items []item, budget int) [][]item {
+	var groups [][]item
+	var cur []item
+	size := 0
+	for _, it := range items {
+		cost := len(it.text)
+		if len(cur) == 0 || cur[len(cur)-1].heading != it.heading {
+			cost += headingCost(it)
+		}
+		if size+cost > budget && len(cur) > 0 {
+			groups = append(groups, cur)
+			cur, size, cost = nil, 0, len(it.text)+headingCost(it)
+		}
+		cur = append(cur, it)
+		size += cost
+	}
+	if len(cur) > 0 || len(groups) == 0 {
+		groups = append(groups, cur)
+	}
+	return groups
+}
+
+func (ps pageSpec) pages(banner string) []PageOut {
+	items := ps.itemsOf()
 	// The whole page has to fit MaxPageBytes, not just its claims. What claims may use is what
 	// the widest head leaves: the first part, with its introduction, a full link list and a
 	// long part number (the slack covers " (part 99999)" in a later title).
@@ -336,36 +461,32 @@ func (ps pageSpec) pages(banner string) []PageOut {
 	if budget < minClaimBudget {
 		budget = minClaimBudget
 	}
-	var groups [][]atom
-	var cur []atom
-	size := 0
-	var last atom
-	for _, a := range atoms {
-		if size+len(a.text) > budget && len(cur) > 0 {
-			groups = append(groups, cur)
-			cur, size = nil, 0
-			if a.claim && last.text != "" {
-				cur, size = append(cur, last), len(last.text)
-			}
+	groups := group(items, budget)
+	// Verify each part with the real parser and halve any that it does not see whole. A part
+	// that holds a single claim and still fails cannot be helped by splitting: it stays alone
+	// on its page and is reported, never dropped.
+	var bad []string // claim ids, in page order
+	for i := 0; i < len(groups); {
+		g := groups[i]
+		switch {
+		case len(g) == 0 || ps.sound(banner, i, len(groups), g):
+			i++
+		case len(g) == 1:
+			bad = append(bad, g[0].claimID)
+			i++
+		default:
+			mid := len(g) / 2
+			groups = slices.Insert(groups, i+1, slices.Clone(g[mid:]))
+			groups[i] = slices.Clone(g[:mid])
 		}
-		cur = append(cur, a)
-		size += len(a.text)
-		if a.heading {
-			last = a
-		}
-	}
-	if len(cur) > 0 || len(groups) == 0 {
-		groups = append(groups, cur)
 	}
 	var out []PageOut
 	for i, g := range groups {
-		var b strings.Builder
-		b.WriteString(ps.head(banner, i, ps.linksFor(i, len(groups))))
-		for _, a := range g {
-			b.WriteString(a.text)
+		pg := PageOut{Path: WikiDir + "/" + ps.pageFile(i), ID: ps.idOf(i), Content: ps.content(banner, i, len(groups), g)}
+		if len(g) == 1 && slices.Contains(bad, g[0].claimID) {
+			pg.Unrenderable = []string{g[0].claimID}
 		}
-		file := strings.TrimPrefix(ps.idOf(i), "bootstrap-") + ".md"
-		out = append(out, PageOut{Path: WikiDir + "/" + file, ID: ps.idOf(i), Content: []byte(b.String())})
+		out = append(out, pg)
 	}
 	return out
 }
