@@ -476,8 +476,15 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 			for _, f := range append(f1, f2...) {
 				rep.Findings = append(rep.Findings, Safe(f.Msg))
 			}
+			// The validator is run over the original to refuse what it would refuse, but its output
+			// is not written back: it re-resolves the original's own evidence, and evidence that went
+			// stale since extraction would lose its object id silently. The original keeps its
+			// metadata as read, apart from the status and the link to the claim contradicting it
+			// (the rule Task 11 applies to a downgraded confirmation).
+			kept := parsed
+			kept.Status = outOld.Status
 			upd := cur
-			upd.Status, upd.Meta, upd.Loc = outOld.Status, outOld.Render(), locJSON(locs)
+			upd.Status, upd.Meta, upd.Loc = kept.Status, kept.Render(), locJSON(locs)
 			ins := StoredClaim{ClaimID: outNew.ID, Text: v.Corrected, Kind: "current-impl", Status: outNew.Status, Meta: outNew.Render(), Tier: TierImplementation, Loc: locJSON(locs)}
 			changes = append(changes, change{update: &upd, before: cur}, change{insert: &ins})
 			decided[v.Claim] = true
