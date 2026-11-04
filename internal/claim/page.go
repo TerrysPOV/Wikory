@@ -35,10 +35,13 @@ type Block struct {
 
 // Page is a parsed wiki page.
 type Page struct {
-	RelPath  string
-	ID       string
-	Type     string
-	Title    string
+	RelPath string
+	ID      string
+	Type    string
+	Title   string
+	// Origin is the frontmatter origin key, "" when absent. A tool that writes pages sets it to
+	// say so ("bootstrap").
+	Origin   string
 	Links    []string
 	Blocks   []Block
 	Body     string
@@ -528,6 +531,8 @@ func (p *Page) parseFrontmatter(lines []string) int {
 			p.ID = v
 		case "title":
 			p.Title = v
+		case "origin":
+			p.Origin = v
 		case "scope":
 			if v != "repo" {
 				p.Findings = append(p.Findings, Finding{i + 1, "page scope must be repo"})
