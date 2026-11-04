@@ -77,3 +77,21 @@ func ownerOf(p string, prefixes map[string]bool) string {
 	}
 	return "."
 }
+
+// ComponentFiles maps each component prefix to the queued implementation-tier repository
+// files it owns, in path order.
+func ComponentFiles(res Result) map[string][]Source {
+	prefixes := map[string]bool{}
+	for _, c := range res.Components {
+		prefixes[c.Prefix] = true
+	}
+	out := map[string][]Source{}
+	for _, s := range res.Sources {
+		if s.Name != "repo" || s.Tier != TierImplementation || s.Disposition != DispQueued {
+			continue
+		}
+		pre := ownerOf(s.Path, prefixes)
+		out[pre] = append(out[pre], s)
+	}
+	return out
+}
