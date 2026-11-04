@@ -8758,6 +8758,22 @@ git commit -m "feat: check, admit and store extract proposals through the valida
 
 ---
 
+#### Final whole-branch review fixes (2026-11-04)
+
+- B1 (`886fb29`): `CheckText` refuses claim text holding `](` or `![` with reject code `markup` and the fixed message "the text contains link or image markup, which a page would render as a link or an image": claim text is written into a page unescaped. Test: `TestCheckTextRefusesLinkAndImageMarkup`.
+- B3 (`9937586`): `CheckText` and `Safe` use the shared `unprintable` rule and `maxShownRunes` (see Task 9).
+- B13 (`f24ed34`): `bootstrap submit` refuses, with nothing recorded, once HEAD is not the run's planned commit (`errRepoMoved`): evidence lines are checked against the blobs the plan recorded and the validator records the blobs at HEAD, which agree only while HEAD is the planned commit. Test: `TestSubmitRefusesARunWhoseRepositoryMoved`. The same helper now gives confirm's and finish's identical message.
+- A4 (`86fdd47`): `Submit` reads the work file with `WorkReadMax` (Task 9).
+
+Run: `scripts/inject.sh internal/bootstrap/proposal.go '	case strings.Contains(t, "](") || strings.Contains(t, "!["):' '	case false && strings.Contains(t, "]("):' ./internal/bootstrap/ 'TestCheckTextRefusesLinkAndImageMarkup' 'want the markup rejection'`
+Run: `scripts/inject.sh internal/app/bootstrap_submit.go '	if head != run.Head {
+		return Result{}, errRepoMoved(run.Head, head)
+	}' '	if false && head != run.Head {
+		return Result{}, errRepoMoved(run.Head, head)
+	}' ./internal/app/ 'TestSubmitRefusesARunWhoseRepositoryMoved' 'must be refused'`
+
+Expected: each exits 0 (RED).
+
 ### Task 11: Verify stage and `conflicting` claims
 
 **Files:**
