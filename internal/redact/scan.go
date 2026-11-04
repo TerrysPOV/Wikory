@@ -12,6 +12,14 @@ type Span struct {
 // Scan reports where each rule matches the original text, ordered by position. It never
 // rewrites anything and never returns the matched text: callers record the kind and compute a
 // line number, so a coverage report can say where a secret was without repeating it.
+//
+// Overlapping or nested spans are merged into the widest (the assignment rules overlap, and
+// one secret must be one span), so the result is ordered by Start and no two spans overlap.
+// A merged span keeps the Kind of the span that starts first.
+//
+// Scan and String disagree about input that already contains a marker: String rewrites
+// "[REDACTED:" to "[REDACTED-IN:" before any rule runs, whereas Scan trusts a value that is
+// exactly one marker and skips it. Scan is a detector over the original text, not a mirror.
 func Scan(s string) []Span {
 	var spans []Span
 	for _, r := range rules {
@@ -30,16 +38,19 @@ func Scan(s string) []Span {
 			spans = append(spans, Span{Kind: r.kind, Start: start, End: end})
 		}
 	}
+	// Position order, widest first at equal Start, so a merge only ever extends the last span.
 	sort.SliceStable(spans, func(i, j int) bool {
 		if spans[i].Start != spans[j].Start {
 			return spans[i].Start < spans[j].Start
 		}
-		return spans[i].End < spans[j].End
+		return spans[i].End > spans[j].End
 	})
-	// Two rules can match the same text (the assignment rules overlap); report each place once.
 	out := spans[:0]
 	for _, sp := range spans {
-		if n := len(out); n > 0 && out[n-1].Start == sp.Start && out[n-1].End == sp.End {
+		if n := len(out); n > 0 && sp.Start < out[n-1].End {
+			if sp.End > out[n-1].End {
+				out[n-1].End = sp.End
+			}
 			continue
 		}
 		out = append(out, sp)

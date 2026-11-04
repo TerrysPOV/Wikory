@@ -61,16 +61,35 @@ func TestScanSeesEverythingStringRedacts(t *testing.T) {
 }
 
 func TestScanReportsEachPlaceOnce(t *testing.T) {
-	in := "DB_PASS" + "WORD=hunter2hunter2"
-	if sp := Scan(in); len(sp) != 1 {
-		t.Fatalf("two overlapping rules must not double-count one secret: %+v", sp)
+	// The second fixture has text after the value, so the two assignment rules end at
+	// different offsets (one takes the rest of the line, one a single word) from one Start.
+	for _, tc := range []struct{ in, want string }{
+		{"DB_PASS" + "WORD=hunter2hunter2", "hunter2hunter2"},
+		{"DB_PASS" + "WORD=hunter2hunter2 # note here", "hunter2hunter2 # note here"},
+	} {
+		sp := Scan(tc.in)
+		if len(sp) != 1 {
+			t.Fatalf("one secret in %q must be one span, got %+v", tc.in, sp)
+		}
+		if got := tc.in[sp[0].Start:sp[0].End]; got != tc.want {
+			t.Errorf("span covers %q, want the widest match %q", got, tc.want)
+		}
 	}
 }
 
 func TestScanSpansAreOrderedAndInRange(t *testing.T) {
-	in := "a=" + "AK" + "IAABCDEFGHIJKLMNOP and DB_PASS" + "WORD=hunter2hunter2"
+	// The assignment comes first in the text but later in the rule list, so rule order and
+	// position order disagree and only an explicit sort puts the spans in position order.
+	in := "DB_PASS" + "WORD=hunter2hunter2\n" + "AK" + "IAABCDEFGHIJKLMNOP"
+	spans := Scan(in)
+	if len(spans) != 2 {
+		t.Fatalf("want 2 spans, got %+v", spans)
+	}
+	if spans[0].Kind != "assignment" || spans[1].Kind != "aws-access-key" {
+		t.Fatalf("spans out of position order: %+v", spans)
+	}
 	prev := -1
-	for _, sp := range Scan(in) {
+	for _, sp := range spans {
 		if sp.Start < prev || sp.Start < 0 || sp.End > len(in) || sp.End <= sp.Start {
 			t.Fatalf("bad span %+v in %d bytes", sp, len(in))
 		}
