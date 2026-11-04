@@ -12,14 +12,34 @@ var implExt = map[string]bool{".go": true, ".py": true, ".js": true, ".mjs": tru
 
 var implBase = map[string]bool{"makefile": true, "dockerfile": true}
 
-var handoffMarks = []string{"handoff", "prior_session_state", ".planning/", "/memory/", "memory/", "memory.md", "agents.md", "claude.md"}
+// Handoffs, planning notes and memory notes are attributed claims. They are recognised by whole
+// path segments and base names, never by substring, so code that merely has such a word in its
+// path (internal/memory/store.go, pkg/inmemory/cache.go) stays code.
+var (
+	// handoffDirs mark everything beneath them, whatever the extension.
+	handoffDirs = map[string]bool{"handoffs": true, ".planning": true}
+	// noteDirs mark only prose beneath them: a directory called memory or handoff is as likely to
+	// be a Go package as a folder of notes.
+	noteDirs = map[string]bool{"handoff": true, "memory": true, "memories": true}
+	// handoffBases are file names that are notes wherever they sit.
+	handoffBases = map[string]bool{"memory.md": true, "agents.md": true, "claude.md": true}
+	proseExt     = map[string]bool{".md": true, ".markdown": true, ".txt": true, ".rst": true}
+)
 
 // IsHandoff reports whether a path looks like a handoff, planning note or memory note: the
 // material whose mentions of a component say people were working on it.
 func IsHandoff(p string) bool {
-	l := strings.ToLower(p)
-	for _, m := range handoffMarks {
-		if strings.Contains(l, m) {
+	segs := strings.Split(strings.ToLower(p), "/")
+	base := segs[len(segs)-1]
+	if handoffBases[base] {
+		return true
+	}
+	prose := proseExt[path.Ext(base)]
+	if prose && (strings.HasPrefix(base, "handoff") || strings.HasPrefix(base, "prior_session_state")) {
+		return true
+	}
+	for _, s := range segs[:len(segs)-1] {
+		if handoffDirs[s] || prose && noteDirs[s] {
 			return true
 		}
 	}

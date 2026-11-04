@@ -3,7 +3,7 @@ package bootstrap
 import (
 	"context"
 	"fmt"
-	"io/fs"
+	"os"
 	"path"
 	"sort"
 
@@ -96,12 +96,19 @@ func (d *DirReader) List(ctx context.Context) ([]Entry, error) {
 				continue
 			}
 			child := path.Join(rel, e.Name())
-			if e.Type()&fs.ModeSymlink != 0 {
+			if e.Type()&os.ModeSymlink != 0 {
 				d.skip(child, DispLink)
 				continue
 			}
 			if e.IsDir() {
 				if depth+1 < d.MaxDepth {
+					// A name the root cannot address (a backslash, or a colon in second place)
+					// is legal on Unix. Record the directory like an unreadable file instead of
+					// letting ReadDir fail the whole listing.
+					if _, err := confine.Split(child); err != nil {
+						d.skip(child+"/", DispUnreadable)
+						continue
+					}
 					if err := walk(child, depth+1); err != nil {
 						return err
 					}

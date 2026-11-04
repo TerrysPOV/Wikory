@@ -176,3 +176,134 @@ func TestDirReaderBoundsDepthAndEntryCount(t *testing.T) {
 		t.Fatal("exceeding MaxEntries must be an error, not a silent truncation")
 	}
 }
+
+func TestDirReaderReadRefusesWhatAListedFileBecame(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks and hard links need privileges on Windows")
+	}
+	ctx := context.Background()
+	// listed returns a reader and the entry it listed for note.md, plus the paths needed to swap it.
+	listed := func(t *testing.T) (rd *DirReader, e Entry, note, secret string) {
+		t.Helper()
+		dir, _ := filepath.EvalSymlinks(t.TempDir())
+		outside, _ := filepath.EvalSymlinks(t.TempDir())
+		note, secret = filepath.Join(dir, "note.md"), filepath.Join(outside, "secret.txt")
+		if err := os.WriteFile(note, []byte("note\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(secret, []byte("outside\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		root, err := confine.Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { root.Close() })
+		rd = NewDirReader("notes", root)
+		es, err := rd.List(ctx)
+		if err != nil || len(es) != 1 {
+			t.Fatalf("setup: %v %+v", err, es)
+		}
+		if b, err := rd.Read(ctx, es[0], 100); err != nil || string(b) != "note\n" {
+			t.Fatalf("setup: the untouched file reads: %q %v", b, err)
+		}
+		return rd, es[0], note, secret
+	}
+	t.Run("swapped for a symlink to an outside file", func(t *testing.T) {
+		rd, e, note, secret := listed(t)
+		if err := os.Remove(note); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(secret, note); err != nil {
+			t.Fatal(err)
+		}
+		b, err := rd.Read(ctx, e, 100)
+		if !errors.Is(err, confine.ErrSymlink) {
+			t.Fatalf("a listed file swapped for a symlink must be refused with ErrSymlink: got %q, %v", b, err)
+		}
+	})
+	t.Run("swapped for a hard link to an outside file", func(t *testing.T) {
+		rd, e, note, secret := listed(t)
+		if err := os.Remove(note); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(secret, note); err != nil {
+			t.Fatal(err)
+		}
+		b, err := rd.Read(ctx, e, 100)
+		if !errors.Is(err, confine.ErrHardlink) {
+			t.Fatalf("a listed file swapped for a hard link must be refused with ErrHardlink: got %q, %v", b, err)
+		}
+	})
+}
+
+func TestDirReaderRecordsDirectoriesWithNamesTheRootCannotAddress(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a backslash or colon is not legal in a Windows file name")
+	}
+	ctx := context.Background()
+	dir, _ := filepath.EvalSymlinks(t.TempDir())
+	for _, f := range []string{`a\b/inner.md`, `x:y/inner.md`, "ok/inner.md", "top.md"} {
+		p := filepath.Join(dir, filepath.FromSlash(f))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := confine.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	rd := NewDirReader("notes", root)
+	es, err := rd.List(ctx)
+	if err != nil {
+		t.Fatalf("one odd directory name must not abort the listing: %v", err)
+	}
+	var paths []string
+	for _, e := range es {
+		paths = append(paths, e.Path)
+	}
+	if !slices.Equal(paths, []string{"ok/inner.md", "top.md"}) {
+		t.Fatalf("the readable files are still listed: %v", paths)
+	}
+	got := map[string]string{}
+	for _, s := range rd.Skipped() {
+		got[s.Path] = s.Reason
+	}
+	want := map[string]string{`a\b/`: DispUnreadable, "x:y/": DispUnreadable}
+	if !maps.Equal(got, want) {
+		t.Fatalf("skipped = %v, want %v", got, want)
+	}
+}
+
+func TestDirReaderMaxEntriesBoundary(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := filepath.EvalSymlinks(t.TempDir())
+	write := func(name string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := confine.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	rd := NewDirReader("x", root)
+	rd.MaxEntries = 3
+	write("1.md")
+	write("2.md")
+	write("3.md")
+	es, err := rd.List(ctx)
+	if err != nil || len(es) != 3 {
+		t.Fatalf("exactly MaxEntries files must list without error: %d entries, %v", len(es), err)
+	}
+	write("4.md")
+	if _, err := rd.List(ctx); err == nil {
+		t.Fatal("MaxEntries+1 files must fail")
+	}
+}
