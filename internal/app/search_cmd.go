@@ -46,7 +46,7 @@ func runSearch(ctx context.Context, env *Env, args []string) (Result, error) {
 	if !servable(p) {
 		return Result{}, errors.New(strings.TrimSpace(strings.SplitN(notRegisteredBriefing(p), "\n", 2)[0]))
 	}
-	prog := NewProgress(env.IO.Err, env.JSON, false, time.Now)
+	prog := NewProgress(env.IO.Err, env.JSON, IsTTY(env.IO.Err), time.Now)
 	stats, err := p.refresh(ctx, prog)
 	if err != nil {
 		return Result{}, err
