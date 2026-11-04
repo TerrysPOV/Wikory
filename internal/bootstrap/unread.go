@@ -10,7 +10,7 @@ import (
 // say they were not read. A bootstrap baselines the default branch at HEAD only, so work that
 // lives somewhere else is not in the baseline; listing it keeps the plan and the coverage
 // report from implying otherwise. Worktrees are brought in by refresh after a merge, not by
-// bootstrap (architecture spec section 9). The records carry no content and no hash.
+// bootstrap (architecture spec section 9). The records carry no content and no hash, and no machine-specific path.
 func UnreadSources(def string, branches []gitx.Branch, trees []gitx.Worktree) []Source {
 	var out []Source
 	for _, b := range branches {
@@ -18,15 +18,17 @@ func UnreadSources(def string, branches []gitx.Branch, trees []gitx.Worktree) []
 			Tier: TierAttributed, Disposition: DispUnmergedBranch, Date: dateOf(b.Tip)})
 	}
 	for _, w := range trees {
-		on := w.Branch
-		if on == "" {
-			head := w.Head
-			if len(head) > 12 {
-				head = head[:12]
+		// The label is the branch (git lets one worktree hold a branch, so it is unique) or a
+		// short head id when detached. The directory is left out on purpose: it differs by
+		// machine and moves with the worktree, and the plan hash covers this path.
+		label := w.Branch
+		if label == "" {
+			label = w.Head
+			if len(label) > 12 {
+				label = label[:12]
 			}
-			on = "detached at " + head
 		}
-		out = append(out, Source{Name: "repo", Path: fmt.Sprintf("worktree:%s (%s)", w.Path, on), Tier: TierAttributed, Disposition: DispOtherWorktree})
+		out = append(out, Source{Name: "repo", Path: "worktree:" + label, Tier: TierAttributed, Disposition: DispOtherWorktree})
 	}
 	return out
 }

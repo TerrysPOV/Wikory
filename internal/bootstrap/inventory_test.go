@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -210,15 +211,15 @@ func TestUnreadSourcesNameBranchesAndWorktreesAndInventoryNeverReadsThem(t *test
 	tip := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 	un := UnreadSources("main",
 		[]gitx.Branch{{Name: "feature/x", Ahead: 3, Tip: tip}},
-		[]gitx.Worktree{{Path: "/w/side", Branch: "side", Head: strings.Repeat("c", 40)}, {Path: "/w/old", Head: strings.Repeat("d", 40)}, {Path: "/w/node_modules/deps", Branch: "deps", Head: strings.Repeat("e", 40)}})
+		[]gitx.Worktree{{Path: "/w/side", Branch: "side", Head: strings.Repeat("c", 40)}, {Path: "/w/old", Head: strings.Repeat("d", 40)}, {Path: "/w/deps", Branch: "x/node_modules/deps", Head: strings.Repeat("e", 40)}})
 	if len(un) != 4 || un[0].Disposition != DispUnmergedBranch || un[1].Disposition != DispOtherWorktree || un[2].Disposition != DispOtherWorktree {
 		t.Fatalf("%+v", un)
 	}
 	if !strings.Contains(un[0].Path, "feature/x") || !strings.Contains(un[0].Path, "3 commit") || un[0].Date != "2026-03-04T05:06:07Z" {
 		t.Fatalf("a branch is named with how far ahead it is, and dated: %+v", un[0])
 	}
-	if !strings.Contains(un[2].Path, "detached at dddddddddddd") {
-		t.Fatalf("a detached worktree says so: %+v", un[2])
+	if un[1].Path != "worktree:side" || un[2].Path != "worktree:dddddddddddd" {
+		t.Fatalf("a worktree is labelled by its branch, or by a short head id when detached, never by its directory: %+v %+v", un[1], un[2])
 	}
 	repo := &memReader{name: "repo", files: map[string]string{"a.go": "package a\n"}}
 	res, err := Inventory(ctx, []Reader{repo}, Options{Budget: 5, Unread: un})
@@ -232,11 +233,25 @@ func TestUnreadSourcesNameBranchesAndWorktreesAndInventoryNeverReadsThem(t *test
 		t.Fatalf("the file and four unread records: %+v", res.Sources)
 	}
 	if got := srcBy(res, un[3].Path); got.Disposition != DispOtherWorktree {
-		t.Fatalf("a recorded disposition is never replaced by an exclusion rule (this path has a node_modules segment): %+v", got)
+		t.Fatalf("a recorded disposition is never replaced by an exclusion rule (this label has a node_modules segment): %+v", got)
 	}
 	for _, p := range repo.reads {
 		if strings.HasPrefix(p, "branch:") || strings.HasPrefix(p, "worktree:") {
 			t.Fatalf("%s was read", p)
+		}
+	}
+}
+
+func TestUnreadWorktreeRecordsDoNotDependOnWhereTheWorktreeLives(t *testing.T) {
+	head := strings.Repeat("c", 40)
+	a := UnreadSources("main", nil, []gitx.Worktree{{Path: "/Users/a/side", Branch: "side", Head: head}, {Path: "/Users/a/old", Head: head}})
+	b := UnreadSources("main", nil, []gitx.Worktree{{Path: "/srv/ci/elsewhere/side", Branch: "side", Head: head}, {Path: "/srv/ci/moved/old", Head: head}})
+	if !reflect.DeepEqual(a, b) {
+		t.Fatalf("the same worktrees in other directories must give identical records, so a plan hash is portable:\n%+v\n%+v", a, b)
+	}
+	for _, s := range a {
+		if strings.Contains(s.Path, "/") {
+			t.Fatalf("an absolute directory leaked into a record: %+v", s)
 		}
 	}
 }
