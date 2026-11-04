@@ -1056,16 +1056,35 @@ func TestScanSeesEverythingStringRedacts(t *testing.T) {
 }
 
 func TestScanReportsEachPlaceOnce(t *testing.T) {
-	in := "DB_PASS" + "WORD=hunter2hunter2"
-	if sp := Scan(in); len(sp) != 1 {
-		t.Fatalf("two overlapping rules must not double-count one secret: %+v", sp)
+	// The second fixture has text after the value, so the two assignment rules end at
+	// different offsets (one takes the rest of the line, one a single word) from one Start.
+	for _, tc := range []struct{ in, want string }{
+		{"DB_PASS" + "WORD=hunter2hunter2", "hunter2hunter2"},
+		{"DB_PASS" + "WORD=hunter2hunter2 # note here", "hunter2hunter2 # note here"},
+	} {
+		sp := Scan(tc.in)
+		if len(sp) != 1 {
+			t.Fatalf("one secret in %q must be one span, got %+v", tc.in, sp)
+		}
+		if got := tc.in[sp[0].Start:sp[0].End]; got != tc.want {
+			t.Errorf("span covers %q, want the widest match %q", got, tc.want)
+		}
 	}
 }
 
 func TestScanSpansAreOrderedAndInRange(t *testing.T) {
-	in := "a=" + "AK" + "IAABCDEFGHIJKLMNOP and DB_PASS" + "WORD=hunter2hunter2"
+	// The assignment comes first in the text but later in the rule list, so rule order and
+	// position order disagree and only an explicit sort puts the spans in position order.
+	in := "DB_PASS" + "WORD=hunter2hunter2\n" + "AK" + "IAABCDEFGHIJKLMNOP"
+	spans := Scan(in)
+	if len(spans) != 2 {
+		t.Fatalf("want 2 spans, got %+v", spans)
+	}
+	if spans[0].Kind != "assignment" || spans[1].Kind != "aws-access-key" {
+		t.Fatalf("spans out of position order: %+v", spans)
+	}
 	prev := -1
-	for _, sp := range Scan(in) {
+	for _, sp := range spans {
 		if sp.Start < prev || sp.Start < 0 || sp.End > len(in) || sp.End <= sp.Start {
 			t.Fatalf("bad span %+v in %d bytes", sp, len(in))
 		}
@@ -1096,6 +1115,14 @@ type Span struct {
 // Scan reports where each rule matches the original text, ordered by position. It never
 // rewrites anything and never returns the matched text: callers record the kind and compute a
 // line number, so a coverage report can say where a secret was without repeating it.
+//
+// Overlapping or nested spans are merged into the widest (the assignment rules overlap, and
+// one secret must be one span), so the result is ordered by Start and no two spans overlap.
+// A merged span keeps the Kind of the span that starts first.
+//
+// Scan and String disagree about input that already contains a marker: String rewrites
+// "[REDACTED:" to "[REDACTED-IN:" before any rule runs, whereas Scan trusts a value that is
+// exactly one marker and skips it. Scan is a detector over the original text, not a mirror.
 func Scan(s string) []Span {
 	var spans []Span
 	for _, r := range rules {
@@ -1114,16 +1141,19 @@ func Scan(s string) []Span {
 			spans = append(spans, Span{Kind: r.kind, Start: start, End: end})
 		}
 	}
+	// Position order, widest first at equal Start, so a merge only ever extends the last span.
 	sort.SliceStable(spans, func(i, j int) bool {
 		if spans[i].Start != spans[j].Start {
 			return spans[i].Start < spans[j].Start
 		}
-		return spans[i].End < spans[j].End
+		return spans[i].End > spans[j].End
 	})
-	// Two rules can match the same text (the assignment rules overlap); report each place once.
 	out := spans[:0]
 	for _, sp := range spans {
-		if n := len(out); n > 0 && out[n-1].Start == sp.Start && out[n-1].End == sp.End {
+		if n := len(out); n > 0 && sp.Start < out[n-1].End {
+			if sp.End > out[n-1].End {
+				out[n-1].End = sp.End
+			}
 			continue
 		}
 		out = append(out, sp)
@@ -1137,10 +1167,19 @@ func Scan(s string) []Span {
 Run: `go test ./internal/redact/ -count=1`
 Expected: PASS. If `TestScanSeesEverythingStringRedacts` names a fixture that `String` does not change, fix the fixture (the test says so). If a real input is redacted by `String` but missed by `Scan`, fix `Scan`.
 
-- [ ] **Step 5: Prove the consistency test can fail**
+- [ ] **Step 5: Prove each Scan test can fail** (four separate runs, one fault each)
 
 Run: `scripts/inject.sh internal/redact/scan.go 'if end <= start || markerRe.MatchString(s[start:end]) {' 'if end <= start || true {' ./internal/redact/ 'TestScanSeesEverythingStringRedacts' 'Scan found nothing'`
 Expected: exit 0 (RED).
+
+Run: `scripts/inject.sh internal/redact/scan.go 'return spans[i].Start < spans[j].Start' 'return false' ./internal/redact/ 'TestScanSpansAreOrderedAndInRange' 'want 2 spans'`
+Expected: exit 0 (RED). With the position sort disabled the spans stay in rule order, the merge loop folds the later-listed assignment into the key span, and the test sees one span.
+
+Run: `scripts/inject.sh internal/redact/scan.go 'return out' 'return nil' ./internal/redact/ 'TestScanSpansAreOrderedAndInRange' 'want 2 spans'`
+Expected: exit 0 (RED).
+
+Run: `scripts/inject.sh internal/redact/scan.go 'sp.Start < out[n-1].End' 'sp.Start == out[n-1].Start && sp.End == out[n-1].End' ./internal/redact/ 'TestScanReportsEachPlaceOnce' 'must be one span'`
+Expected: exit 0 (RED). This restores the old identical-range dedupe, which leaves `DB_PASSWORD=hunter2hunter2 # note here` as two overlapping spans.
 
 - [ ] **Step 6: Commit**
 
