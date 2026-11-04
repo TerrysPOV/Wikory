@@ -1362,17 +1362,21 @@ import "testing"
 
 func TestTierOf(t *testing.T) {
 	cases := map[string]string{
-		"internal/store/schema.go":                  TierImplementation,
-		"internal/store/schema_test.go":             TierImplementation,
-		"config.toml":                               TierImplementation,
-		"Makefile":                                  TierImplementation,
-		"docs/decisions/0001-use-sqlite.md":         TierIntent,
-		"docs/adr/ADR-0002-queues.md":               TierIntent,
-		"README.md":                                 TierAttributed,
-		".claude/handoffs/PRIOR_SESSION_STATE.md":   TierAttributed,
-		".planning/notes.json":                      TierAttributed,
-		"memory/MEMORY.md":                          TierAttributed,
-		"notes.txt":                                 TierAttributed,
+		"internal/store/schema.go":                TierImplementation,
+		"internal/store/schema_test.go":           TierImplementation,
+		"config.toml":                             TierImplementation,
+		"Makefile":                                TierImplementation,
+		"docs/decisions/0001-use-sqlite.md":       TierIntent,
+		"docs/adr/ADR-0002-queues.md":             TierIntent,
+		"README.md":                               TierAttributed,
+		".claude/handoffs/PRIOR_SESSION_STATE.md": TierAttributed,
+		".planning/notes.json":                    TierAttributed,
+		"memory/MEMORY.md":                        TierAttributed,
+		"notes.txt":                               TierAttributed,
+		// Code that merely has a handoff or memory in its path is still code.
+		"internal/memory/store.go":    TierImplementation,
+		"internal/handoff/handoff.go": TierImplementation,
+		"pkg/inmemory/cache.go":       TierImplementation,
 	}
 	for p, want := range cases {
 		if got := TierOf(p); got != want {
@@ -1386,6 +1390,17 @@ func TestIsHandoff(t *testing.T) {
 		".claude/handoffs/PRIOR_SESSION_STATE.md": true,
 		".planning/phase1/PLAN.md":                true,
 		"docs/design.md":                          false,
+		"internal/memory/store.go":                false,
+		"internal/handoff/handoff.go":             false,
+		"pkg/inmemory/cache.go":                   false,
+		"docs/myclaude.md":                        false,
+		"docs/inmemory/notes.md":                  false,
+		".claude/projects/x/memory/note.md":       true,
+		"memory/MEMORY.md":                        true,
+		"docs/HANDOFF-2026-11-01.md":              true,
+		"sub/CLAUDE.md":                           true,
+		"AGENTS.md":                               true,
+		".claude/handoffs/state.json":             true,
 	} {
 		if IsHandoff(p) != want {
 			t.Errorf("IsHandoff(%q) = %v, want %v", p, !want, want)
@@ -1575,6 +1590,137 @@ func TestDirReaderBoundsDepthAndEntryCount(t *testing.T) {
 		t.Fatal("exceeding MaxEntries must be an error, not a silent truncation")
 	}
 }
+
+func TestDirReaderReadRefusesWhatAListedFileBecame(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks and hard links need privileges on Windows")
+	}
+	ctx := context.Background()
+	// listed returns a reader and the entry it listed for note.md, plus the paths needed to swap it.
+	listed := func(t *testing.T) (rd *DirReader, e Entry, note, secret string) {
+		t.Helper()
+		dir, _ := filepath.EvalSymlinks(t.TempDir())
+		outside, _ := filepath.EvalSymlinks(t.TempDir())
+		note, secret = filepath.Join(dir, "note.md"), filepath.Join(outside, "secret.txt")
+		if err := os.WriteFile(note, []byte("note\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(secret, []byte("outside\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		root, err := confine.Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { root.Close() })
+		rd = NewDirReader("notes", root)
+		es, err := rd.List(ctx)
+		if err != nil || len(es) != 1 {
+			t.Fatalf("setup: %v %+v", err, es)
+		}
+		if b, err := rd.Read(ctx, es[0], 100); err != nil || string(b) != "note\n" {
+			t.Fatalf("setup: the untouched file reads: %q %v", b, err)
+		}
+		return rd, es[0], note, secret
+	}
+	t.Run("swapped for a symlink to an outside file", func(t *testing.T) {
+		rd, e, note, secret := listed(t)
+		if err := os.Remove(note); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(secret, note); err != nil {
+			t.Fatal(err)
+		}
+		b, err := rd.Read(ctx, e, 100)
+		if !errors.Is(err, confine.ErrSymlink) {
+			t.Fatalf("a listed file swapped for a symlink must be refused with ErrSymlink: got %q, %v", b, err)
+		}
+	})
+	t.Run("swapped for a hard link to an outside file", func(t *testing.T) {
+		rd, e, note, secret := listed(t)
+		if err := os.Remove(note); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(secret, note); err != nil {
+			t.Fatal(err)
+		}
+		b, err := rd.Read(ctx, e, 100)
+		if !errors.Is(err, confine.ErrHardlink) {
+			t.Fatalf("a listed file swapped for a hard link must be refused with ErrHardlink: got %q, %v", b, err)
+		}
+	})
+}
+
+func TestDirReaderRecordsDirectoriesWithNamesTheRootCannotAddress(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a backslash or colon is not legal in a Windows file name")
+	}
+	ctx := context.Background()
+	dir, _ := filepath.EvalSymlinks(t.TempDir())
+	for _, f := range []string{`a\b/inner.md`, `x:y/inner.md`, "ok/inner.md", "top.md"} {
+		p := filepath.Join(dir, filepath.FromSlash(f))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := confine.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	rd := NewDirReader("notes", root)
+	es, err := rd.List(ctx)
+	if err != nil {
+		t.Fatalf("one odd directory name must not abort the listing: %v", err)
+	}
+	var paths []string
+	for _, e := range es {
+		paths = append(paths, e.Path)
+	}
+	if !slices.Equal(paths, []string{"ok/inner.md", "top.md"}) {
+		t.Fatalf("the readable files are still listed: %v", paths)
+	}
+	got := map[string]string{}
+	for _, s := range rd.Skipped() {
+		got[s.Path] = s.Reason
+	}
+	want := map[string]string{`a\b/`: DispUnreadable, "x:y/": DispUnreadable}
+	if !maps.Equal(got, want) {
+		t.Fatalf("skipped = %v, want %v", got, want)
+	}
+}
+
+func TestDirReaderMaxEntriesBoundary(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := filepath.EvalSymlinks(t.TempDir())
+	write := func(name string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := confine.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	rd := NewDirReader("x", root)
+	rd.MaxEntries = 3
+	write("1.md")
+	write("2.md")
+	write("3.md")
+	es, err := rd.List(ctx)
+	if err != nil || len(es) != 3 {
+		t.Fatalf("exactly MaxEntries files must list without error: %d entries, %v", len(es), err)
+	}
+	write("4.md")
+	if _, err := rd.List(ctx); err == nil {
+		t.Fatal("MaxEntries+1 files must fail")
+	}
+}
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -1758,14 +1904,34 @@ var implExt = map[string]bool{".go": true, ".py": true, ".js": true, ".mjs": tru
 
 var implBase = map[string]bool{"makefile": true, "dockerfile": true}
 
-var handoffMarks = []string{"handoff", "prior_session_state", ".planning/", "/memory/", "memory/", "memory.md", "agents.md", "claude.md"}
+// Handoffs, planning notes and memory notes are attributed claims. They are recognised by whole
+// path segments and base names, never by substring, so code that merely has such a word in its
+// path (internal/memory/store.go, pkg/inmemory/cache.go) stays code.
+var (
+	// handoffDirs mark everything beneath them, whatever the extension.
+	handoffDirs = map[string]bool{"handoffs": true, ".planning": true}
+	// noteDirs mark only prose beneath them: a directory called memory or handoff is as likely to
+	// be a Go package as a folder of notes.
+	noteDirs = map[string]bool{"handoff": true, "memory": true, "memories": true}
+	// handoffBases are file names that are notes wherever they sit.
+	handoffBases = map[string]bool{"memory.md": true, "agents.md": true, "claude.md": true}
+	proseExt     = map[string]bool{".md": true, ".markdown": true, ".txt": true, ".rst": true}
+)
 
 // IsHandoff reports whether a path looks like a handoff, planning note or memory note: the
 // material whose mentions of a component say people were working on it.
 func IsHandoff(p string) bool {
-	l := strings.ToLower(p)
-	for _, m := range handoffMarks {
-		if strings.Contains(l, m) {
+	segs := strings.Split(strings.ToLower(p), "/")
+	base := segs[len(segs)-1]
+	if handoffBases[base] {
+		return true
+	}
+	prose := proseExt[path.Ext(base)]
+	if prose && (strings.HasPrefix(base, "handoff") || strings.HasPrefix(base, "prior_session_state")) {
+		return true
+	}
+	for _, s := range segs[:len(segs)-1] {
+		if handoffDirs[s] || prose && noteDirs[s] {
 			return true
 		}
 	}
@@ -1817,7 +1983,7 @@ package bootstrap
 import (
 	"context"
 	"fmt"
-	"io/fs"
+	"os"
 	"path"
 	"sort"
 
@@ -1841,8 +2007,8 @@ type RepoReader struct {
 // NewRepoReader reads rev (HEAD or a hex commit id) through src.
 func NewRepoReader(src TreeSource, rev string) *RepoReader { return &RepoReader{src: src, rev: rev} }
 
-func (r *RepoReader) Name() string          { return "repo" }
-func (r *RepoReader) Tier(p string) string  { return TierOf(p) }
+func (r *RepoReader) Name() string         { return "repo" }
+func (r *RepoReader) Tier(p string) string { return TierOf(p) }
 func (r *RepoReader) List(ctx context.Context) ([]Entry, error) {
 	tree, err := r.src.ListTree(ctx, r.rev)
 	if err != nil {
@@ -1885,7 +2051,9 @@ func (d *DirReader) Tier(p string) string { return outsideTier(p) }
 // links, and files it could not open.
 func (d *DirReader) Skipped() []Skip { return d.skipped }
 
-func (d *DirReader) skip(p, reason string) { d.skipped = append(d.skipped, Skip{Path: p, Reason: reason}) }
+func (d *DirReader) skip(p, reason string) {
+	d.skipped = append(d.skipped, Skip{Path: p, Reason: reason})
+}
 
 func (d *DirReader) List(ctx context.Context) ([]Entry, error) {
 	d.skipped = nil
@@ -1908,12 +2076,19 @@ func (d *DirReader) List(ctx context.Context) ([]Entry, error) {
 				continue
 			}
 			child := path.Join(rel, e.Name())
-			if e.Type()&fs.ModeSymlink != 0 {
+			if e.Type()&os.ModeSymlink != 0 {
 				d.skip(child, DispLink)
 				continue
 			}
 			if e.IsDir() {
 				if depth+1 < d.MaxDepth {
+					// A name the root cannot address (a backslash, or a colon in second place)
+					// is legal on Unix. Record the directory like an unreadable file instead of
+					// letting ReadDir fail the whole listing.
+					if _, err := confine.Split(child); err != nil {
+						d.skip(child+"/", DispUnreadable)
+						continue
+					}
 					if err := walk(child, depth+1); err != nil {
 						return err
 					}
@@ -1969,7 +2144,7 @@ Expected: PASS. Platform note: `e.Info()` on an entry returned by `confine.Root.
 - [ ] **Step 5: Prove the safety assertions can fail**
 
 Run: `scripts/inject.sh internal/bootstrap/reader.go 'if e.Name() == ".git" {' 'if e.Name() == ".gitx" {' ./internal/bootstrap/ 'TestDirReaderWalksThroughTheConfinedRootAndNeverFollowsLinks' 'under .git'`
-(Symlinks are refused by two layers, the `ModeSymlink` check here and `confine.Root.OpenRead` below it, so no single-site fault in this file shows the symlink assertion failing. The proof that a link is never followed is `TestRefusesSymlinkedFile` and its siblings in `internal/confine`. The `.git` skip has one layer, so it carries the injection.)
+(Symlinks are refused by two layers, the `ModeSymlink` check in `List` and `confine.Root.OpenRead` below it, so no single-site fault in `List` shows a symlink being followed there. `Read` has one layer, `Root.ReadFile`, so it carries the link proof below: `TestDirReaderReadRefusesWhatAListedFileBecame` lists a file, swaps it for a symlink or a hard link to an outside file, and expects `confine.ErrSymlink` and `confine.ErrHardlink`. The injection replaces the `Root.ReadFile` call with `os.ReadFile` of the joined path. That compiles because `reader.go` already imports `os` for `os.ModeSymlink`. The refusals themselves are also proved in `internal/confine`.) The `.git` skip has one layer, so it carries the first injection.
 Run: `scripts/inject.sh internal/bootstrap/reader.go 'if len(es) >= d.MaxEntries {' 'if false {' ./internal/bootstrap/ 'TestDirReaderBoundsDepthAndEntryCount' 'MaxEntries'`
 Run: `scripts/inject.sh internal/bootstrap/reader.go 'd.skip(child+"/", DispTooDeep)' '_ = child' ./internal/bootstrap/ 'TestDirReaderRecordsWhatItDrops' 'skipped = '`
 Run: `scripts/inject.sh internal/bootstrap/reader.go 'd.skip(child, DispLink)' '_ = child' ./internal/bootstrap/ 'TestDirReaderRecordsWhatItDrops' 'skipped = '`
@@ -1982,6 +2157,15 @@ Run: `scripts/inject.sh internal/bootstrap/reader.go 'f, err := d.Root.OpenRead(
 				continue
 			}' ./internal/bootstrap/ 'TestDirReaderRecordsWhatItDrops' 'skipped = '`
 Run: `scripts/inject.sh internal/bootstrap/exclude.go 'if size > MaxFileBytes {' 'if size > MaxFileBytes+1 {' ./internal/bootstrap/ 'TestExclusionReasons' 'oversize'`
+Run: `scripts/inject.sh internal/bootstrap/reader.go 'return d.Root.ReadFile(e.Path, max)' 'return os.ReadFile(d.Root.Path() + "/" + e.Path)' ./internal/bootstrap/ 'TestDirReaderReadRefusesWhatAListedFileBecame' 'ErrSymlink'`
+Run: `scripts/inject.sh internal/bootstrap/reader.go 'return d.Root.ReadFile(e.Path, max)' 'return os.ReadFile(d.Root.Path() + "/" + e.Path)' ./internal/bootstrap/ 'TestDirReaderReadRefusesWhatAListedFileBecame' 'ErrHardlink'`
+Run: `scripts/inject.sh internal/bootstrap/reader.go 'if _, err := confine.Split(child); err != nil {' 'if false {' ./internal/bootstrap/ 'TestDirReaderRecordsDirectoriesWithNamesTheRootCannotAddress' 'one odd directory name'`
+Run: `scripts/inject.sh internal/bootstrap/reader.go 'if len(es) >= d.MaxEntries {' 'if len(es) > d.MaxEntries {' ./internal/bootstrap/ 'TestDirReaderMaxEntriesBoundary' 'MaxEntries+1'`
+Run: `scripts/inject.sh internal/bootstrap/reader.go 'if len(es) >= d.MaxEntries {' 'if len(es) >= d.MaxEntries-1 {' ./internal/bootstrap/ 'TestDirReaderMaxEntriesBoundary' 'exactly MaxEntries'`
+Run: `scripts/inject.sh internal/bootstrap/tier.go 'handoffDirs[s] || prose && noteDirs[s]' 'handoffDirs[s] || noteDirs[s]' ./internal/bootstrap/ 'TestIsHandoff' 'IsHandoff("internal/memory/store.go")'`
+Run: `scripts/inject.sh internal/bootstrap/tier.go 'if handoffBases[base] {' 'if handoffBases[base] || strings.HasSuffix(base, "claude.md") {' ./internal/bootstrap/ 'TestIsHandoff' 'IsHandoff("docs/myclaude.md")'`
+Run: `scripts/inject.sh internal/bootstrap/tier.go 'prose && noteDirs[s]' 'prose && strings.Contains(s, "memory")' ./internal/bootstrap/ 'TestIsHandoff' 'IsHandoff("docs/inmemory/notes.md")'`
+Run: `scripts/inject.sh internal/bootstrap/tier.go 'case IsHandoff(l):' 'case IsHandoff(l) || strings.Contains(l, "memory/"):' ./internal/bootstrap/ 'TestTierOf' 'TierOf("internal/memory/store.go")'`
 Expected: each exits 0 (RED).
 
 - [ ] **Step 6: Commit**
