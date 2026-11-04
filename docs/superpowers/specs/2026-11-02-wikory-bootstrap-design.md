@@ -1,7 +1,7 @@
 # Wikory: stage 2 bootstrap design
 
 Date: 2026-11-02
-Status: draft 2. Subsystem design under section 9 and section 12 (stage 2) of [the architecture design](2026-11-01-wikory-architecture-design.md), which is approved and wins where the two differ. Terry ruled on the four open choices on 2026-11-02 (section 5). The design itself still awaits his review before the implementation plan is written.
+Status: draft 2. Subsystem design under section 9 and section 12 (stage 2) of [the architecture design](2026-11-01-wikory-architecture-design.md), which is approved and wins where the two differ. Terry ruled on the four open choices on 2026-11-02 (section 5). Terry approved the whole design on 2026-11-04.
 
 ## 1. Problem
 
