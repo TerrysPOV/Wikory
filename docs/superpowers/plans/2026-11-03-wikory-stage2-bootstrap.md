@@ -12228,6 +12228,20 @@ Known gap recorded here (decision 3 of this plan): search results do not yet dis
 
 ---
 
+#### Final whole-branch review fixes (2026-11-04)
+
+- A9 (`e5d3521`): a component page's introduction reads "Component `X`: rank R of N, F files, entry point." (the entry-point mark is new on the component page; the architecture listing already had it), and the file count and mark now reach the page because the store keeps them. Test: `TestFinishedComponentPageShowsItsFileCountAndEntryPoint` (end to end through finish).
+- A10 (`64f5d3a`): `place()` puts a component claim on the page of its owner from `claimOwners(m.Components, m.Claims)`, which is `AssignClaims` (Task 11); `componentFor` is gone. A claim from a component that was not inspected but that names one that was now sits on that component's page, where its verifier judged it (`TestAClaimPlacedByOwnershipReachesTheInspectedComponentItNames`).
+- B9 (`cf83166`): a component page's title (frontmatter and heading) shows the name inside a code span, "Component: `X`", as the listings already did, so a name shaped like a link or an image renders inert. Test: `TestAComponentNameShapedLikeALinkRendersInert` (the page parses with no finding and the name never appears outside a code span).
+- C3 (`0f2b764`): the banner's commit uses `short()`.
+
+Run: `scripts/inject.sh internal/bootstrap/render.go '	owners := claimOwners(m.Components, m.Claims)' '	owners := claimOwners(nil, m.Claims)' ./internal/bootstrap/ 'TestTheVerifierThePageAndTheCoverageAgree' 'the claim sits on sub'"'"'s page'`
+Run: `scripts/inject.sh internal/bootstrap/render.go 'title: "Component: `" + displayName(c.Prefix) + "`", intro' 'title: "Component: " + displayName(c.Prefix), intro' ./internal/bootstrap/ 'TestAComponentNameShapedLikeALinkRendersInert' 'outside a code span'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'boolInt(c.Inspected), c.Files, boolInt(c.Entry)); err != nil {' 'boolInt(c.Inspected), 0, boolInt(c.Entry)); err != nil {' ./internal/app/ 'TestFinishedComponentPage' 'file count and the entry-point mark'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'c.Inspected, c.Entry = insp == 1, entry == 1' 'c.Inspected, c.Entry = insp == 1, entry == 2' ./internal/app/ 'TestFinishedComponentPage' 'file count and the entry-point mark'`
+
+Expected: each exits 0 (RED).
+
 ### Task 13: Coverage report, `finish` and the end marker
 
 **Files:**
