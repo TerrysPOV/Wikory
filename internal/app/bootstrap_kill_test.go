@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -82,10 +83,11 @@ func finishHelper() int {
 }
 
 // finishBoundaries are the places a finish can die. "checked" and "planned" are bootstrap's,
-// before anything is published (the run is already finishing at "planned"). The next ten are the
+// before anything is published (the run is already finishing at "planned"); "pending-N" is after
+// job N's page hashes are recorded as pending and before the job begins. The next ten are the
 // publisher's own journal steps in the first job (names from internal/publish/kill_test.go); the
-// rest are bootstrap's. rerun says whether finishing again is still allowed: after "marked-done"
-// the run is already done, so the check is that everything is complete and finish refuses.
+// rest are bootstrap's. rerun says whether the rerun completes the finish: after "marked-done"
+// the run is already done with its report stored, so the check is that finish reprints it.
 var finishBoundaries = []struct {
 	step  string
 	rerun bool
@@ -145,8 +147,21 @@ func assertFinishConverges(t *testing.T, dir string, c *cli, run, step string, r
 				t.Fatalf("%s: a page this very bootstrap wrote was taken for a person's edit", p.Path)
 			}
 		}
-	} else if e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run); code == ExitOK || e.OK {
-		t.Fatal("a run that was marked done before the kill cannot be finished again")
+	} else {
+		// The run was marked done, with its report, in the same transaction: finish reprints the
+		// stored report, and status shows the same one.
+		e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
+		if code != ExitOK || !e.OK {
+			t.Fatalf("finish on a run marked done before the kill reprints its report: %d %+v", code, e)
+		}
+		st, _, _ := runBootstrapJSON(t, c, dir, "status", "--run", run)
+		stored := decodeData[struct {
+			Coverage json.RawMessage `json:"coverage"`
+		}](t, st).Coverage
+		printed, _ := json.Marshal(e.Data)
+		if len(stored) == 0 || !jsonEqual(t, stored, printed) {
+			t.Fatalf("status and finish must show the same stored report:\nstatus %s\nfinish %s", stored, printed)
+		}
 	}
 	// Exactly the expected pages: none lost, none duplicated, no temporary or backup file.
 	base := filepath.Join(dir, "project-memory", "wiki", "bootstrap")

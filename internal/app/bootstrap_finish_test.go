@@ -110,8 +110,16 @@ func TestFinishPublishesPagesAndTheyAreSearchable(t *testing.T) {
 	if st := gitIn(t, dir, "status", "--porcelain", "--", "project-memory/wiki/bootstrap"); !strings.Contains(st, "bootstrap") {
 		t.Fatalf("pages are left as uncommitted files for a person to review: %q", st)
 	}
-	if again, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run); code == ExitOK && again.OK {
-		t.Fatal("a finished run cannot be finished twice")
+	// Finishing a done run again reprints its stored report and writes nothing.
+	pagesBefore := recordedPages(t, c)
+	again, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
+	if code != ExitOK || !again.OK || decodeData[struct {
+		EndMarker string `json:"end_marker"`
+	}](t, again).EndMarker != rep.EndMarker {
+		t.Fatalf("finish on a done run reprints the stored report: %d %+v", code, again)
+	}
+	if after := recordedPages(t, c); len(after) != len(pagesBefore) {
+		t.Fatal("finish on a done run must write nothing")
 	}
 }
 

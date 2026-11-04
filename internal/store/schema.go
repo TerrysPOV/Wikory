@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS bs_runs(
   tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0,
   sample_in INTEGER NOT NULL DEFAULT 0, sample_out INTEGER NOT NULL DEFAULT 0,
   sample_acc INTEGER NOT NULL DEFAULT 0, sample_rej INTEGER NOT NULL DEFAULT 0,
+  coverage TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS bs_runs_by_checkout ON bs_runs(checkout_id, state);
 CREATE TABLE IF NOT EXISTS bs_sources(

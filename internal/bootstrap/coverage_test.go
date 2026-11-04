@@ -180,18 +180,18 @@ func TestCoverageCountsClaimsByKindAndStatus(t *testing.T) {
 func TestFinishSetsTheEndMarkerOnlyFromRunningOrFinishing(t *testing.T) {
 	ctx := context.Background()
 	r, run := coverageRig(t)
-	if err := r.Finish(ctx, run.ID, "c0ffee012345 2026-11-03T09:00:00Z"); err != nil {
+	if err := r.Finish(ctx, run.ID, "c0ffee012345 2026-11-03T09:00:00Z", Coverage{}); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := r.Get(ctx, run.ID)
 	if got.State != StateDone || got.EndMarker != "c0ffee012345 2026-11-03T09:00:00Z" {
 		t.Fatalf("%+v", got)
 	}
-	if err := r.Finish(ctx, run.ID, "again"); err == nil {
+	if err := r.Finish(ctx, run.ID, "again", Coverage{}); err == nil {
 		t.Fatal("a finished run cannot be finished again")
 	}
 	planned := mustRun(t, r, 0, 1)
-	if err := r.Finish(ctx, planned.ID, "x"); err == nil {
+	if err := r.Finish(ctx, planned.ID, "x", Coverage{}); err == nil {
 		t.Fatal("a run that never started cannot finish")
 	}
 }

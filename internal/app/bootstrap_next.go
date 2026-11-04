@@ -129,6 +129,8 @@ type statusReport struct {
 	AdmissionsNote string `json:"admissions_note"`
 	// Sample is what the sample showed, for a run planned with one. It covers extraction only.
 	Sample *bootstrap.Measure `json:"sample,omitempty"`
+	// Coverage is the report stored when the run was marked done.
+	Coverage *bootstrap.Coverage `json:"coverage,omitempty"`
 }
 
 // admissionsNote is the plain meaning of a run's accepted and rejected counts.
@@ -163,6 +165,12 @@ func bootstrapStatus(ctx context.Context, env *Env, args []string) (Result, erro
 		}
 		rep.Sample = &m
 		text += sampleText(m)
+	}
+	if cov, ok, err := runs.StoredCoverage(ctx, id); err != nil {
+		return Result{}, err
+	} else if ok {
+		rep.Coverage = &cov
+		text += "\n" + cov.Text()
 	}
 	return Result{Data: rep, Text: text}, nil
 }

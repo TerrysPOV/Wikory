@@ -143,7 +143,8 @@ func TestARefusalLeavesAFinishingRunFinishingWhenThisCallDidNotMoveIt(t *testing
 
 func TestFinishRefusalNamesBothStatesThatCanBeFinished(t *testing.T) {
 	dir, c, run := finishedRunInputs(t)
-	forceState(t, c, run, "done")
+	// A done run is not refused: finish reprints its stored report (final review A8).
+	forceState(t, c, run, "abandoned")
 	e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
 	if code == ExitOK || e.OK || !strings.Contains(e.Error.Message, "running or finishing") {
 		t.Fatalf("the refusal names both states that can be finished: %d %+v", code, e)

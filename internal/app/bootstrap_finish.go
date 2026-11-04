@@ -24,6 +24,10 @@ const maxBytesPerJob = 2 << 20
 // step of finish, as a kill would.
 var killPoint = func(string) {}
 
+// buildCoverage is a test seam: a test makes it fail to show that a run whose report cannot be
+// built is not marked done.
+var buildCoverage = bootstrap.BuildCoverage
+
 func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, error) {
 	p, runs, fl, err := openRun(ctx, env, args, map[string]bool{"run": true})
 	if err != nil {
@@ -37,6 +41,11 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 	run, err := runs.Get(ctx, id)
 	if err != nil {
 		return Result{}, err
+	}
+	if run.State == bootstrap.StateDone {
+		// Finishing a done run again reprints the report stored when it was marked done and writes
+		// nothing, so a finish killed after that move can be rerun to see its report.
+		return storedFinishReport(ctx, runs, id)
 	}
 	if run.State != bootstrap.StateRunning && run.State != bootstrap.StateFinishing {
 		return Result{}, fmt.Errorf("the run is %s; only a running or finishing run can be finished", run.State)
@@ -230,29 +239,56 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		outcomes = append(outcomes, bootstrap.PageOutcome{Path: pg.Path, Outcome: o})
 	}
 	marker := fmt.Sprintf("%.12s %s", head, runs.Now().UTC().Format(time.RFC3339))
-	if err := runs.Finish(ctx, id, marker); err != nil {
-		return Result{}, err
-	}
-	killPoint("marked-done")
-	cov, err := bootstrap.BuildCoverage(ctx, runs, id, outcomes, runs.Now())
+	// The report is built before the run is marked done and stored in the same transaction as
+	// that move: a run that is done always has its report, and one whose report cannot be built
+	// stays finishing, so finish can be run again.
+	cov, err := buildCoverage(ctx, runs, id, outcomes, runs.Now())
 	if err != nil {
 		return Result{}, err
 	}
-	cov.Unindexed = unindexed
+	cov.Unindexed, cov.EndMarker = unindexed, marker
+	if err := runs.Finish(ctx, id, marker, cov); err != nil {
+		return Result{}, err
+	}
+	killPoint("marked-done")
+	return Result{Data: cov, Text: cov.Text(), Notices: finishNotices(cov)}, nil
+}
+
+// storedFinishReport is what finish answers for a done run: the stored report, nothing written.
+func storedFinishReport(ctx context.Context, runs *bootstrap.Runs, id string) (Result, error) {
+	cov, ok, err := runs.StoredCoverage(ctx, id)
+	if err != nil {
+		return Result{}, err
+	}
+	if !ok {
+		return Result{}, fmt.Errorf("the run is done but has no stored report (it finished before reports were stored)")
+	}
+	return Result{Data: cov, Text: cov.Text(), Notices: finishNotices(cov)}, nil
+}
+
+// finishNotices are the warnings that go with a coverage report. They are computed from the
+// report alone, so a reprinted report carries the same ones.
+func finishNotices(cov bootstrap.Coverage) []string {
 	var notices []string
-	if len(unindexed) > 0 {
-		notices = append(notices, fmt.Sprintf("%d claim(s) are on a published page but the index cannot read them, so search will not find them: %s", len(unindexed), strings.Join(unindexed, ", ")))
+	if n := len(cov.Unindexed); n > 0 {
+		notices = append(notices, fmt.Sprintf("%d claim(s) are on a published page but the index cannot read them, so search will not find them: %s", n, strings.Join(cov.Unindexed, ", ")))
 	}
 	if len(cov.StalePages) > 0 {
 		notices = append(notices, fmt.Sprintf("%d page(s) an earlier bootstrap wrote were not rendered this time and were left in place; the report lists them", len(cov.StalePages)))
 	}
-	if len(conflicts) > 0 {
-		notices = append(notices, fmt.Sprintf("%d page(s) were edited by a person and were left alone; see the report", len(conflicts)))
+	conflicts := 0
+	for _, pg := range cov.Pages {
+		if pg.Outcome == "conflict" {
+			conflicts++
+		}
+	}
+	if conflicts > 0 {
+		notices = append(notices, fmt.Sprintf("%d page(s) were edited by a person and were left alone; see the report", conflicts))
 	}
 	if cov.Components.Inspected > 0 && len(cov.Components.Verified)+len(cov.Components.Conflicting) == 0 {
 		notices = append(notices, "no component has a verified or conflicting claim: the baseline is entirely unchecked against code")
 	}
-	return Result{Data: cov, Text: cov.Text(), Notices: notices}, nil
+	return notices
 }
 
 // refuseSecretPages is the error for pages that would hold secret-shaped text. It names each

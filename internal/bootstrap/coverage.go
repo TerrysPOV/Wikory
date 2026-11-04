@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -44,7 +45,9 @@ type SecretSkip struct {
 	Lines []int  `json:"lines"`
 }
 
-// Coverage is the report finish prints and stores.
+// Coverage is the report finish prints. It is built, outcomes included, before the run is marked
+// done and stored with the run in the same transaction as that move (Runs.Finish), so status and
+// a later finish reprint exactly what the first finish reported (Runs.StoredCoverage).
 type Coverage struct {
 	RunID   string `json:"run_id"`
 	Head    string `json:"head"`
@@ -424,11 +427,16 @@ func (c Coverage) Text() string {
 	return b.String()
 }
 
-// Finish records the end marker and marks the run done. It works only from running or finishing.
-func (r *Runs) Finish(ctx context.Context, id, marker string) error {
+// Finish records the end marker and the coverage report and marks the run done, all in one
+// transaction, so a done run always has its report. It works only from running or finishing.
+func (r *Runs) Finish(ctx context.Context, id, marker string, cov Coverage) error {
+	report, err := json.Marshal(cov)
+	if err != nil {
+		return fmt.Errorf("bootstrap: the coverage report cannot be stored: %w", err)
+	}
 	return r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `UPDATE bs_runs SET state=?, end_marker=?, updated_at=? WHERE run_id=? AND checkout_id=? AND state IN (?,?)`,
-			StateDone, marker, r.ts(), id, r.CheckoutID, StateRunning, StateFinishing)
+		res, err := tx.ExecContext(ctx, `UPDATE bs_runs SET state=?, end_marker=?, coverage=?, updated_at=? WHERE run_id=? AND checkout_id=? AND state IN (?,?)`,
+			StateDone, marker, string(report), r.ts(), id, r.CheckoutID, StateRunning, StateFinishing)
 		if err != nil {
 			return err
 		}
@@ -437,6 +445,23 @@ func (r *Runs) Finish(ctx context.Context, id, marker string) error {
 		}
 		return nil
 	})
+}
+
+// StoredCoverage is the report stored with a done run, and whether there is one.
+func (r *Runs) StoredCoverage(ctx context.Context, id string) (Coverage, bool, error) {
+	var cov Coverage
+	var report string
+	err := r.DB.QueryRowContext(ctx, `SELECT coverage FROM bs_runs WHERE run_id=? AND checkout_id=?`, id, r.CheckoutID).Scan(&report)
+	if errors.Is(err, sql.ErrNoRows) {
+		return cov, false, ErrNoRun
+	}
+	if err != nil || report == "" {
+		return cov, false, err
+	}
+	if err := json.Unmarshal([]byte(report), &cov); err != nil {
+		return cov, false, fmt.Errorf("bootstrap: the stored coverage report does not parse: %w", err)
+	}
+	return cov, true, nil
 }
 
 // EnterFinishing moves a running run to finishing, from where nothing new can be handed out or
