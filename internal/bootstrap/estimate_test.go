@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"fmt"
 	"slices"
 	"testing"
 
@@ -87,6 +88,11 @@ func TestPlanHashIsStableAndSensitive(t *testing.T) {
 	if BuildPlan(mut, "repo", "abc123", 0).Hash == a.Hash {
 		t.Fatal("a changed source must change the plan hash")
 	}
+	un := sampleResult()
+	un.Sources[4].Hash = "other" // an uninspected component's file: in no work item, so only the source list covers it
+	if BuildPlan(un, "repo", "abc123", 0).Hash == a.Hash {
+		t.Fatal("a changed source in an uninspected component must change the plan hash")
+	}
 	if BuildPlan(sampleResult(), "repo", "def456", 0).Hash == a.Hash {
 		t.Fatal("a different HEAD must change the plan hash")
 	}
@@ -118,5 +124,74 @@ func TestPlanHashDoesNotDependOnWhereAWorktreeLives(t *testing.T) {
 	none := BuildPlan(sampleResult(), "repo", "abc123", 0)
 	if none.Hash == here.Hash {
 		t.Fatal("having another worktree at all must change the hash")
+	}
+}
+
+func TestEstimateStagesVerifyTokensScaleWithInspectedComponents(t *testing.T) {
+	r := sampleResult()
+	r.Components[1].Inspected = true
+	v := EstimateStages(r)[1]
+	if v.Stage != "verify" || v.Items != 2 {
+		t.Fatalf("verify items = %+v, want 2 (two inspected components)", v)
+	}
+	if v.InputTokens != 2*verifyInTokens || v.OutputTokens != 2*verifyOutTokens {
+		t.Fatalf("verify tokens = %d/%d, want %d/%d (they scale with the item count)", v.InputTokens, v.OutputTokens, 2*verifyInTokens, 2*verifyOutTokens)
+	}
+}
+
+func intentSources(n int) Result {
+	var r Result
+	for i := 0; i < n; i++ {
+		r.Sources = append(r.Sources, Source{Name: "repo", Path: fmt.Sprintf("docs/%d.md", i), Tier: TierIntent, Disposition: DispQueued, Hash: fmt.Sprintf("h%d", i), Size: 100})
+	}
+	return r
+}
+
+func TestBatchCountRoundsUpAtTheBatchBoundary(t *testing.T) {
+	for _, c := range []struct{ items, batches int }{{0, 0}, {BatchSize, 1}, {BatchSize + 1, 2}} {
+		if got := BuildPlan(intentSources(c.items), "repo", "abc123", 0).Batches; got != c.batches {
+			t.Fatalf("%d items give %d batches, want %d (batch size %d, rounded up)", c.items, got, c.batches, BatchSize)
+		}
+	}
+}
+
+func TestPlanHashCoversSourceTier(t *testing.T) {
+	a := BuildPlan(sampleResult(), "repo", "abc123", 0)
+	mut := sampleResult()
+	mut.Sources[2].Tier = TierIntent // the skipped source: no work list or estimate changes
+	b := BuildPlan(mut, "repo", "abc123", 0)
+	if !slices.Equal(b.Estimates, a.Estimates) || b.Batches != a.Batches {
+		t.Fatal("fixture error: the tier change must not move the estimates")
+	}
+	if b.Hash == a.Hash {
+		t.Fatal("a changed source tier must change the plan hash: tiers decide what is extracted")
+	}
+}
+
+func TestPlanHashCoversTheWorkListEstimatesAndBatches(t *testing.T) {
+	p := BuildPlan(sampleResult(), "repo", "abc123", 0)
+
+	work := p
+	work.Result.Sources = slices.Clone(p.Sources)
+	work.Result.Sources[0].Size++ // not an input to the hash; it changes only the work list
+	if planHash(work) == p.Hash {
+		t.Fatal("a changed work list must change the plan hash")
+	}
+
+	est := p
+	est.Estimates = slices.Clone(p.Estimates)
+	est.Estimates[0].InputTokens++ // what a changed estimate constant would do
+	if planHash(est) == p.Hash {
+		t.Fatal("changed estimates must change the plan hash")
+	}
+
+	bat := p
+	bat.Batches++
+	if planHash(bat) == p.Hash {
+		t.Fatal("a changed batch count must change the plan hash")
+	}
+
+	if planHash(p) != p.Hash {
+		t.Fatal("planHash must reproduce the hash BuildPlan stored")
 	}
 }

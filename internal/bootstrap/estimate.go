@@ -81,8 +81,9 @@ type Estimate struct {
 	OutputTokens int    `json:"output_tokens"`
 }
 
-// EstimateStages sizes extract and verify from byte counts. Tokens are bytes divided by four
-// plus a fixed prompt overhead per item.
+// EstimateStages sizes extract and verify. Extract tokens come from each item's byte count:
+// bytes divided by bytesPerToken plus a fixed prompt overhead, with a fixed output per item.
+// Verify uses fixed per-item constants and does not look at byte counts.
 func EstimateStages(res Result) []Estimate {
 	specs := ExtractSpecs(res)
 	ex := Estimate{Stage: "extract", Items: len(specs), OutputTokens: len(specs) * extractOutPerItem}
@@ -107,22 +108,32 @@ type Plan struct {
 	Estimates []Estimate
 }
 
-type hashSource struct{ Name, Path, Hash, Disposition string }
+type hashSource struct{ Name, Path, Hash, Tier, Disposition string }
 type hashComponent struct {
 	Prefix    string
 	Rank      int
 	Inspected bool
 }
 
-// BuildPlan assembles the plan and its hash. The hash covers the scope, the HEAD commit, every
-// source's content hash and disposition, the component ranking and the constants above, so
-// anything that would change what is done changes the hash. It does not cover the sample size.
+// BuildPlan assembles the plan and its hash. The hash is built from the work and the numbers
+// Terry approves, not only from the inputs, so a change to anything that would change what is
+// done or what it is said to cost changes the hash. See planHash. It does not cover the sample
+// size or the Roots.
 func BuildPlan(res Result, scope, head string, sample int) Plan {
 	est := EstimateStages(res)
 	p := Plan{Scope: scope, Head: head, Sample: sample, Result: res, Estimates: est}
 	for _, e := range est {
 		p.Batches += (e.Items + BatchSize - 1) / BatchSize
 	}
+	p.Hash = planHash(p)
+	return p
+}
+
+// planHash hashes the plan's inputs (scope, HEAD, weights, limits, every source's content hash,
+// tier and disposition, the component ranking) together with what they produce: the ordered
+// extract work list and the estimates and batch count Terry sees. A changed estimate constant
+// or tier classifier therefore changes the hash even when the inputs do not.
+func planHash(p Plan) string {
 	h := struct {
 		V          int
 		Scope      string
@@ -131,16 +142,22 @@ func BuildPlan(res Result, scope, head string, sample int) Plan {
 		Constants  [4]int
 		Sources    []hashSource
 		Components []hashComponent
-	}{V: 1, Scope: scope, Head: head,
+		Work       []ItemSpec
+		Estimates  []Estimate
+		Batches    int
+	}{V: 2, Scope: p.Scope, Head: p.Head,
 		Weights:   [4]float64{WeightChurn, WeightDocRef, WeightHandoff, WeightEntry},
-		Constants: [4]int{BatchSize, DigestMaxBytes, InspectBudget, CapChurn}}
-	for _, s := range res.Sources {
-		h.Sources = append(h.Sources, hashSource{s.Name, s.Path, s.Hash, s.Disposition})
+		Constants: [4]int{BatchSize, DigestMaxBytes, InspectBudget, CapChurn},
+		Work:      ExtractSpecs(p.Result), Estimates: p.Estimates, Batches: p.Batches}
+	for _, s := range p.Sources {
+		h.Sources = append(h.Sources, hashSource{s.Name, s.Path, s.Hash, s.Tier, s.Disposition})
 	}
-	for _, c := range res.Components {
+	for _, c := range p.Components {
 		h.Components = append(h.Components, hashComponent{c.Prefix, c.Rank, c.Inspected})
 	}
-	b, _ := json.Marshal(h)
-	p.Hash = ids.SHA256Hex(b)
-	return p
+	b, err := json.Marshal(h)
+	if err != nil {
+		panic("bootstrap: plan hash input cannot be marshalled: " + err.Error()) // plain strings and numbers: cannot happen
+	}
+	return ids.SHA256Hex(b)
 }
