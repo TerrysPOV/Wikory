@@ -11,10 +11,13 @@ import (
 // progressNow is the clock progress reporting uses; a test replaces it to make quick work look slow.
 var progressNow = time.Now
 
+// progressTTY decides whether stderr is a terminal; a test replaces it to see the terminal form.
+var progressTTY = IsTTY
+
 // newBootstrapProgress is the reporter for next and finish. It writes to stderr (JSON events in
 // --json mode), so stdout stays one envelope.
 func newBootstrapProgress(env *Env) *Progress {
-	return NewProgress(env.IO.Err, env.JSON, IsTTY(env.IO.Err), progressNow)
+	return NewProgress(env.IO.Err, env.JSON, progressTTY(env.IO.Err), progressNow)
 }
 
 // verifyPrepDue reports whether the next PrepareVerify will do real work, and for how many

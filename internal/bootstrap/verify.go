@@ -147,18 +147,82 @@ func ownsBetter(a, b Component, s StoredClaim) bool {
 }
 
 // EnqueueVerify adds verify items to a run. A component that already has one is left alone, so
-// two callers racing to prepare the same run queue one paid verification per component.
+// two callers racing to prepare the same run queue one paid verification per component. It adds
+// nothing, and says nothing, to a run that is not running: the state is read inside the write
+// transaction, so a next call that read the run as running before finish moved it on cannot put
+// rows in a finishing or finished run, where they could never be handed out or committed.
 func (r *Runs) EnqueueVerify(ctx context.Context, runID string, specs []ItemSpec) error {
-	return r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	_, err := r.enqueueVerify(ctx, runID, specs)
+	return err
+}
+
+// enqueueVerify is EnqueueVerify reporting how many rows it inserted.
+func (r *Runs) enqueueVerify(ctx context.Context, runID string, specs []ItemSpec) (int, error) {
+	inserted := 0
+	err := r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		inserted = 0
+		var state string
+		err := tx.QueryRowContext(ctx, `SELECT state FROM bs_runs WHERE run_id=? AND checkout_id=?`, runID, r.CheckoutID).Scan(&state)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNoRun
+		}
+		if err != nil {
+			return err
+		}
+		if state != StateRunning {
+			return nil
+		}
 		for _, sp := range specs {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO bs_items(item_id,run_id,checkout_id,stage,ref,input_hash,state) VALUES(?,?,?,'verify',?,?,'pending')
+			res, err := tx.ExecContext(ctx, `INSERT INTO bs_items(item_id,run_id,checkout_id,stage,ref,input_hash,state) VALUES(?,?,?,'verify',?,?,'pending')
 				ON CONFLICT(run_id, stage, ref) DO NOTHING`,
-				r.NewID("itm_"), runID, r.CheckoutID, sp.Ref, sp.InputHash); err != nil {
+				r.NewID("itm_"), runID, r.CheckoutID, sp.Ref, sp.InputHash)
+			if err != nil {
 				return err
 			}
+			n, _ := res.RowsAffected()
+			inserted += int(n)
 		}
 		return nil
 	})
+	if err != nil {
+		return 0, err
+	}
+	return inserted, nil
+}
+
+// verifyTargets are the inspected components that have claims to judge: the ones that get a
+// verify item. PrepareVerify queues them and VerifyOwed counts them, so the two cannot disagree.
+func verifyTargets(comps []Component, assigned map[string][]StoredClaim) []Component {
+	var out []Component
+	for _, c := range comps {
+		if c.Inspected && len(assigned[c.Prefix]) > 0 {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// VerifyOwed is how many components still need a verify item: none when verify items exist
+// (PrepareVerify queues them all at once), otherwise the inspected components that have claims to
+// judge. It reads, and decides, the same way PrepareVerify does but works in any run state and
+// changes nothing, so finish can ask it after the run has stopped accepting new work.
+func VerifyOwed(ctx context.Context, runs *Runs, runID string) (int, error) {
+	st, err := runs.Status(ctx, runID)
+	if err != nil {
+		return 0, err
+	}
+	if len(st.Items["verify"]) > 0 {
+		return 0, nil
+	}
+	comps, err := runs.Components(ctx, runID)
+	if err != nil {
+		return 0, err
+	}
+	claims, err := runs.Claims(ctx, runID)
+	if err != nil {
+		return 0, err
+	}
+	return len(verifyTargets(comps, AssignClaims(comps, claims))), nil
 }
 
 // PrepareVerify creates the verify items once every extract item is closed: one per inspected
@@ -187,14 +251,8 @@ func PrepareVerify(ctx context.Context, runs *Runs, w WorkFiles, runID string) (
 	files := ComponentFiles(Result{Sources: srcs, Components: comps})
 	assigned := AssignClaims(comps, claims)
 	var specs []ItemSpec
-	for _, c := range comps {
-		if !c.Inspected {
-			continue
-		}
+	for _, c := range verifyTargets(comps, assigned) {
 		related := assigned[c.Prefix]
-		if len(related) == 0 {
-			continue
-		}
 		var b strings.Builder
 		fmt.Fprintf(&b, "COMPONENT %s\nFILES\n", c.Prefix)
 		for _, f := range files[c.Prefix] {
@@ -210,7 +268,7 @@ func PrepareVerify(ctx context.Context, runs *Runs, w WorkFiles, runID string) (
 		}
 		specs = append(specs, ItemSpec{Stage: "verify", Ref: "comp:" + c.Prefix, InputHash: hash})
 	}
-	return len(specs), runs.EnqueueVerify(ctx, runID, specs)
+	return runs.enqueueVerify(ctx, runID, specs)
 }
 
 // quietReport is what an infrastructure failure reports: the item the store found and nothing

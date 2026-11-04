@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -38,7 +39,7 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		return Result{}, err
 	}
 	if run.State != bootstrap.StateRunning && run.State != bootstrap.StateFinishing {
-		return Result{}, fmt.Errorf("the run is %s; only a running run can be finished", run.State)
+		return Result{}, fmt.Errorf("the run is %s; only a running or finishing run can be finished", run.State)
 	}
 	head, err := p.Repo.HeadCommit(ctx)
 	if err != nil {
@@ -48,27 +49,49 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		return Result{}, &UsageError{Msg: fmt.Sprintf("the repository moved from %.12s to %.12s since this run was planned; the baseline describes the planned commit, so plan again", run.Head, head)}
 	}
 	prog := newBootstrapProgress(env)
-	prog.BeginStage(1, 2, "prepare", 1, time.Second, "Checking and rendering the baseline pages. Safe to leave running; if it is interrupted, run finish again.")
+	// The progress line is ended on every way out of here, so an error never starts in the middle of it.
+	staged := false
+	beginStage := func(index, count int, name string, total int, expected time.Duration, notice string) {
+		prog.BeginStage(index, count, name, total, expected, notice)
+		staged = true
+	}
+	endStage := func() {
+		if staged {
+			staged = false
+			prog.End()
+		}
+	}
+	defer endStage()
+	beginStage(1, 2, "prepare", 1, time.Second, "Checking and rendering the baseline pages. Safe to leave running; if it is interrupted, run finish again.")
 	wf := bootstrap.WorkFiles{Root: p.Store.Root, CheckoutID: p.Checkout.ID}
 	if n, err := bootstrap.PrepareVerify(ctx, runs, wf, id); err != nil {
 		return Result{}, err
 	} else if n > 0 {
 		return Result{}, fmt.Errorf("%d verify item(s) were just created; run wikory bootstrap next to hand them out, submit the verdicts, then finish", n)
 	}
-	st, err := runs.Status(ctx, id)
-	if err != nil {
+	killPoint("prepared")
+	if err := openItemsRefusal(ctx, runs, id); err != nil {
 		return Result{}, err
 	}
-	for _, stage := range []string{"extract", "verify"} {
-		if open := st.Items[stage]["pending"] + st.Items[stage]["leased"]; open > 0 {
-			return Result{}, fmt.Errorf("%d %s item(s) are still open; hand them out with wikory bootstrap next and submit them first", open, stage)
-		}
-	}
+	killPoint("checked")
 	pub := p.publisher()
 	if _, err := pub.Recover(ctx); err != nil {
 		return Result{}, err
 	}
-	if err := runs.Transition(ctx, id, bootstrap.StateFinishing, bootstrap.StateRunning, bootstrap.StateFinishing); err != nil {
+	entered, err := runs.EnterFinishing(ctx, id)
+	if err != nil {
+		return Result{}, err
+	}
+	// Nothing new can be handed out or committed from here, so this look is the authoritative one:
+	// the checks above ran in separate transactions, and a submit or a next call can have landed
+	// between any of them and the move. A refusal here undoes the move if this call made it, or
+	// the run would sit in finishing with open work that nothing can close.
+	if err := finishBlockers(ctx, runs, id); err != nil {
+		if entered {
+			if lerr := runs.LeaveFinishing(ctx, id); lerr != nil {
+				err = errors.Join(err, fmt.Errorf("the run could not be put back to running: %w", lerr))
+			}
+		}
 		return Result{}, err
 	}
 	comps, err := runs.Components(ctx, id)
@@ -94,11 +117,16 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 	}
 	unindexed := bootstrap.Unrenderable(pages)
 	prog.Step(1)
-	prog.End()
+	endStage()
 	current := func(path string) ([]byte, bool, error) {
 		data, err := p.RepoRoot.ReadFile(path, 4<<20)
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, false, nil
+		}
+		if errors.Is(err, confine.ErrTooLarge) {
+			// A page that has grown past the read limit is not ours: PlanOps must see content that
+			// matches neither the new render nor anything recorded, and so file it as a conflict.
+			return notOursContent, true, nil
 		}
 		return data, err == nil, err
 	}
@@ -117,6 +145,7 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 	if err != nil {
 		return Result{}, describeConfineErr(err)
 	}
+	killPoint("planned")
 	outcomes := make([]bootstrap.PageOutcome, 0, len(pages))
 	isConflict, isSame := map[string]bool{}, map[string]bool{}
 	for _, c := range conflicts {
@@ -126,7 +155,7 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		isSame[u] = true
 	}
 	written := map[string]string{}
-	prog.BeginStage(2, 2, "publish", len(ops), time.Duration(len(ops))*100*time.Millisecond,
+	beginStage(2, 2, "publish", len(ops), time.Duration(len(ops))*100*time.Millisecond,
 		fmt.Sprintf("Publishing %d page(s). Safe to leave running; if it is interrupted, run finish again.", len(ops)))
 	jobNo := 0
 	for start := 0; start < len(ops); {
@@ -143,6 +172,9 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 			return Result{}, err
 		}
 		if err := pub.Publish(ctx, job, ops[start:end], fmt.Sprintf("bootstrap %s: %d page(s)", id, end-start)); err != nil {
+			if errors.Is(err, publish.ErrConflict) {
+				return Result{}, describePublishConflict(err, jobState(ctx, p.Store.DB, job.ID), jobNo)
+			}
 			return Result{}, err
 		}
 		for _, o := range ops[start:end] {
@@ -153,7 +185,7 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		killPoint(fmt.Sprintf("after-job-%d", jobNo))
 		jobNo++
 	}
-	prog.End()
+	endStage()
 	// A page that already equals the new render is our output too (for example after a killed
 	// finish that recovery completed), so its hash is recorded and the next bootstrap will not
 	// mistake it for a person's edit.
@@ -239,4 +271,78 @@ func describeConfineErr(err error) error {
 		return describeConfine(err)
 	}
 	return err
+}
+
+// notOursContent stands for an existing page too large to read. It is not the new render and not
+// anything a bootstrap recorded, so PlanOps files the page as a conflict.
+var notOursContent = []byte("wikory: an existing page larger than the read limit; it is not ours\n")
+
+// openItemsRefusal is the error for extract or verify work that is still pending or leased, or nil.
+func openItemsRefusal(ctx context.Context, runs *bootstrap.Runs, id string) error {
+	st, err := runs.Status(ctx, id)
+	if err != nil {
+		return err
+	}
+	for _, stage := range []string{"extract", "verify"} {
+		if open := st.Items[stage]["pending"] + st.Items[stage]["leased"]; open > 0 {
+			return fmt.Errorf("%d %s item(s) are still open; hand them out with wikory bootstrap next and submit them first", open, stage)
+		}
+	}
+	return nil
+}
+
+// finishBlockers is the look finish takes once the run is finishing: no extract or verify item is
+// open, and no verify work is owed that nothing has queued yet (a baseline must not be published
+// unverified because the last extract submit landed after finish last looked).
+func finishBlockers(ctx context.Context, runs *bootstrap.Runs, id string) error {
+	if err := openItemsRefusal(ctx, runs, id); err != nil {
+		return err
+	}
+	owed, err := bootstrap.VerifyOwed(ctx, runs, id)
+	if err != nil {
+		return err
+	}
+	if owed > 0 {
+		return fmt.Errorf("%d component(s) have claims to verify but no verify item has been queued; run wikory bootstrap next to queue and hand them out, submit the verdicts, then finish", owed)
+	}
+	return nil
+}
+
+// finishConflict is a publish conflict with the explanation finish gives for it. It prints its
+// own message, not the publisher's, whose sentence about earlier operations may not be true of
+// this case, and keeps the cause for errors.Is.
+type finishConflict struct {
+	msg   string
+	cause error
+}
+
+func (e *finishConflict) Error() string { return e.msg }
+func (e *finishConflict) Unwrap() error { return e.cause }
+
+// describePublishConflict explains a conflict from the publisher. jobState is the job's state in
+// the store: "refused" means the publisher found the page changed before it applied anything;
+// anything else, "conflict" included, means it was found while applying, when earlier operations
+// of the same job may already be on disk. jobNo counts the publish jobs of this finish that
+// completed before this one.
+func describePublishConflict(err error, jobState string, jobNo int) error {
+	const again = "Run wikory bootstrap finish again: it reads the pages afresh, reports a page a person created or edited as a conflict and leaves it alone."
+	var msg string
+	switch {
+	case jobState == "refused" && jobNo == 0:
+		msg = "a baseline page was created or edited after finish planned its writes; nothing was applied. " + again
+	case jobState == "refused":
+		msg = fmt.Sprintf("a baseline page was created or edited after finish planned its writes; nothing was applied from the job that found it, but the pages of the %d earlier job(s) of this finish are already written. %s", jobNo, again)
+	default:
+		msg = "a baseline page changed while finish was writing it, so earlier operations of this job may already be applied. " + again
+	}
+	return &finishConflict{msg: msg, cause: err}
+}
+
+// jobState reads a publish job's state, or "" when it cannot be read.
+func jobState(ctx context.Context, db *sql.DB, jobID string) string {
+	var state string
+	if err := db.QueryRowContext(ctx, `SELECT state FROM jobs WHERE job_id = ?`, jobID).Scan(&state); err != nil {
+		return ""
+	}
+	return state
 }

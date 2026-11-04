@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/TerrysPOV/Wikory/internal/bootstrap"
 	"github.com/TerrysPOV/Wikory/internal/ids"
 	"github.com/TerrysPOV/Wikory/internal/publish"
 )
@@ -175,8 +176,10 @@ func TestFinishRecordsTheHashOfTheBytesOnDiskAndRerunsAsUnchanged(t *testing.T) 
 			t.Fatalf("%s: pages are written with the line endings they were rendered with", p)
 		}
 	}
-	// A person's edit that keeps the very same bytes is not an edit: a rerun of the same render
-	// (with nothing extracted, so a different render) never reports our own page as a conflict.
+	// A second bootstrap of the same commit with nothing extracted renders a different overview and
+	// component page (they hold or count the claim) but byte-identical claim-free pages. Our own
+	// earlier output is never a conflict: the identical pages are reported unchanged, and the
+	// others are written over because the bytes on disk are the bytes we recorded.
 	pe, _, _ := runBootstrapJSON(t, c, dir, "plan")
 	run2 := decodeData[planData](t, pe).RunID
 	forceState(t, c, run2, "running")
@@ -185,9 +188,21 @@ func TestFinishRecordsTheHashOfTheBytesOnDiskAndRerunsAsUnchanged(t *testing.T) 
 	if code != ExitOK {
 		t.Fatalf("%d %+v", code, e2)
 	}
+	got := map[string]string{}
 	for _, p := range decodeData[finishReport](t, e2).Pages {
-		if p.Outcome == "conflict" {
-			t.Fatalf("%s: our own earlier output is not a conflict", p.Path)
+		got[strings.TrimPrefix(p.Path, "project-memory/wiki/bootstrap/")] = p.Outcome
+	}
+	for _, name := range []string{"architecture.md", "constraints.md", "known-issues.md", "unfinished-work.md"} {
+		if got[name] != "unchanged" {
+			t.Fatalf("%s renders the same, so the rerun reports it unchanged, not %q (%v)", name, got[name], got)
+		}
+	}
+	if got["overview.md"] != "written" {
+		t.Fatalf("the overview counts claims, so it was rendered again and written over our own earlier version: %v", got)
+	}
+	for name, outcome := range got {
+		if outcome == "conflict" {
+			t.Fatalf("%s: our own earlier output is not a conflict (%v)", name, got)
 		}
 	}
 }
@@ -313,9 +328,11 @@ func TestStatusAndFinishSayThatAcceptedAndRejectedCountExtractSubmissionsOnly(t 
 		t.Fatalf("status text:\n%s", out)
 	}
 	e, _, _ := runBootstrapJSON(t, c, dir, "status", "--run", run)
-	if st := decodeData[struct {
-		Note string `json:"admissions_note"`
-	}](t, e); !strings.Contains(st.Note, "extract submissions only") {
+	st := decodeData[struct {
+		Note       string `json:"admissions_note"`
+		TokensNote string `json:"tokens_note"`
+	}](t, e)
+	if !strings.Contains(st.Note, "extract submissions only") {
 		t.Fatalf("status JSON carries the note: %q", st.Note)
 	}
 	forceItemsClosed(t, c, run)
@@ -326,6 +343,9 @@ func TestStatusAndFinishSayThatAcceptedAndRejectedCountExtractSubmissionsOnly(t 
 	rep := decodeData[finishReport](t, e)
 	if !strings.Contains(rep.Proposals.Basis, "extract") || !strings.Contains(rep.TokensNote, "asserted") {
 		t.Fatalf("finish labels the counts: %+v", rep)
+	}
+	if st.TokensNote != rep.TokensNote || st.TokensNote != bootstrap.TokensNote {
+		t.Fatalf("status and the coverage report label the token counts with one shared note: %q / %q", st.TokensNote, rep.TokensNote)
 	}
 }
 

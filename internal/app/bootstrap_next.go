@@ -151,7 +151,7 @@ func bootstrapStatus(ctx context.Context, env *Env, args []string) (Result, erro
 		return Result{}, err
 	}
 	rep := statusReport{Run: st.Run, Items: st.Items, Dispositions: st.Dispositions, Components: st.Components, Claims: st.Claims, Summary: statusLine(st),
-		TokensNote: "token counts are asserted by the driver; the binary cannot measure them", AdmissionsNote: admissionsNote}
+		TokensNote: bootstrap.TokensNote, AdmissionsNote: admissionsNote}
 	text := fmt.Sprintf("%s\nextract admissions: %d accepted, %d rejected (verify verdicts are not counted here)\ntokens (asserted): %d in, %d out\n",
 		rep.Summary, st.Run.Accepted, st.Run.Rejected, st.Run.TokensIn, st.Run.TokensOut)
 	return Result{Data: rep, Text: text}, nil

@@ -457,6 +457,7 @@ func TestAVerifyItemIsQueuedOncePerComponent(t *testing.T) {
 	ctx := context.Background()
 	r, _, _, _ := newTestRuns(t)
 	run, _ := r.Create(ctx, planWith(0), specsN(1))
+	_ = r.Transition(ctx, run.ID, StateRunning, StatePlanned)
 	spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: "h"}
 	for i := 0; i < 2; i++ {
 		if err := r.EnqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil {

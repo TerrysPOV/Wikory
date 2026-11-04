@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -13,6 +14,10 @@ import (
 	"github.com/TerrysPOV/Wikory/internal/ids"
 	"github.com/TerrysPOV/Wikory/internal/redact"
 )
+
+// TokensNote is the label every report of token counts carries: status and the coverage report
+// print whole-run totals the driver asserted, and the binary measures nothing itself.
+const TokensNote = "token counts are whole-run totals asserted by the driver; the binary cannot measure them"
 
 // PageOutcome is what happened to one page at finish.
 type PageOutcome struct {
@@ -284,7 +289,7 @@ func BuildCoverage(ctx context.Context, runs *Runs, runID string, pages []PageOu
 	cov.Proposals.Accepted, cov.Proposals.Rejected = run.Accepted, run.Rejected
 	cov.Proposals.Basis = "extract submissions only: claims admitted or rejected when they were first proposed, not verify verdicts (see claims by status for the outcome of verification)"
 	cov.TokensIn, cov.TokensOut = run.TokensIn, run.TokensOut
-	cov.TokensNote = "token counts are whole-run totals asserted by the driver; the binary cannot measure them"
+	cov.TokensNote = TokensNote
 	if created, err := time.Parse(tsLayout, run.CreatedAt); err == nil {
 		cov.DurationSecs = now.Sub(created).Seconds()
 	}
@@ -434,4 +439,43 @@ func (r *Runs) Finish(ctx context.Context, id, marker string) error {
 		}
 		return nil
 	})
+}
+
+// EnterFinishing moves a running run to finishing, from where nothing new can be handed out or
+// committed. It reports whether this call made the move, so that a caller that has to back out
+// undoes only its own move: a run that was already finishing (an earlier finish failed after the
+// move) is left as it is. A run in any other state is refused.
+func (r *Runs) EnterFinishing(ctx context.Context, id string) (bool, error) {
+	moved := false
+	err := r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		moved = false
+		var state string
+		err := tx.QueryRowContext(ctx, `SELECT state FROM bs_runs WHERE run_id=? AND checkout_id=?`, id, r.CheckoutID).Scan(&state)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNoRun
+		}
+		if err != nil {
+			return err
+		}
+		switch state {
+		case StateFinishing:
+			return nil
+		case StateRunning:
+			if _, err := tx.ExecContext(ctx, `UPDATE bs_runs SET state=?, updated_at=? WHERE run_id=? AND checkout_id=? AND state=?`,
+				StateFinishing, r.ts(), id, r.CheckoutID, StateRunning); err != nil {
+				return err
+			}
+			moved = true
+			return nil
+		default:
+			return fmt.Errorf("%w: a %s run cannot move to finishing", ErrState, state)
+		}
+	})
+	return moved && err == nil, err
+}
+
+// LeaveFinishing puts a finishing run back to running, so that its open work can be handed out
+// and submitted again.
+func (r *Runs) LeaveFinishing(ctx context.Context, id string) error {
+	return r.Transition(ctx, id, StateRunning, StateFinishing)
 }
