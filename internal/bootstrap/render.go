@@ -295,7 +295,11 @@ func RenderPages(m RenderModel) []PageOut {
 		for _, x := range cs {
 			hasRationale = hasRationale || x.Kind == "rationale"
 		}
-		intro := []string{fmt.Sprintf("Component `%s`: rank %d of %d, %d files.", displayName(c.Prefix), c.Rank, len(m.Components), c.Files)}
+		entry := ""
+		if c.Entry {
+			entry = ", entry point"
+		}
+		intro := []string{fmt.Sprintf("Component `%s`: rank %d of %d, %d files%s.", displayName(c.Prefix), c.Rank, len(m.Components), c.Files, entry)}
 		if !hasRationale {
 			intro = append(intro, "No rationale was found for this component in the sources.")
 		}

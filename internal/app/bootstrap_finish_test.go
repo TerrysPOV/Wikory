@@ -18,7 +18,27 @@ var verifyPrepStderr string
 // run id. Everything goes through the CLI.
 func finishedRunInputs(t *testing.T) (string, *cli, string) {
 	t.Helper()
+	return finishedRunInputsWith(t, nil)
+}
+
+// finishedRunInputsWith is finishedRunInputs on the bootstrapRepo fixture plus extra committed
+// files.
+func finishedRunInputsWith(t *testing.T, extra map[string]string) (string, *cli, string) {
+	t.Helper()
 	dir, c := bootstrapRepo(t)
+	if len(extra) > 0 {
+		for rel, content := range extra {
+			p := filepath.Join(dir, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		gitIn(t, dir, "add", "-A")
+		gitIn(t, dir, "commit", "-qm", "extra files")
+	}
 	pe, _, _ := runBootstrapJSON(t, c, dir, "plan")
 	run := decodeData[planData](t, pe).RunID
 	forceState(t, c, run, "running")

@@ -154,8 +154,8 @@ func (r *Runs) Create(ctx context.Context, p Plan, specs []ItemSpec) (Run, error
 			}
 		}
 		for _, c := range p.Components {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO bs_components(run_id,checkout_id,name,prefix,score,rank,inspected) VALUES(?,?,?,?,?,?,?)`,
-				run.ID, r.CheckoutID, c.Name, c.Prefix, c.Score, c.Rank, boolInt(c.Inspected)); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO bs_components(run_id,checkout_id,name,prefix,score,rank,inspected,files,entry) VALUES(?,?,?,?,?,?,?,?,?)`,
+				run.ID, r.CheckoutID, c.Name, c.Prefix, c.Score, c.Rank, boolInt(c.Inspected), c.Files, boolInt(c.Entry)); err != nil {
 				return err
 			}
 		}
@@ -529,9 +529,11 @@ func (r *Runs) Sources(ctx context.Context, id string) ([]Source, error) {
 	return out, rows.Err()
 }
 
-// Components returns a run's components in rank order.
+// Components returns a run's components in rank order, with the file count and entry-point
+// mark the pages show. Churn and the mention counts are not stored: they are inputs to the
+// score, which is.
 func (r *Runs) Components(ctx context.Context, id string) ([]Component, error) {
-	rows, err := r.DB.QueryContext(ctx, `SELECT name,prefix,score,rank,inspected FROM bs_components WHERE run_id=? AND checkout_id=? ORDER BY rank`, id, r.CheckoutID)
+	rows, err := r.DB.QueryContext(ctx, `SELECT name,prefix,score,rank,inspected,files,entry FROM bs_components WHERE run_id=? AND checkout_id=? ORDER BY rank`, id, r.CheckoutID)
 	if err != nil {
 		return nil, err
 	}
@@ -539,11 +541,11 @@ func (r *Runs) Components(ctx context.Context, id string) ([]Component, error) {
 	var out []Component
 	for rows.Next() {
 		var c Component
-		var insp int
-		if err := rows.Scan(&c.Name, &c.Prefix, &c.Score, &c.Rank, &insp); err != nil {
+		var insp, entry int
+		if err := rows.Scan(&c.Name, &c.Prefix, &c.Score, &c.Rank, &insp, &c.Files, &entry); err != nil {
 			return nil, err
 		}
-		c.Inspected = insp == 1
+		c.Inspected, c.Entry = insp == 1, entry == 1
 		out = append(out, c)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Rank < out[j].Rank })
