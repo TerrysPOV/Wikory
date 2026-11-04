@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -67,6 +68,9 @@ func TestInventoryDisposesEachSourceAndNeverKeepsSecretText(t *testing.T) {
 	}
 	if srcBy(res, "internal/queue/queue.go").Hash == "" || srcBy(res, "vendor/x/y.go").Hash != "" {
 		t.Fatal("only read sources have a content hash")
+	}
+	if srcBy(res, "internal/queue/cfg.go").Hash != "" {
+		t.Fatal("a source skipped for a secret carries no content hash")
 	}
 }
 
@@ -233,6 +237,126 @@ func TestUnreadSourcesNameBranchesAndWorktreesAndInventoryNeverReadsThem(t *test
 	for _, p := range repo.reads {
 		if strings.HasPrefix(p, "branch:") || strings.HasPrefix(p, "worktree:") {
 			t.Fatalf("%s was read", p)
+		}
+	}
+}
+
+func TestCountMentionsNamesAComponentOnlyAtAPathBoundary(t *testing.T) {
+	cases := []struct {
+		name, prefix, text string
+		want               bool
+	}{
+		{"file under the directory", "internal/queue", "see internal/queue/queue.go for the loop", true},
+		{"backticks", "internal/queue", "the `internal/queue` package", true},
+		{"parentheses", "internal/queue", "acks (internal/queue) after the handler", true},
+		{"start of text", "internal/queue", "internal/queue acks", true},
+		{"end of text", "internal/queue", "owned by internal/queue", true},
+		{"full stop at the end of a sentence", "internal/queue", "It lives in internal/queue. Next.", true},
+		{"colon after", "internal/queue", "internal/queue: acks", true},
+		{"single segment with a slash", "web", "the web/ directory", true},
+		{"longer sibling name", "internal/queue", "see internal/queue2 instead", false},
+		{"suffix after underscore", "internal/queue", "internal/queue_test is a file", false},
+		{"suffix after hyphen", "cmd/wikory", "run cmd/wikory-admin", false},
+		{"suffix after dot", "internal/queue", "open internal/queue.go", false},
+		{"nested under another directory", "internal/queue", "see x/internal/queue for it", false},
+		{"inside a longer word", "internal/queue", "myinternal/queue", false},
+		{"inside a URL", "api", "call https://x.example/api/v1 now", false},
+		{"word that ends in the name", "lib", "a cobweb/ of lib-like things", false},
+		{"bare single segment word", "web", "the web is big", false},
+	}
+	for _, tc := range cases {
+		comps := []Component{{Name: tc.prefix, Prefix: tc.prefix}}
+		countMentions(comps, "docs/x.md", tc.text)
+		if got := comps[0].DocRefs == 1; got != tc.want {
+			t.Errorf("%s: %q names %q = %v, want %v", tc.name, tc.text, tc.prefix, got, tc.want)
+		}
+	}
+}
+
+func TestInventoryAttributesChurnOnlyToQueuedImplementationSources(t *testing.T) {
+	ctx := context.Background()
+	repo := &memReader{name: "repo", files: map[string]string{
+		"main.go":                 "package main\n",
+		"internal/queue/queue.go": "package queue\n",
+		"internal/queue/NOTES.md": "notes\n",
+		"docs/x.md":               "doc\n",
+		"vendor/z/v.go":           "package v\n",
+		"go.sum":                  "x\n",
+	}}
+	res, err := Inventory(ctx, []Reader{repo}, Options{Budget: 5, Churn: map[string]int{
+		"internal/queue/queue.go": 2,
+		"internal/queue/NOTES.md": 5,
+		"docs/x.md":               9,
+		"vendor/z/v.go":           9,
+		"go.sum":                  9,
+		"deleted/gone.go":         9,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range res.Components {
+		switch c.Prefix {
+		case "internal/queue":
+			if c.Churn != 2 {
+				t.Errorf("queue churn = %d, want 2 (only its queued implementation source counts)", c.Churn)
+			}
+		case ".":
+			if c.Churn != 0 {
+				t.Errorf("root churn = %d, want 0 (no implementation source owns those paths)", c.Churn)
+			}
+		}
+	}
+}
+
+// failingReader lists the embedded files and fails every Read with err, after running hook.
+type failingReader struct {
+	*memReader
+	err  error
+	hook func()
+}
+
+func (f *failingReader) Read(ctx context.Context, e Entry, _ int64) ([]byte, error) {
+	if f.hook != nil {
+		f.hook()
+	}
+	return nil, f.err
+}
+
+func TestInventoryStopsOnACancelledContextInsteadOfReturningAResult(t *testing.T) {
+	files := map[string]string{"a.go": "package a\n", "b.go": "package b\n"}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	res, err := Inventory(ctx, []Reader{&memReader{name: "repo", files: files}}, Options{Budget: 5})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a context cancelled before the loop must be returned, got err=%v result=%+v", err, res)
+	}
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	fr := &failingReader{memReader: &memReader{name: "repo", files: map[string]string{"a.go": "package a\n"}}, err: errors.New("read aborted"), hook: cancel2}
+	res, err = Inventory(ctx2, []Reader{fr}, Options{Budget: 5})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a read that fails because the context was cancelled must return the context error, got err=%v result=%+v", err, res)
+	}
+}
+
+func TestInventoryMapsAnOversizeReadErrorToTheOversizeDisposition(t *testing.T) {
+	for name, readErr := range map[string]error{
+		"git":     gitx.ErrTooLarge,
+		"confine": fmt.Errorf("read a.go: %w", confine.ErrTooLarge),
+		"other":   errors.New("disk on fire"),
+	} {
+		fr := &failingReader{memReader: &memReader{name: "repo", files: map[string]string{"a.go": "package a\n"}}, err: readErr}
+		res, err := Inventory(context.Background(), []Reader{fr}, Options{Budget: 5})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		want := DispOversize
+		if name == "other" {
+			want = DispUnreadable
+		}
+		if got := srcBy(res, "a.go").Disposition; got != want {
+			t.Errorf("%s: a read that fails with %v is %q, want %q", name, readErr, got, want)
 		}
 	}
 }

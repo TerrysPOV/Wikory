@@ -24,6 +24,7 @@ const (
 	// Dispositions of things that were never opened. The coverage report lists each by name.
 	DispTooDeep        = "skipped:too-deep"
 	DispUnreadable     = "skipped:unreadable"
+	DispOversize       = "skipped:oversize"
 	DispLink           = "skipped:link"
 	DispUnmergedBranch = "skipped:unmerged-branch"
 	DispOtherWorktree  = "skipped:other-worktree"

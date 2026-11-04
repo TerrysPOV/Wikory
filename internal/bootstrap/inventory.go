@@ -2,10 +2,14 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/TerrysPOV/Wikory/internal/confine"
+	"github.com/TerrysPOV/Wikory/internal/gitx"
 	"github.com/TerrysPOV/Wikory/internal/ids"
 	"github.com/TerrysPOV/Wikory/internal/redact"
 )
@@ -73,6 +77,7 @@ func Inventory(ctx context.Context, readers []Reader, opt Options) (Result, erro
 	})
 
 	var implPaths []string
+	impl := map[string]bool{}
 	for i := range all {
 		s := &all[i].s
 		if s.Disposition != "" {
@@ -82,6 +87,7 @@ func Inventory(ctx context.Context, readers []Reader, opt Options) (Result, erro
 			s.Disposition = why
 		} else if s.Tier == TierImplementation && s.Name == "repo" {
 			implPaths = append(implPaths, s.Path)
+			impl[s.Path] = true
 		}
 	}
 	comps := DetectComponents(implPaths)
@@ -94,12 +100,20 @@ func Inventory(ctx context.Context, readers []Reader, opt Options) (Result, erro
 		idx[comps[i].Prefix] = &comps[i]
 	}
 	for p, n := range opt.Churn {
+		// Churn comes from git history, which names docs, vendored and generated files, and paths
+		// that no longer exist. Only a queued implementation source can say a component is active.
+		if !impl[p] {
+			continue
+		}
 		if c := idx[ownerOf(p, prefixes)]; c != nil {
 			c.Churn += n
 		}
 	}
 
 	for i := range all {
+		if err := ctx.Err(); err != nil {
+			return Result{}, fmt.Errorf("bootstrap: inventory stopped: %w", err)
+		}
 		s := &all[i].s
 		if opt.Progress != nil {
 			opt.Progress(i, len(all))
@@ -109,7 +123,14 @@ func Inventory(ctx context.Context, readers []Reader, opt Options) (Result, erro
 		}
 		data, err := all[i].r.Read(ctx, all[i].e, opt.MaxFileBytes)
 		if err != nil {
-			s.Disposition = "skipped:unreadable"
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return Result{}, fmt.Errorf("bootstrap: inventory stopped reading %s: %w", s.Path, ctxErr)
+			}
+			if errors.Is(err, gitx.ErrTooLarge) || errors.Is(err, confine.ErrTooLarge) {
+				s.Disposition = DispOversize // it grew between List and Read
+			} else {
+				s.Disposition = DispUnreadable
+			}
 			continue
 		}
 		if why := Exclusion(s.Path, int64(len(data)), data); why != "" {
@@ -150,12 +171,13 @@ func dateOf(t time.Time) string {
 
 // countMentions adds one to each component the text names by path. A handoff counts toward
 // HandoffMentions and any other non-code file toward DocRefs. A component is named at most
-// once per file, so a file that repeats a path cannot inflate its score.
+// once per file, so a file that repeats a path cannot inflate its score. Doc text is untrusted,
+// so a name counts only on path boundaries: see mentionsPath.
 func countMentions(comps []Component, p, text string) {
 	handoff := IsHandoff(p)
 	for i := range comps {
 		pre := comps[i].Prefix
-		if pre == "." || !(strings.Contains(text, pre+"/") || (strings.Contains(pre, "/") && strings.Contains(text, pre))) {
+		if pre == "." || !mentionsPath(text, pre, !strings.Contains(pre, "/")) {
 			continue
 		}
 		if handoff {
@@ -165,3 +187,44 @@ func countMentions(comps []Component, p, text string) {
 		}
 	}
 }
+
+// mentionsPath reports whether text names the directory pre as a whole path. The name must
+// start the text or follow whitespace or one of "'`([{<,;=*| (never a letter, digit, "_", "-",
+// "." or "/", so x/internal/queue and https://h/api/ do not count), and must end the text or be
+// followed by "/" (so internal/queue/queue.go counts), whitespace, a quote, a closing bracket,
+// one of ,;:*|, or a full stop that ends a sentence (so internal/queue2, internal/queue_test,
+// cmd/wikory-admin and internal/queue.go do not). A single-segment name such as web or api is
+// too common a word to count bare, so it must be followed by "/" (needSlash).
+func mentionsPath(text, pre string, needSlash bool) bool {
+	for from := 0; ; {
+		k := strings.Index(text[from:], pre)
+		if k < 0 {
+			return false
+		}
+		i := from + k
+		from = i + 1
+		if i > 0 && !strings.ContainsRune(boundaryBefore, rune(text[i-1])) && !isSpace(text[i-1]) {
+			continue
+		}
+		j := i + len(pre)
+		if j < len(text) && text[j] == '/' {
+			return true
+		}
+		if needSlash {
+			continue
+		}
+		if j == len(text) || isSpace(text[j]) || strings.ContainsRune(boundaryAfter, rune(text[j])) {
+			return true
+		}
+		if text[j] == '.' && (j+1 == len(text) || isSpace(text[j+1])) {
+			return true
+		}
+	}
+}
+
+const (
+	boundaryBefore = "\"'`([{<,;=*|"
+	boundaryAfter  = "\"'`)]}>,;:*|"
+)
+
+func isSpace(b byte) bool { return b == ' ' || b == '\t' || b == '\n' || b == '\r' }

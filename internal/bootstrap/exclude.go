@@ -25,7 +25,7 @@ var generatedBases = map[string]bool{"go.sum": true, "package-lock.json": true, 
 // checks run either way, so a caller can drop a file before reading it.
 func Exclusion(p string, size int64, head []byte) string {
 	if size > MaxFileBytes {
-		return "skipped:oversize"
+		return DispOversize
 	}
 	if strings.HasPrefix(p, "project-memory/") {
 		return "skipped:wikory" // Wikory's own output is never its input
