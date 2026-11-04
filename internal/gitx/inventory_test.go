@@ -82,6 +82,11 @@ func TestReadBlobHonoursTheLimitAndRefusesNonIDs(t *testing.T) {
 	if _, err := r.ReadBlob(ctx, oid, 1, 5); !errors.Is(err, ErrTooLarge) { // a size that understates is still held to max
 		t.Fatalf("a blob of 6 bytes against a limit of 5 must be ErrTooLarge, got %v", err)
 	}
+	// The listed size decides before git runs: an id git does not have still gives ErrTooLarge
+	// when its size is over the limit, because nothing is read.
+	if _, err := r.ReadBlob(ctx, strings.Repeat("f", 40), 100, 5); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("a listed size over the limit must refuse before reading: %v", err)
+	}
 	if _, err := r.ReadBlob(ctx, "HEAD:a.txt", 6, 100); err == nil {
 		t.Fatal("only a full hex id is accepted")
 	}
