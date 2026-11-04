@@ -17075,6 +17075,13 @@ git commit -m "test: add stage 2 exit checks, a finish kill test and the dry run
 
 ---
 
+#### Final whole-branch review fixes (2026-11-04)
+
+- B14 (`ab929cd`): `scripts/exit-checks.sh` anchors every alternative at both ends: the existence check is `grep -Eqx` against the listed test names and the run is `go test -run "^($pattern)$"`, so a deleted test whose name is a prefix of a surviving one is reported missing instead of counting as present. The stage 1 checks that named a family by prefix now say so explicitly (`TestRule.*`, `TestStamp.*`, `TestSanitize.*`, `TestReplace.*`, `TestRefuses.*`, `TestEnsurePrivateDir.*`, `TestRepeatedFinalText.*`, `TestDelayedFlush.*`, `Test.*SubstitutedBySymlinkToMovedOriginalIsRefused`). Proved by renaming `TestCapStatus` to `TestCapStatusRenamed` and running `check` on `TestCapStatus`: FAIL, where the unanchored match had passed.
+- Fifteen checks are added under "Final whole-branch review fixes" for the new properties (git log runs nothing, hash-rocket secrets, a portable plan hash, digest bounds, the unknown projection, empty components, one claim owner, pending hashes and abandon, the stored report, resume, inert names and markup, the contradicted original's metadata, the source, branch and HEAD preconditions). `scripts/exit-checks.sh`: 128 PASS.
+- The dry-run note gains "Rerun after the final-review fixes": the same counts, 201,929 extract input tokens (the digest estimate now counts header lines) and plan hash `84522dfbfab84e0e93bec5e6d9cb90895002eb803f0a792cf6b2694b14063891` (hash version 3), stable across two runs.
+- The kill test (`finishBoundaries`) gains `pending-0` and `pending-1`, and after `marked-done` it checks that finish reprints the stored report and status shows the same one (Task 13).
+
 ## Review amendments (Codex Astra, 2026-11-03)
 
 Astra read the plan against the design, the architecture spec and the existing code, read-only, and found no critical issue but would not approve it unchanged. Each finding was checked against the plan text before it was acted on. All thirteen are fixed; two of the fixes differ from Astra's suggestion and one finding is met by disclosure, not by building (marked below).
