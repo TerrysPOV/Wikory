@@ -282,3 +282,24 @@ func forceState(t *testing.T, c *cli, runID, state string) {
 		t.Fatal(err)
 	}
 }
+
+// forceItemsClosed marks every open item of a run done, so finish can be exercised without
+// replaying every submission.
+func forceItemsClosed(t *testing.T, c *cli, runID string) {
+	t.Helper()
+	var dbPath string
+	_ = filepath.WalkDir(c.dataDir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && d.Name() == "wikory.db" {
+			dbPath = p
+		}
+		return nil
+	})
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE bs_items SET state='done' WHERE run_id=? AND state IN ('pending','leased')`, runID); err != nil {
+		t.Fatal(err)
+	}
+}

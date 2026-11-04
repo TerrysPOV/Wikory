@@ -334,6 +334,24 @@ func (r *Runs) Next(ctx context.Context, id string, max int) (Batch, error) {
 	return b, err
 }
 
+// requireWorking refuses a commit into a run that is not sampling or running. An item leased
+// before the run finished or was abandoned must not be able to store claims or add usage later:
+// the end marker and the published pages describe the run as it stood.
+func requireWorking(ctx context.Context, tx *sql.Tx, runID, checkout string) error {
+	var state string
+	err := tx.QueryRowContext(ctx, `SELECT state FROM bs_runs WHERE run_id=? AND checkout_id=?`, runID, checkout).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNoRun
+	}
+	if err != nil {
+		return err
+	}
+	if state != StateSampling && state != StateRunning {
+		return fmt.Errorf("%w: the run is %s; submissions are accepted only while it is sampling or running", ErrState, state)
+	}
+	return nil
+}
+
 func loadItem(ctx context.Context, tx *sql.Tx, id, checkout string) (Item, error) {
 	it := Item{ID: id}
 	err := tx.QueryRowContext(ctx, `SELECT run_id,stage,ref,input_hash,state,epoch,attempts,batch FROM bs_items WHERE item_id=? AND checkout_id=?`, id, checkout).
@@ -356,6 +374,9 @@ func (r *Runs) Complete(ctx context.Context, itemID string, epoch int, u Usage, 
 		}
 		if it.State != "leased" || it.Epoch != epoch {
 			return ErrStaleLease
+		}
+		if err := requireWorking(ctx, tx, it.RunID, r.CheckoutID); err != nil {
+			return err
 		}
 		if fn != nil {
 			if err := fn(ctx, tx, it); err != nil {
@@ -391,6 +412,9 @@ func (r *Runs) FailCounted(ctx context.Context, itemID string, epoch, accepted, 
 		}
 		if it.State != "leased" || it.Epoch != epoch {
 			return ErrStaleLease
+		}
+		if err := requireWorking(ctx, tx, it.RunID, r.CheckoutID); err != nil {
+			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE bs_runs SET accepted=accepted+?, rejected=rejected+?, tokens_in=tokens_in+?, tokens_out=tokens_out+? WHERE run_id=?`,
 			accepted, rejected, u.InputTokens, u.OutputTokens, it.RunID); err != nil {

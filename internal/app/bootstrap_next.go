@@ -69,7 +69,7 @@ func bootstrapNext(ctx context.Context, env *Env, args []string) (Result, error)
 			return Result{}, &UsageError{Msg: "--max needs a whole number of at least 1"}
 		}
 	}
-	if _, err := bootstrap.PrepareVerify(ctx, runs, bootstrap.WorkFiles{Root: p.Store.Root, CheckoutID: p.Checkout.ID}, runID); err != nil {
+	if err := prepareVerifyWithProgress(ctx, env, p, runs, runID); err != nil {
 		return Result{}, err
 	}
 	b, err := runs.Next(ctx, runID, max)
@@ -125,7 +125,12 @@ type statusReport struct {
 	Claims       map[string]int            `json:"claims"`
 	Summary      string                    `json:"summary"`
 	TokensNote   string                    `json:"tokens_note"`
+	// AdmissionsNote says what run.claims_accepted and run.claims_rejected count.
+	AdmissionsNote string `json:"admissions_note"`
 }
+
+// admissionsNote is the plain meaning of a run's accepted and rejected counts.
+const admissionsNote = "claims_accepted and claims_rejected count extract submissions only (claims admitted or rejected when first proposed); verify verdicts are not counted in them"
 
 func bootstrapStatus(ctx context.Context, env *Env, args []string) (Result, error) {
 	p, runs, fl, err := openRun(ctx, env, args, map[string]bool{"run": true})
@@ -146,7 +151,8 @@ func bootstrapStatus(ctx context.Context, env *Env, args []string) (Result, erro
 		return Result{}, err
 	}
 	rep := statusReport{Run: st.Run, Items: st.Items, Dispositions: st.Dispositions, Components: st.Components, Claims: st.Claims, Summary: statusLine(st),
-		TokensNote: "token counts are asserted by the driver; the binary cannot measure them"}
-	text := fmt.Sprintf("%s\ntokens (asserted): %d in, %d out\n", rep.Summary, st.Run.TokensIn, st.Run.TokensOut)
+		TokensNote: "token counts are asserted by the driver; the binary cannot measure them", AdmissionsNote: admissionsNote}
+	text := fmt.Sprintf("%s\nextract admissions: %d accepted, %d rejected (verify verdicts are not counted here)\ntokens (asserted): %d in, %d out\n",
+		rep.Summary, st.Run.Accepted, st.Run.Rejected, st.Run.TokensIn, st.Run.TokensOut)
 	return Result{Data: rep, Text: text}, nil
 }
