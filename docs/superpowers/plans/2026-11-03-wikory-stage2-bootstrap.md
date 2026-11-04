@@ -6891,6 +6891,25 @@ git commit -m "feat: write redacted content-addressed work files and component d
 
 ---
 
+#### Final whole-branch review fixes (2026-11-04)
+
+- A4 (`86fdd47`): a digest is now bounded as a whole. `BuildDigest` counts each file's header line against the budget, and when anything is left out it keeps `omittedReserve` bytes for the omitted mark and an "=== and K more ===" line and lists only as many left-out paths as the remaining room holds (the returned slice still lists every one). For any `max >= omittedReserve` the digest is at most `max` bytes. `WorkReadMax = max(MaxFileBytes+64<<10, DigestMaxBytes)` bounds every work-file read, and `Submit` reads with it, so a digest Wikory wrote can never be refused as too large (a component of about 5,000 files made a work file over the old limit, which returned `ErrTooLarge` as an infrastructure error, retried the paid item three times and lost it). Tests: `TestADigestOfThousandsOfFilesStaysWithinItsBoundAndReadsBack` (5,000 small and 3,000 tiny files, written and read back through `WorkFiles`), `TestBuildDigestNeverExceedsItsBudget`; `TestBuildDigestHonoursTheBudgetAndListsWhatItLeftOut` uses a budget of 600, since 500 no longer holds two headers and the reserve.
+- B3 (`9937586`): `unprintable(r)` (control, format, line and paragraph separator characters) is the one rule for text that is never printed raw, used by `hasControl`, `visiblePath`, `CheckText`, `Safe` and `safeLabel`; `maxShownRunes` (200) is the one length cap for `Safe` and `safeLabel`. Tests: `TestSeparatorsAndBidiOverridesInANameMakeItABadName`, `TestSafeAndSafeLabelShareOneCap`.
+- C3 (`0f2b764`): `SectionsOf` finds the omitted mark in its one scan.
+
+Run: `scripts/inject.sh internal/bootstrap/digest.go '		budget = max - omittedReserve' '		budget = max - 0*omittedReserve' ./internal/bootstrap/ 'TestBuildDigestNeverExceedsItsBudget' 'digest is'`
+Run: `scripts/inject.sh internal/bootstrap/digest.go 'n := len(parts[i].head) + len(parts[i].body)' 'n := 0*len(parts[i].head) + len(parts[i].body)' ./internal/bootstrap/ 'TestADigestOfThousands' 'over its bound'`
+Run: `scripts/inject.sh internal/bootstrap/digest.go '			if len(p)+1 > room {
+				break
+			}' '			if len(p)+1 > room && false {
+				break
+			}' ./internal/bootstrap/ 'TestADigestOfThousands' 'over its bound'`
+Run: `scripts/inject.sh internal/bootstrap/workfile.go 'const WorkReadMax = max(MaxFileBytes+64<<10, DigestMaxBytes)' 'const WorkReadMax = DigestMaxBytes / 2' ./internal/bootstrap/ 'TestADigestOfThousands' 'must read back within WorkReadMax'`
+Run: `scripts/inject.sh internal/bootstrap/digest.go '	return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r)' '	return unicode.IsControl(r)' ./internal/bootstrap/ 'TestSeparatorsAndBidiOverrides' 'want "skipped:bad-name"'`
+Run: `scripts/inject.sh internal/bootstrap/coverage.go '		if n++; n > maxShownRunes {' '		if n++; n > maxShownRunes+1 {' ./internal/bootstrap/ 'TestSafeAndSafeLabelShareOneCap' 'both must stop at'`
+
+Expected: each exits 0 (RED).
+
 ### Task 10: Proposals, excerpt checks, admission and `submit` (extract)
 
 **Files:**
