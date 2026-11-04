@@ -282,7 +282,7 @@ func TestASampleWhoseLastItemIsRejectedStillSettles(t *testing.T) {
 		if len(b.Items) != 1 {
 			t.Fatalf("attempt %d: %+v", i, b)
 		}
-		if err := r.Fail(ctx, b.Items[0].ID, b.Items[0].Epoch); err != nil {
+		if err := r.FailCounted(ctx, b.Items[0].ID, b.Items[0].Epoch, 0, 0, Usage{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -363,7 +363,7 @@ func TestEveryMutationTakesTheWriteLock(t *testing.T) {
 		{"Create", func() (err error) { run, err = r.Create(ctx, planWith(0), specsN(2)); return }},
 		{"Transition", func() error { return r.Transition(ctx, run.ID, StateRunning, StatePlanned) }},
 		{"Next", func() (err error) { batch, err = r.Next(ctx, run.ID, 1); return }},
-		{"Fail", func() error { return r.Fail(ctx, batch.Items[0].ID, batch.Items[0].Epoch) }},
+		{"FailCounted", func() error { return r.FailCounted(ctx, batch.Items[0].ID, batch.Items[0].Epoch, 0, 0, Usage{}) }},
 		{"Complete", func() error {
 			b, err := r.Next(ctx, run.ID, 1)
 			if err != nil || len(b.Items) != 1 {

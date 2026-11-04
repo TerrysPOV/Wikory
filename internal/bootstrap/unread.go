@@ -27,10 +27,7 @@ func UnreadSources(def string, branches []gitx.Branch, trees []gitx.Worktree) []
 		// machine and moves with the worktree, and the plan hash covers this path.
 		label := w.Branch
 		if label == "" {
-			label = w.Head
-			if len(label) > 12 {
-				label = label[:12]
-			}
+			label = short(w.Head)
 		}
 		out = append(out, Source{Name: UnreadSourceName, Path: "worktree:" + label, Tier: TierAttributed, Disposition: DispOtherWorktree})
 	}

@@ -133,7 +133,9 @@ func bootstrapSubmit(ctx context.Context, env *Env, args []string) (Result, erro
 			}
 		case "verify":
 			r, err := bootstrap.ApplyVerdicts(ctx, bootstrap.VerifyInput{Runs: runs, Env: p.validateEnv(), Mint: ids.NewULID, Batch: batch, V: sets[i],
-				Blob: func(oid string) ([]byte, error) { return p.Repo.ReadBlob(ctx, oid, bootstrap.MaxFileBytes) }})
+				Blob: func(oid string, size int64) ([]byte, error) {
+					return p.Repo.ReadBlob(ctx, oid, size, bootstrap.MaxFileBytes)
+				}})
 			sr = submitResult{Item: r.Item, Accepted: r.Confirmed + r.Contradicted, Rejected: r.Rejected, Findings: r.Findings, Requeued: r.Requeued}
 			if err != nil {
 				sr.Error = describeSubmitError(err)

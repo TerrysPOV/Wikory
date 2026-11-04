@@ -9,6 +9,14 @@ import (
 	"time"
 )
 
+// addCounts adds claim counts to a run directly, as a submission does inside its completion.
+func addCounts(t *testing.T, r *Runs, runID string, accepted, rejected int) {
+	t.Helper()
+	if _, err := r.DB.Exec(`UPDATE bs_runs SET accepted=accepted+?, rejected=rejected+? WHERE run_id=?`, accepted, rejected, runID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // When every sampled item failed there is nothing to project from: the projection is unknown
 // (null in JSON), never a zero that reads as free, and the tokens the failures spent still count.
 func TestMeasureOfASampleWithNoCompletedItemHasNoProjection(t *testing.T) {
@@ -53,9 +61,7 @@ func TestMeasureReportsDurationTokensAcceptanceAndAProjection(t *testing.T) {
 		t.Fatalf("%d", len(b.Items))
 	}
 	// A submission adds its claim counts inside Complete, so they are in before the sample settles.
-	if err := r.AddCounts(ctx, run.ID, 3, 1); err != nil {
-		t.Fatal(err)
-	}
+	addCounts(t, r, run.ID, 3, 1)
 	*now = now.Add(40 * time.Second)
 	if err := r.Complete(ctx, b.Items[0].ID, 1, Usage{InputTokens: 3000, OutputTokens: 300}, nil); err != nil {
 		t.Fatal(err)
@@ -83,9 +89,7 @@ func TestMeasureStaysTheSampleAfterTheFullRunStarts(t *testing.T) {
 	run := mustRun(t, r, 2, 8)
 	_ = r.Transition(ctx, run.ID, StateSampling, StatePlanned)
 	b, _ := r.Next(ctx, run.ID, 50)
-	if err := r.AddCounts(ctx, run.ID, 3, 1); err != nil {
-		t.Fatal(err)
-	}
+	addCounts(t, r, run.ID, 3, 1)
 	*now = now.Add(time.Minute)
 	for _, it := range b.Items {
 		if err := r.Complete(ctx, it.ID, it.Epoch, Usage{InputTokens: 2000, OutputTokens: 200}, nil); err != nil {
@@ -109,9 +113,7 @@ func TestMeasureStaysTheSampleAfterTheFullRunStarts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := r.AddCounts(ctx, run.ID, 40, 40); err != nil {
-		t.Fatal(err)
-	}
+	addCounts(t, r, run.ID, 40, 40)
 	after, err := r.Measure(ctx, run.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -137,9 +139,7 @@ func TestMeasureIsLiveWhileTheSampleRuns(t *testing.T) {
 	run := mustRun(t, r, 2, 8)
 	_ = r.Transition(ctx, run.ID, StateSampling, StatePlanned)
 	b, _ := r.Next(ctx, run.ID, 50)
-	if err := r.AddCounts(ctx, run.ID, 1, 1); err != nil {
-		t.Fatal(err)
-	}
+	addCounts(t, r, run.ID, 1, 1)
 	if err := r.Complete(ctx, b.Items[0].ID, b.Items[0].Epoch, Usage{InputTokens: 700, OutputTokens: 70}, nil); err != nil {
 		t.Fatal(err)
 	}

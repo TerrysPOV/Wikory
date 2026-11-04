@@ -165,7 +165,7 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		err = recErr
 	}
 	if err != nil {
-		return Result{}, describeConfineErr(err)
+		return Result{}, describeConfine(err)
 	}
 	killPoint("planned")
 	outcomes := make([]bootstrap.PageOutcome, 0, len(pages))
@@ -323,14 +323,6 @@ func refuseSecretPages(bad []bootstrap.PageSecret) error {
 		list += fmt.Sprintf(" and %d more", len(bad)-shown)
 	}
 	return fmt.Errorf("page(s) %s would hold text that looks like a secret (%s); nothing was published. The text is not shown here: find it in the sources the page was built from, remove or redact it there, and plan again", list, strings.Join(ks, ", "))
-}
-
-// describeConfineErr wraps a confinement failure with the plain-language explanation.
-func describeConfineErr(err error) error {
-	if errors.Is(err, confine.ErrSymlink) || errors.Is(err, confine.ErrNotRegular) {
-		return describeConfine(err)
-	}
-	return err
 }
 
 // notOursContent stands for an existing page too large to read. It is not the new render and not

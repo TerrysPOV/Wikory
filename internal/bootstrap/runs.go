@@ -416,12 +416,6 @@ func (r *Runs) Complete(ctx context.Context, itemID string, epoch int, u Usage, 
 	})
 }
 
-// Fail returns a leased item to pending (or rejects it after MaxAttempts) when its submission
-// was unusable as a whole.
-func (r *Runs) Fail(ctx context.Context, itemID string, epoch int) error {
-	return r.FailCounted(ctx, itemID, epoch, 0, 0, Usage{})
-}
-
 // FailCounted is Fail that also adds the submission's accepted and rejected claim counts and the
 // usage it cost to the run in the same transaction, so a sample that settles on this failure
 // freezes the final figures. An attempt that yields nothing usable still spends tokens.
@@ -568,7 +562,6 @@ func (r *Runs) Components(ctx context.Context, id string) ([]Component, error) {
 		c.Inspected, c.Entry = insp == 1, entry == 1
 		out = append(out, c)
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Rank < out[j].Rank })
 	return out, rows.Err()
 }
 
@@ -581,15 +574,6 @@ func (r *Runs) Item(ctx context.Context, id string) (Item, error) {
 		return it, ErrNoItem
 	}
 	return it, err
-}
-
-// AddCounts adds to a run's accepted and rejected claim counts, for a submission that was
-// requeued and so never reached Complete.
-func (r *Runs) AddCounts(ctx context.Context, runID string, accepted, rejected int) error {
-	return r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE bs_runs SET accepted=accepted+?, rejected=rejected+? WHERE run_id=? AND checkout_id=?`, accepted, rejected, runID, r.CheckoutID)
-		return err
-	})
 }
 
 // Measure is what the sample showed, from the stored run. Tokens are asserted by the driver.

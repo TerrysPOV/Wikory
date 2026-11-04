@@ -175,10 +175,11 @@ func SectionsOf(text string, valid map[string]string) []Section {
 		n--
 	}
 	var secs []Section
-	cur := -1
+	cur, end := -1, n
 	for i := 0; i < n; i++ {
 		l := lines[i]
 		if l == omittedMark {
+			end = i
 			break
 		}
 		if strings.HasPrefix(l, headerPrefix) && strings.HasSuffix(l, headerSuffix) {
@@ -194,13 +195,6 @@ func SectionsOf(text string, valid map[string]string) []Section {
 		}
 	}
 	if cur >= 0 {
-		end := n
-		for i := 0; i < n; i++ {
-			if lines[i] == omittedMark {
-				end = i
-				break
-			}
-		}
 		secs[cur].End = end
 	}
 	return secs

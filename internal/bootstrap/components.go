@@ -48,16 +48,23 @@ func hasSegment(dir, seg string) bool {
 	return false
 }
 
+// nearestDir is the deepest directory above p (p's own directory first) that is in dirs.
+func nearestDir(p string, dirs map[string]bool) (string, bool) {
+	for d := path.Dir(p); d != "." && d != "/"; d = path.Dir(d) {
+		if dirs[d] {
+			return d, true
+		}
+	}
+	return "", false
+}
+
 // owner is the component prefix for one file: the longest package directory that contains it,
 // else its top-level directory, else ".".
 func owner(p string, pkg map[string]bool) string {
-	dir := path.Dir(p)
-	for d := dir; d != "." && d != "/"; d = path.Dir(d) {
-		if pkg[d] {
-			return d
-		}
+	if d, ok := nearestDir(p, pkg); ok {
+		return d
 	}
-	if dir == "." {
+	if path.Dir(p) == "." {
 		return "."
 	}
 	top, _, _ := strings.Cut(p, "/")
@@ -66,10 +73,8 @@ func owner(p string, pkg map[string]bool) string {
 
 // ownerOf returns the prefix that owns p among the detected components, for attaching churn.
 func ownerOf(p string, prefixes map[string]bool) string {
-	for d := path.Dir(p); d != "." && d != "/"; d = path.Dir(d) {
-		if prefixes[d] {
-			return d
-		}
+	if d, ok := nearestDir(p, prefixes); ok {
+		return d
 	}
 	top, _, _ := strings.Cut(p, "/")
 	if prefixes[top] {

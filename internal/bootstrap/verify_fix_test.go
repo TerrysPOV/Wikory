@@ -13,7 +13,7 @@ import (
 
 // input builds a verify submission over the rig with an environment, blob reader and usage the
 // test chooses.
-func (v *verifyRig) input(env hookEnv, blob func(string) ([]byte, error), verdicts ...Verdict) VerifyInput {
+func (v *verifyRig) input(env hookEnv, blob func(string, int64) ([]byte, error), verdicts ...Verdict) VerifyInput {
 	return VerifyInput{Runs: v.r, Env: env, Mint: ids.NewULID, Blob: blob, Batch: v.batch,
 		V: VerdictSet{Item: v.item.ID, Epoch: v.item.Epoch, Verdicts: verdicts, Usage: Usage{InputTokens: 5000, OutputTokens: 400}}}
 }
@@ -58,7 +58,7 @@ func requireQuiet(t *testing.T, rep VerifyReport, item string) {
 func TestABlobReadFailureIsAnErrorNotAReject(t *testing.T) {
 	v := newVerifyRig(t)
 	boom := errors.New("git cat-file: broken pipe")
-	rep, err := ApplyVerdicts(context.Background(), v.input(queueEnv(), func(string) ([]byte, error) { return nil, boom },
+	rep, err := ApplyVerdicts(context.Background(), v.input(queueEnv(), func(string, int64) ([]byte, error) { return nil, boom },
 		Verdict{Claim: v.c2.ClaimID, Result: "probably"}, // rejected before the blob is read
 		Verdict{Claim: v.c1.ClaimID, Result: "confirmed", Evidence: codeLoc()}))
 	if !errors.Is(err, boom) {
@@ -148,7 +148,7 @@ func TestAVerifierNamingAnotherComponentsDecidedClaimIsToldItIsUnknown(t *testin
 		t.Fatal(err)
 	}
 	spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: ids.SHA256Hex([]byte("other"))}
-	if err := r.EnqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil {
+	if _, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil {
 		t.Fatal(err)
 	}
 	ob, _ := r.Next(ctx, run.ID, 5)

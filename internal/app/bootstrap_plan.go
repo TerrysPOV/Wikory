@@ -149,11 +149,7 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 	for _, s := range res.Sources {
 		rep.Sources[s.Disposition]++
 	}
-	for _, c := range res.Components {
-		if c.Inspected {
-			rep.Inspected++
-		}
-	}
+	rep.Inspected = bootstrap.CountInspected(res.Components)
 	rep.Next = fmt.Sprintf("wikory bootstrap confirm --run %s --plan-hash %s", run.ID, plan.Hash)
 	if sample > 0 {
 		rep.Next += " --sample" // a run planned with a sample cannot start in full until its sample has run

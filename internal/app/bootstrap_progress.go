@@ -32,12 +32,7 @@ func verifyPrepDue(ctx context.Context, runs *bootstrap.Runs, runID string) (boo
 	if err != nil {
 		return false, 0
 	}
-	n := 0
-	for _, c := range comps {
-		if c.Inspected {
-			n++
-		}
-	}
+	n := bootstrap.CountInspected(comps)
 	return n > 0, n
 }
 

@@ -428,7 +428,7 @@ func TestClaimsReturnsTheLocationAVerifierKeeps(t *testing.T) {
 	}
 }
 
-func TestItemReportsTheBatchAndAddCountsAdds(t *testing.T) {
+func TestItemReportsTheBatch(t *testing.T) {
 	ctx := context.Background()
 	s := newSubmitRig(t)
 	if s.item.Batch != s.batch {
@@ -440,11 +440,5 @@ func TestItemReportsTheBatchAndAddCountsAdds(t *testing.T) {
 	}
 	if _, err := s.r.Item(ctx, "itm_nothing"); !errors.Is(err, ErrNoItem) {
 		t.Fatalf("%v", err)
-	}
-	if err := s.r.AddCounts(ctx, s.run.ID, 2, 3); err != nil {
-		t.Fatal(err)
-	}
-	if run, _ := s.r.Get(ctx, s.run.ID); run.Accepted != 2 || run.Rejected != 3 {
-		t.Fatalf("%+v", run)
 	}
 }

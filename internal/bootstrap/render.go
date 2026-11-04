@@ -202,10 +202,7 @@ func place(m RenderModel) placement {
 // fixed template sentences.
 func RenderPages(m RenderModel) []PageOut {
 	pl := place(m)
-	head12 := m.Run.Head
-	if len(head12) > 12 {
-		head12 = head12[:12]
-	}
+	head12 := short(m.Run.Head)
 	banner := fmt.Sprintf("> This page is a baseline built by `wikory bootstrap` on %s from commit %s. It was assembled by a fixed template from the project's code, documents and notes; none of its prose was written by hand. Each claim keeps the status it earned: verified claims were checked against committed code, unverified claims were not, and historical claims describe the past. Edit or delete anything: Wikory will not overwrite a page you changed.", m.Date, head12)
 
 	counts := map[string]int{}

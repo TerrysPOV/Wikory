@@ -14,7 +14,7 @@ import (
 // TreeSource is the part of gitx.Repo that RepoReader needs.
 type TreeSource interface {
 	ListTree(ctx context.Context, rev string) ([]gitx.TreeEntry, error)
-	ReadBlob(ctx context.Context, oid string, max int64) ([]byte, error)
+	ReadBlob(ctx context.Context, oid string, size, max int64) ([]byte, error)
 }
 
 // RepoReader reads the tracked files of one revision. Untracked and ignored files are not
@@ -42,7 +42,7 @@ func (r *RepoReader) List(ctx context.Context) ([]Entry, error) {
 	return es, nil
 }
 func (r *RepoReader) Read(ctx context.Context, e Entry, max int64) ([]byte, error) {
-	return r.src.ReadBlob(ctx, e.OID, max)
+	return r.src.ReadBlob(ctx, e.OID, e.Size, max)
 }
 
 // DirReader reads a directory the person opted in (an existing wiki, a memory folder, planning

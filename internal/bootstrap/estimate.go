@@ -100,6 +100,18 @@ func EstimateStages(res Result) []Estimate {
 	return []Estimate{ex, {Stage: "verify", Items: n, InputTokens: n * verifyInTokens, OutputTokens: n * verifyOutTokens}}
 }
 
+// CountInspected is how many components were chosen for inspection. (The verify estimate counts
+// only those with files to read; see EstimateStages.)
+func CountInspected(cs []Component) int {
+	n := 0
+	for _, c := range cs {
+		if c.Inspected {
+			n++
+		}
+	}
+	return n
+}
+
 // Plan is a bootstrap plan: what would be read, what it would cost and how it is grouped.
 type Plan struct {
 	Scope, Head, Hash string

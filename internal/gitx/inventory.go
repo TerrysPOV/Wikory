@@ -55,24 +55,26 @@ func (r *Repo) ListTree(ctx context.Context, rev string) ([]TreeEntry, error) {
 	return res, nil
 }
 
-// ReadBlob returns the raw content of a blob given its full hex id, or ErrTooLarge when it is
-// bigger than max. No filter, textconv or smudge runs: cat-file blob reads the stored bytes.
-func (r *Repo) ReadBlob(ctx context.Context, oid string, max int64) ([]byte, error) {
+// ReadBlob returns the raw content of a blob given its full hex id and the size ListTree
+// reported for it, or ErrTooLarge when it is bigger than max. The size decides before anything is
+// read, so one cat-file runs per blob; what comes back is held to max as well, so a size that was
+// wrong cannot let a larger object through. No filter, textconv or smudge runs: cat-file blob
+// reads the stored bytes.
+func (r *Repo) ReadBlob(ctx context.Context, oid string, size, max int64) ([]byte, error) {
 	if !shaRe.MatchString(oid) {
 		return nil, fmt.Errorf("gitx: %q is not a hex object id", oid)
 	}
-	sz, err := r.output(ctx, nil, "cat-file", "-s", oid)
+	if size > max {
+		return nil, ErrTooLarge
+	}
+	data, err := r.git(ctx, nil, "cat-file", "blob", oid)
 	if err != nil {
 		return nil, err
 	}
-	n, err := strconv.ParseInt(sz, 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("gitx: unreadable object size %q", sz)
-	}
-	if n > max {
+	if int64(len(data)) > max {
 		return nil, ErrTooLarge
 	}
-	return r.git(ctx, nil, "cat-file", "blob", oid)
+	return data, nil
 }
 
 // Churn counts, per path, the commits reachable from HEAD since the given time that touched it.

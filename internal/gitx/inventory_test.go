@@ -72,14 +72,17 @@ func TestReadBlobHonoursTheLimitAndRefusesNonIDs(t *testing.T) {
 	dir := newRepo(t)
 	r, _ := Discover(ctx, dir)
 	oid := gitT(t, dir, "rev-parse", "HEAD:a.txt")
-	b, err := r.ReadBlob(ctx, oid, 100)
+	b, err := r.ReadBlob(ctx, oid, 6, 100)
 	if err != nil || string(b) != "alpha\n" {
 		t.Fatalf("%q %v", b, err)
 	}
-	if _, err := r.ReadBlob(ctx, oid, 5); !errors.Is(err, ErrTooLarge) {
+	if _, err := r.ReadBlob(ctx, oid, 6, 5); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("over the limit: %v", err)
+	}
+	if _, err := r.ReadBlob(ctx, oid, 1, 5); !errors.Is(err, ErrTooLarge) { // a size that understates is still held to max
 		t.Fatalf("a blob of 6 bytes against a limit of 5 must be ErrTooLarge, got %v", err)
 	}
-	if _, err := r.ReadBlob(ctx, "HEAD:a.txt", 100); err == nil {
+	if _, err := r.ReadBlob(ctx, "HEAD:a.txt", 6, 100); err == nil {
 		t.Fatal("only a full hex id is accepted")
 	}
 }

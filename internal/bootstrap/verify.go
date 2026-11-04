@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,8 +24,6 @@ const (
 )
 
 const maxEvidencePerVerdict = 5
-
-var linesRe = regexp.MustCompile(`^L([1-9][0-9]{0,6})-L([1-9][0-9]{0,6})$`)
 
 // errClaimMoved means a claim changed between the moment a verdict was judged and the moment it
 // was written, so the write was refused.
@@ -61,7 +58,7 @@ type VerifyInput struct {
 	Runs  *Runs
 	Env   validate.Env
 	Mint  func() string
-	Blob  func(oid string) ([]byte, error)
+	Blob  func(oid string, size int64) ([]byte, error)
 	Batch string
 	V     VerdictSet
 }
@@ -166,17 +163,12 @@ func ownsBetter(a, b Component, s StoredClaim) bool {
 	return a.Name < b.Name
 }
 
-// EnqueueVerify adds verify items to a run. A component that already has one is left alone, so
-// two callers racing to prepare the same run queue one paid verification per component. It adds
+// enqueueVerify adds verify items to a run and reports how many rows it inserted. A component
+// that already has one is left alone, so two callers racing to prepare the same run queue one
+// paid verification per component. It adds
 // nothing, and says nothing, to a run that is not running: the state is read inside the write
 // transaction, so a next call that read the run as running before finish moved it on cannot put
 // rows in a finishing or finished run, where they could never be handed out or committed.
-func (r *Runs) EnqueueVerify(ctx context.Context, runID string, specs []ItemSpec) error {
-	_, err := r.enqueueVerify(ctx, runID, specs)
-	return err
-}
-
-// enqueueVerify is EnqueueVerify reporting how many rows it inserted.
 func (r *Runs) enqueueVerify(ctx context.Context, runID string, specs []ItemSpec) (int, error) {
 	inserted := 0
 	err := r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
@@ -598,8 +590,8 @@ func writeChanges(ctx context.Context, tx *sql.Tx, checkoutID string, it Item, c
 // forwards, and end inside the file the plan recorded. With no blob reader nothing can be
 // bounded, so nothing is accepted. The reason it returns never repeats the range it was given. A
 // failure to read the blob is an error, never a reason: it says nothing about the verdict.
-func checkLines(blob func(oid string) ([]byte, error), src Source, lines string) (string, error) {
-	m := linesRe.FindStringSubmatch(lines)
+func checkLines(blob func(oid string, size int64) ([]byte, error), src Source, lines string) (string, error) {
+	m := locatorRe.FindStringSubmatch(lines)
 	if m == nil {
 		return "lines must look like L10-L20", nil
 	}
@@ -611,7 +603,7 @@ func checkLines(blob func(oid string) ([]byte, error), src Source, lines string)
 	if blob == nil {
 		return "the file's length cannot be checked", nil
 	}
-	data, err := blob(src.OID)
+	data, err := blob(src.OID, src.Size)
 	if err != nil {
 		return "", fmt.Errorf("bootstrap: reading the file %s to check a line range: %w", src.Path, err) // read error
 	}

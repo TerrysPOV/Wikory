@@ -16,7 +16,7 @@ import (
 )
 
 // blobOf40 stands in for the blob reader: every file the tests name is 40 lines long.
-func blobOf40(string) ([]byte, error) { return []byte(strings.Repeat("x\n", 40)), nil }
+func blobOf40(string, int64) ([]byte, error) { return []byte(strings.Repeat("x\n", 40)), nil }
 
 // verifyRig has one inspected component (internal/queue) with two unverified claims, both
 // extracted from a design doc, and one leased verify item.
@@ -383,7 +383,7 @@ func TestASharedClaimIsQueuedForOneVerifierAndTheOtherCannotJudgeIt(t *testing.T
 	}
 	// A verifier of the other component is not given the claim and cannot decide it.
 	spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: ids.SHA256Hex([]byte("other"))}
-	if err := r.EnqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil {
+	if _, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil {
 		t.Fatal(err)
 	}
 	ob, _ := r.Next(ctx, run.ID, 5)
@@ -465,7 +465,7 @@ func TestAVerifyItemIsQueuedOncePerComponent(t *testing.T) {
 	_ = r.Transition(ctx, run.ID, StateRunning, StatePlanned)
 	spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: "h"}
 	for i := 0; i < 2; i++ {
-		if err := r.EnqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil {
+		if _, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil {
 			t.Fatal(err)
 		}
 	}

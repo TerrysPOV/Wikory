@@ -20,7 +20,7 @@ func verifyItems(t *testing.T, r *Runs, runID string) int {
 	return n
 }
 
-// A next call that read the run as running can reach EnqueueVerify after finish has moved the run
+// A next call that read the run as running can reach enqueueVerify after finish has moved the run
 // on. Once the run is finishing (or done) nothing may add work to it: those rows could never be
 // handed out or committed, and a later finish would refuse for ever because of them.
 func TestEnqueueVerifyInsertsNothingIntoARunThatIsNotRunning(t *testing.T) {
@@ -36,7 +36,7 @@ func TestEnqueueVerifyInsertsNothingIntoARunThatIsNotRunning(t *testing.T) {
 			t.Fatal(err)
 		}
 		spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: ids.SHA256Hex([]byte("late"))}
-		if err := r.EnqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil {
+		if _, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil {
 			t.Fatalf("%s: a late enqueue is not an error, it simply adds nothing: %v", state, err)
 		}
 		if n := verifyItems(t, r, run.ID); n != 0 {
@@ -46,7 +46,7 @@ func TestEnqueueVerifyInsertsNothingIntoARunThatIsNotRunning(t *testing.T) {
 	// The same call on a running run still queues the item.
 	r, _, run := extractedRig(t)
 	spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: ids.SHA256Hex([]byte("on time"))}
-	if err := r.EnqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil || verifyItems(t, r, run.ID) != 1 {
+	if _, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil || verifyItems(t, r, run.ID) != 1 {
 		t.Fatalf("a running run takes the item: %v", err)
 	}
 }
