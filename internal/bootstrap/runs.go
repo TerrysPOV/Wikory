@@ -55,17 +55,18 @@ type Usage struct {
 }
 
 // MaxUsageTokens bounds what one submission may claim to have cost. It is far above any real
-// item and far below anything that could overflow a counter.
+// item and far below anything that could overflow a counter. It is compared as an int64, so
+// the package builds where int is 32 bits wide.
 const MaxUsageTokens = 1 << 31
 
 // ErrBadUsage is what a usage figure outside 0..MaxUsageTokens is refused with.
-var ErrBadUsage = errors.New("bootstrap: usage figures must be between 0 and 2147483648 tokens")
+var ErrBadUsage = fmt.Errorf("bootstrap: usage figures must be between 0 and %d tokens", int64(MaxUsageTokens))
 
 // Check refuses usage the driver asserts that cannot be real. The figures feed the cost the
 // go-ahead rests on, so a negative one must never lower them.
 func (u Usage) Check() error {
 	for _, n := range [...]int{u.InputTokens, u.OutputTokens} {
-		if n < 0 || n > MaxUsageTokens {
+		if n < 0 || int64(n) > MaxUsageTokens {
 			return ErrBadUsage
 		}
 	}

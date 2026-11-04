@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -175,6 +176,12 @@ func TestSubmitRefusesUsageThatIsNegativeOrAbsurdBeforeStoringAnything(t *testin
 	}
 }
 
+func TestTheBadUsageMessageNamesTheBound(t *testing.T) {
+	if want := strconv.FormatInt(MaxUsageTokens, 10); !strings.Contains(ErrBadUsage.Error(), want) {
+		t.Fatalf("the message must name the bound %s: %v", want, ErrBadUsage)
+	}
+}
+
 func TestUsageCheckAcceptsTheBoundsAndNothingBeyond(t *testing.T) {
 	for _, u := range []Usage{{}, {InputTokens: MaxUsageTokens, OutputTokens: MaxUsageTokens}} {
 		if err := u.Check(); err != nil {
@@ -205,13 +212,17 @@ func TestSubmitReturnsAnInfrastructureFailureAndChangesNothing(t *testing.T) {
 	ctx := context.Background()
 	s := newSubmitRig(t)
 	infra := errors.New("git: exit status 128: fatal: unable to read tree")
+	// The first claim is rejected by CheckProposal before the second reaches the validator and
+	// fails there, so a report built so far would already hold a reject that was never recorded.
+	badLocator := ProposedClaim{Text: "Handlers may run twice after a crash.", Kind: "current-impl",
+		Excerpt: "acknowledged only after the handler returns", Locator: "L99-L99"}
 	rep, err := Submit(ctx, SubmitInput{Runs: s.r, Env: failingEnv{envWith("docs/decisions/0001.md"), infra}, Work: s.w, Mint: ids.NewULID, Batch: s.batch,
-		P: Proposal{Item: s.item.ID, Epoch: s.item.Epoch, Claims: []ProposedClaim{good()}, Usage: Usage{InputTokens: 1000, OutputTokens: 100}}})
+		P: Proposal{Item: s.item.ID, Epoch: s.item.Epoch, Claims: []ProposedClaim{badLocator, good()}, Usage: Usage{InputTokens: 1000, OutputTokens: 100}}})
 	if !errors.Is(err, infra) {
 		t.Fatalf("an infrastructure failure is returned, not turned into a reject: %v", err)
 	}
-	if rep.Requeued || len(rep.Rejected) != 0 {
-		t.Fatalf("nothing was judged, so nothing is rejected or requeued: %+v", rep)
+	if rep.Requeued || rep.Accepted != 0 || len(rep.Rejected) != 0 || len(rep.Findings) != 0 || rep.Rejected == nil || rep.Findings == nil {
+		t.Fatalf("nothing was judged, so nothing is rejected or requeued and the report is empty: %+v", rep)
 	}
 	it, _ := s.r.Item(ctx, s.item.ID)
 	run, _ := s.r.Get(ctx, s.run.ID)
@@ -225,8 +236,9 @@ func TestSubmitReturnsAnInfrastructureFailureAndChangesNothing(t *testing.T) {
 	}
 }
 
-// What a validator refusal says can carry text the subagent chose (an evidence path, say), so
-// Safe is the last thing between it and the working agent's transcript.
+// Evidence paths are chosen by the binary, so a secret shape should never reach a validator
+// refusal. This is defence in depth: if one ever did, Safe is the last thing between the
+// message and the working agent's transcript.
 func TestSubmitRedactsASecretShapeInAValidatorRefusal(t *testing.T) {
 	s := newSubmitRig(t)
 	key := "AK" + "IAABCDEFGHIJKLMNOP"

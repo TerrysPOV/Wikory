@@ -67,6 +67,9 @@ func TestCheckProposalRejections(t *testing.T) {
 		{"spaced underscore thematic break", mut(func(c *ProposedClaim) { c.Text = "_ _ _" }), "bad-text"},
 		{"link reference definition", mut(func(c *ProposedClaim) { c.Text = "[ref]: https://example.com/page" }), "bad-text"},
 		{"link reference definition with spaces", mut(func(c *ProposedClaim) { c.Text = "[some ref]: /docs/page.md" }), "bad-text"},
+		{"link reference definition with an escaped bracket in the label", mut(func(c *ProposedClaim) { c.Text = `[a\]b]: http://x` }), "bad-text"},
+		{"link reference definition, short", mut(func(c *ProposedClaim) { c.Text = "[x]: y" }), "bad-text"},
+		{"link reference definition, empty destination", mut(func(c *ProposedClaim) { c.Text = "[ref]:" }), "bad-text"},
 		{"line separator", mut(func(c *ProposedClaim) { c.Text = "Jobs are\u2028acknowledged late." }), "bad-text"},
 		{"paragraph separator", mut(func(c *ProposedClaim) { c.Text = "Jobs are\u2029acknowledged late." }), "bad-text"},
 		{"empty text", mut(func(c *ProposedClaim) { c.Text = "  " }), "bad-text"},
@@ -110,6 +113,10 @@ func TestCheckTextStillAcceptsProseThatOnlyLooksLikeAMarker(t *testing.T) {
 		"_internal helpers are private to the package.",
 		"[draft] is the status a new claim starts in.",
 		"Underscores such as ___ are not a rule when they sit inside a sentence.",
+		"The [config] file lives in the data directory.",
+		"[draft] is a status and [final] is another, with a colon here: it is prose.",
+		"A claim that ends with a bracket [x] and no definition.",
+		"The key[0]: first entry is the default, which only a leading bracket would make a definition.",
 	} {
 		if code, why := CheckText(text); code != "" {
 			t.Errorf("%q was refused (%s: %s)", text, code, why)

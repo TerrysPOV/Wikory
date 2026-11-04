@@ -157,8 +157,9 @@ func Submit(ctx context.Context, in SubmitInput) (SubmitReport, error) {
 		if err != nil {
 			if !IsRefusal(err) {
 				// A git or environment failure says nothing about the claim: leave the item leased
-				// and untouched so the same submission can be retried.
-				return rep, err
+				// and untouched so the same submission can be retried. Nothing was recorded, so the
+				// report must not name rejects (earlier ones included) that a retry would count again.
+				return SubmitReport{Item: it.ID, Rejected: []Reject{}, Findings: []string{}}, err
 			}
 			rep.Rejected = append(rep.Rejected, Reject{Index: a.Index, Code: "validator", Why: Safe(err.Error())})
 			continue

@@ -56,10 +56,17 @@ var (
 	badLead  = regexp.MustCompile("^\\s{0,3}([#>*+|-]|[0-9]+[.)]|```|~~~|<)")
 	inlineHT = regexp.MustCompile(`<[A-Za-z/!?]`)
 	// underscoreRule is a thematic break written with underscores, which badLead does not cover.
-	underscoreRule = regexp.MustCompile(`^ {0,3}(_[ \t]*){3,}$`)
-	// linkRefDef is a link reference definition, which a renderer swallows instead of showing.
-	linkRefDef = regexp.MustCompile(`^ {0,3}\[[^\]]*\]:`)
+	// CheckText has already refused leading space, so no indent is allowed for.
+	underscoreRule = regexp.MustCompile(`^(_[ \t]*){3,}$`)
 )
+
+// startsLinkDefinition reports text that could be read as a link reference definition, which a
+// renderer swallows instead of showing. CommonMark's label rules (escaped brackets, nesting) are
+// too fiddly to follow exactly, so any text that opens with "[" and has "]:" anywhere after it
+// is refused. Ordinary prose that merely opens with a bracket has no "]:" and passes.
+func startsLinkDefinition(t string) bool {
+	return strings.HasPrefix(t, "[") && strings.Contains(t, "]:")
+}
 
 // CheckText is the shared rule for claim text, used for extracted claims and for the corrected
 // claim of a contradicting verdict. It returns an empty code when the text is acceptable.
@@ -79,7 +86,7 @@ func CheckText(t string) (code, why string) {
 		return "bad-text", "the text has leading or trailing whitespace"
 	case strings.Contains(t, "<!--") || strings.Contains(t, "-->"):
 		return "bad-text", "the text contains comment markers"
-	case badLead.MatchString(t) || underscoreRule.MatchString(t) || linkRefDef.MatchString(t):
+	case badLead.MatchString(t) || underscoreRule.MatchString(t) || startsLinkDefinition(t):
 		return "bad-text", "the text would render as a heading, quote, list, table, rule, link definition or code, not a paragraph"
 	case inlineHT.MatchString(t):
 		return "bad-text", "the text contains inline HTML, which the index would drop"
