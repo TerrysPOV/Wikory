@@ -15645,6 +15645,16 @@ git commit -m "feat: add the bootstrap cost gate with a hash-gated sample and co
 
 ---
 
+#### Final whole-branch review fixes (2026-11-04)
+
+- `confirm --sample` was checked against the plan hash (final review D4): the hash and HEAD checks come before the sample branch, so a sample start needs the exact hash as the full confirm does. `TestConfirmSampleNeedsTheExactPlanHash` (`05fbe80`) pins it; nothing in the code changed.
+- The repository-moved message is `errRepoMoved(run.Head, head)` (`f24ed34`), shared with submit and finish; the `if head != run.Head {` line is unchanged.
+- The rebuilt plan hash now covers what Task 6's fixes added (hash version 3, header bytes in the digest estimate, empty components skipped); a run planned with an older binary fails confirm with "plan again", as the existing rule says.
+
+Run: `scripts/inject.sh internal/app/bootstrap_confirm.go '	if hash != run.PlanHash {' '	if hash != run.PlanHash && len(fl["sample"]) == 0 {' ./internal/app/ 'TestConfirmSampleNeedsTheExactPlanHash' 'must be refused'`
+
+Expected: exits 0 (RED).
+
 ### Task 15: Plugin command, agents and the prompt-injection fixture
 
 **Files:**
