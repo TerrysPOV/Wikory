@@ -83,9 +83,10 @@ func Inventory(ctx context.Context, readers []Reader, opt Options) (Result, erro
 		if s.Disposition != "" {
 			continue // a reader already recorded why this was not read
 		}
-		if hasControl(s.Path) {
-			// A name with a newline or other control character could forge a digest header, so it
-			// is recorded and never read or queued.
+		if hasControl(s.Path) || unconfinable(s.Path) {
+			// A name with a newline or other control character could forge a digest header, and one
+			// the page and evidence code cannot confine (see unconfinable) would fail every claim
+			// drawn from it after the work was paid for, so it is recorded and never read or queued.
 			s.Disposition = DispBadName
 		} else if spans := redact.Scan(s.Path); len(spans) > 0 {
 			s.Disposition, s.SecretSpans = "skipped:secret", len(spans) // a secret in a name would reach every digest header

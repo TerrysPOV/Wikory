@@ -35,6 +35,16 @@ func hasControl(p string) bool {
 	return strings.IndexFunc(p, unicode.IsControl) >= 0
 }
 
+// unconfinable reports a path that confine.Split refuses on every platform: one holding a
+// backslash, or with a colon as its second byte (it reads as a drive letter). Git allows both in
+// a file name, but evidence for a claim is resolved through confine, so every claim from such a
+// file would be refused after its extraction was paid for. The platform-specific reserved names
+// confine also refuses are left out, so the inventory, and the plan hash, are the same on every
+// platform.
+func unconfinable(p string) bool {
+	return strings.ContainsRune(p, '\\') || (len(p) >= 2 && p[1] == ':')
+}
+
 // visiblePath is a path with each control character shown as "?", safe to list.
 func visiblePath(p string) string {
 	return strings.Map(func(r rune) rune {
