@@ -16317,7 +16317,7 @@ Fix round 1 was committed as `fix: make confirm a prompted step, correct the sam
 
 **Files:**
 - Modify: `scripts/exit-checks.sh`
-- Create: `internal/app/bootstrap_kill_test.go`, `docs/superpowers/notes/2026-11-bootstrap-dry-run.md`
+- Create: `internal/app/bootstrap_kill_test.go`, `internal/app/bootstrap_kill_unix_test.go`, `internal/app/bootstrap_kill_windows_test.go`, `docs/superpowers/notes/2026-11-bootstrap-dry-run.md`
 - Test: the checks themselves
 
 **Interfaces:**
@@ -16326,7 +16326,9 @@ Fix round 1 was committed as `fix: make confirm a prompted step, correct the sam
 
 - [ ] **Step 1: Write the kill test**
 
-A kill must be a real one. `publish`'s own tests re-run the test binary as a child that kills itself at a named step (`internal/publish/kill_test.go`); an in-process `panic` and `recover` would still run deferred cleanup, which a dead process does not. This test does the same for `finish`, at the publisher's journal steps and at the three places bootstrap itself can die: between publishing jobs, after the last job but before the page hashes are recorded, and after they are recorded.
+A kill must be a real one. `publish`'s own tests re-run the test binary as a child that kills itself at a named step (`internal/publish/kill_test.go`); an in-process `panic` and `recover` would still run deferred cleanup, which a dead process does not. This test does the same for `finish`, at the publisher's journal steps and at the places bootstrap itself can die: before anything is published, between publishing jobs, after the last job but before the page hashes are recorded, and after they are recorded.
+
+Three properties keep the proof from being vacuous (fix round 1, below). The parent accepts only a child that SIGKILL ended (exit code 77 on Windows): `ExitCode() == -1` is also what a child that never started or died by another signal reports, and the old `out, _ := cmd.CombinedOutput()` threw the start error away. The child writes a marker file naming the step immediately before it kills itself, and the parent asserts it. And the temporary and backup file assertion only has something to find when a page is replaced, which a first bootstrap never does (every page is new), so a second test finishes a first bootstrap, plans a second and kills inside the replace of an earlier page.
 
 `internal/app/bootstrap_kill_test.go`:
 
@@ -16334,12 +16336,14 @@ A kill must be a real one. `publish`'s own tests re-run the test binary as a chi
 package app
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -16356,14 +16360,46 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// dieAt writes the step it died at to the marker file the parent named, then kills the process.
+// The marker is written immediately before the kill, so the parent can tell a helper that was
+// killed at the named step from one that died, or never started, for any other reason. If the
+// marker cannot be written the helper exits with a code that is not a kill (78), so the parent
+// fails instead of trusting a kill it cannot confirm.
+func dieAt(step string) {
+	if err := os.WriteFile(os.Getenv("WIKORY_KILL_MARKER"), []byte(step), 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, "kill marker:", err)
+		os.Exit(78)
+	}
+	killSelf()
+}
+
 // finishHelper runs `wikory bootstrap finish` on the fixture the parent built and kills itself
-// at the step in WIKORY_KILL_AT, with no deferred call run.
+// at the step in WIKORY_KILL_AT, with no deferred call run. A step of the form "confine:S:N"
+// dies at the Nth (from zero) time confine's replace reports step S, which is how a kill lands
+// in the middle of replacing a page that already exists.
 func finishHelper() int {
 	at := os.Getenv("WIKORY_KILL_AT")
 	hook := func(step string) {
 		if step == at {
-			killSelf()
+			dieAt(at)
 		}
+	}
+	if parts := strings.Split(at, ":"); len(parts) == 3 && parts[0] == "confine" {
+		want, err := strconv.Atoi(parts[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "kill step", at, "has no valid count:", err)
+			return 79
+		}
+		seen := 0
+		confine.SetStepHook(func(s string) {
+			if s != parts[1] {
+				return
+			}
+			if seen == want {
+				dieAt(at)
+			}
+			seen++
+		})
 	}
 	publish.SetKillHook(hook)
 	killPoint = hook
@@ -16380,15 +16416,18 @@ func finishHelper() int {
 	return 0 // reached only if the step was never hit
 }
 
-// finishBoundaries are the places a finish can die. The first five are the publisher's own
-// journal steps in the first job (names from internal/publish/kill_test.go); the rest are
-// bootstrap's. rerun says whether finishing again is still allowed: after "marked-done" the run
-// is already done, so the check is that everything is complete and finish refuses.
+// finishBoundaries are the places a finish can die. "checked" and "planned" are bootstrap's,
+// before anything is published (the run is already finishing at "planned"). The next ten are the
+// publisher's own journal steps in the first job (names from internal/publish/kill_test.go); the
+// rest are bootstrap's. rerun says whether finishing again is still allowed: after "marked-done"
+// the run is already done, so the check is that everything is complete and finish refuses.
 var finishBoundaries = []struct {
 	step  string
 	rerun bool
 }{
-	{"manifest", true}, {"applied-0", true}, {"marked-0", true}, {"dbmarked-0", true}, {"applied-1", true},
+	{"checked", true}, {"planned", true}, {"locked", true}, {"staged", true}, {"manifest", true},
+	{"applied-0", true}, {"marked-0", true}, {"dbmarked-0", true}, {"applied-1", true},
+	{"appended", true}, {"logged", true}, {"committed", true},
 	{"after-job-0", true}, {"after-job-1", true}, {"before-record", true}, {"recorded", true}, {"marked-done", false},
 }
 
@@ -16405,13 +16444,114 @@ func killFinishAt(t *testing.T, dir string, c *cli, run, step string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	marker := filepath.Join(t.TempDir(), "kill-marker") // outside the repository, so it cannot dirty it
 	cmd := exec.Command(exe, "-test.run=^$")
 	cmd.Env = append(os.Environ(), "WIKORY_TEST_ROLE=bootstrap-finish-helper", "WIKORY_KILL_AT="+step,
-		"WIKORY_TEST_DATA="+c.dataDir, "WIKORY_TEST_REPO="+dir, "WIKORY_TEST_RUN="+run)
-	out, _ := cmd.CombinedOutput()
-	if cmd.ProcessState.ExitCode() != killedExitCode {
-		t.Fatalf("step %s: the helper was not killed (exit %d): %s", step, cmd.ProcessState.ExitCode(), out)
+		"WIKORY_KILL_MARKER="+marker, "WIKORY_TEST_DATA="+c.dataDir, "WIKORY_TEST_REPO="+dir, "WIKORY_TEST_RUN="+run)
+	out, err := cmd.CombinedOutput()
+	// Only a real kill counts: a helper that never started, exited by itself or died by another
+	// signal would leave a finish that was never interrupted, and the rerun would trivially pass.
+	if !diedByTheKill(err) {
+		t.Fatalf("step %s: the helper was not killed (%v): %s", step, err, out)
 	}
+	got, rerr := os.ReadFile(marker)
+	if rerr != nil {
+		t.Fatalf("step %s: the helper died but left no kill marker, so it was not killed at that step (%v): %s", step, rerr, out)
+	}
+	if string(got) != step {
+		t.Fatalf("step %s: the helper died at %q, not at the named step: %s", step, got, out)
+	}
+}
+
+// assertFinishConverges is what must hold once a finish of run was killed at step: a rerun
+// completes without taking a page this very bootstrap wrote for a person's edit (or, when the
+// kill came after the run was marked done, finish refuses), the repository holds exactly the pages
+// in want and no temporary or backup file, every page is recorded with the hash of what is on
+// disk, the run is done, and a further bootstrap sees every page as an earlier output of Wikory.
+func assertFinishConverges(t *testing.T, dir string, c *cli, run, step string, rerun bool, want []string) {
+	t.Helper()
+	if rerun {
+		e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
+		if code != ExitOK || !e.OK {
+			t.Fatalf("finish after a kill at %s: %d %+v", step, code, e)
+		}
+		for _, p := range decodeData[finishPages](t, e).Pages {
+			if p.Outcome == "conflict" {
+				t.Fatalf("%s: a page this very bootstrap wrote was taken for a person's edit", p.Path)
+			}
+		}
+	} else if e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run); code == ExitOK || e.OK {
+		t.Fatal("a run that was marked done before the kill cannot be finished again")
+	}
+	// Exactly the expected pages: none lost, none duplicated, no temporary or backup file.
+	base := filepath.Join(dir, "project-memory", "wiki", "bootstrap")
+	ents, err := os.ReadDir(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, en := range ents {
+		if strings.HasPrefix(en.Name(), confine.TempPrefix) || strings.HasPrefix(en.Name(), confine.BackupPrefix) {
+			t.Fatalf("temporary or backup file left behind: %s", en.Name())
+		}
+		got = append(got, en.Name())
+	}
+	sort.Strings(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("pages after recovery = %v, want %v", got, want)
+	}
+	// Every page is recorded with the hash of what is on disk, or the next bootstrap would call
+	// it a person's edit.
+	db := openTestDB(t, c)
+	defer db.Close()
+	for _, name := range got {
+		rel := "project-memory/wiki/bootstrap/" + name
+		data, err := os.ReadFile(filepath.Join(base, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var h string
+		if err := db.QueryRow(`SELECT hash FROM bs_pages WHERE path=?`, rel).Scan(&h); err != nil || h != publish.HashContent(data) {
+			t.Fatalf("%s: the recorded hash must match the file on disk: %q %v", rel, h, err)
+		}
+	}
+	st, _, _ := runBootstrapJSON(t, c, dir, "status", "--run", run)
+	if decodeData[struct {
+		Run struct {
+			State string `json:"state"`
+		} `json:"run"`
+	}](t, st).Run.State != "done" {
+		t.Fatalf("the run should be done: %+v", st)
+	}
+	// A further bootstrap sees every page as its own earlier output.
+	pe, _, _ := runBootstrapJSON(t, c, dir, "plan")
+	next := decodeData[planData](t, pe).RunID
+	forceState(t, c, next, "running")
+	forceItemsClosed(t, c, next)
+	e2, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", next)
+	if code != ExitOK {
+		t.Fatalf("second bootstrap: %d %+v", code, e2)
+	}
+	for _, p := range decodeData[finishPages](t, e2).Pages {
+		if p.Outcome == "conflict" {
+			t.Fatalf("%s: the second bootstrap took the first one's page for a person's edit", p.Path)
+		}
+	}
+}
+
+// pageNames lists the file names under the baseline directory, sorted.
+func pageNames(t *testing.T, dir string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(filepath.Join(dir, "project-memory", "wiki", "bootstrap"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, en := range ents {
+		names = append(names, en.Name())
+	}
+	sort.Strings(names)
+	return names
 }
 
 func TestFinishSurvivesAProcessKillAtEveryBoundary(t *testing.T) {
@@ -16435,73 +16575,53 @@ func TestFinishSurvivesAProcessKillAtEveryBoundary(t *testing.T) {
 			dir, c, run := finishedRunInputs(t)
 			forceItemsClosed(t, c, run)
 			killFinishAt(t, dir, c, run, b.step)
-			if b.rerun {
-				e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
-				if code != ExitOK || !e.OK {
-					t.Fatalf("finish after a kill at %s: %d %+v", b.step, code, e)
-				}
-				for _, p := range decodeData[finishPages](t, e).Pages {
-					if p.Outcome == "conflict" {
-						t.Fatalf("%s: a page this very bootstrap wrote was taken for a person's edit", p.Path)
-					}
-				}
-			} else if e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run); code == ExitOK || e.OK {
-				t.Fatal("a run that was marked done before the kill cannot be finished again")
-			}
-			// Exactly the expected pages: none lost, none duplicated, no temporary or backup file.
-			base := filepath.Join(dir, "project-memory", "wiki", "bootstrap")
-			ents, err := os.ReadDir(base)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var got []string
-			for _, en := range ents {
-				if strings.HasPrefix(en.Name(), confine.TempPrefix) || strings.HasPrefix(en.Name(), confine.BackupPrefix) {
-					t.Fatalf("temporary or backup file left behind: %s", en.Name())
-				}
-				got = append(got, en.Name())
-			}
-			sort.Strings(got)
-			if !slices.Equal(got, want) {
-				t.Fatalf("pages after recovery = %v, want %v", got, want)
-			}
-			// Every page is recorded with the hash of what is on disk, or the next bootstrap
-			// would call it a person's edit.
-			db := openTestDB(t, c)
-			defer db.Close()
-			for _, name := range got {
-				rel := "project-memory/wiki/bootstrap/" + name
-				data, err := os.ReadFile(filepath.Join(base, name))
-				if err != nil {
-					t.Fatal(err)
-				}
-				var h string
-				if err := db.QueryRow(`SELECT hash FROM bs_pages WHERE path=?`, rel).Scan(&h); err != nil || h != publish.HashContent(data) {
-					t.Fatalf("%s: the recorded hash must match the file on disk: %q %v", rel, h, err)
-				}
-			}
-			st, _, _ := runBootstrapJSON(t, c, dir, "status", "--run", run)
-			if decodeData[struct {
-				Run struct {
-					State string `json:"state"`
-				} `json:"run"`
-			}](t, st).Run.State != "done" {
-				t.Fatalf("the run should be done: %+v", st)
-			}
-			// A second bootstrap sees every page as its own earlier output.
-			pe, _, _ := runBootstrapJSON(t, c, dir, "plan")
-			run2 := decodeData[planData](t, pe).RunID
-			forceState(t, c, run2, "running")
-			forceItemsClosed(t, c, run2)
-			e2, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run2)
-			if code != ExitOK {
-				t.Fatalf("second bootstrap: %d %+v", code, e2)
-			}
-			for _, p := range decodeData[finishPages](t, e2).Pages {
-				if p.Outcome == "conflict" {
-					t.Fatalf("%s: the second bootstrap took the first one's page for a person's edit", p.Path)
-				}
-			}
+			assertFinishConverges(t, dir, c, run, b.step, b.rerun, want)
+		})
+	}
+}
+
+// replaceBoundaries are kills inside confine's move-aside replace, which only happens when the
+// page already exists. The fixture's second bootstrap replaces two pages, so N is 0 or 1; the Nth
+// replace of the child process dies after its move-aside, after the
+// comparison, or after the install (when the live page, a backup and the staged temporary all
+// still exist).
+var replaceBoundaries = []string{
+	"confine:moved:0", "confine:compared:0", "confine:installed:0",
+	"confine:moved:1", "confine:installed:1",
+}
+
+// secondBootstrapInputs finishes a first bootstrap, then plans a second one whose items are all
+// closed with no claims, so that its render differs from the first and finishing it replaces
+// pages the first one wrote.
+func secondBootstrapInputs(t *testing.T) (string, *cli, string) {
+	t.Helper()
+	dir, c, run := finishedRunInputs(t)
+	forceItemsClosed(t, c, run)
+	if e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run); code != ExitOK {
+		t.Fatalf("first bootstrap: %d %+v", code, e)
+	}
+	pe, _, _ := runBootstrapJSON(t, c, dir, "plan")
+	run2 := decodeData[planData](t, pe).RunID
+	forceState(t, c, run2, "running")
+	forceItemsClosed(t, c, run2)
+	return dir, c, run2
+}
+
+func TestASecondBootstrapFinishSurvivesAKillInsideAReplaceOfAnEarlierPage(t *testing.T) {
+	cdir, cc, crun := secondBootstrapInputs(t)
+	first := pageNames(t, cdir)
+	if e, code, _ := runBootstrapJSON(t, cc, cdir, "finish", "--run", crun); code != ExitOK {
+		t.Fatalf("control second finish: %d %+v", code, e)
+	}
+	want := pageNames(t, cdir)
+	if len(want) < len(first) {
+		t.Fatalf("a second bootstrap does not delete pages: %v then %v", first, want)
+	}
+	for _, step := range replaceBoundaries {
+		t.Run(step, func(t *testing.T) {
+			dir, c, run := secondBootstrapInputs(t)
+			killFinishAt(t, dir, c, run, step)
+			assertFinishConverges(t, dir, c, run, step, true, want)
 		})
 	}
 }
@@ -16515,13 +16635,51 @@ func TestFinishSurvivesAProcessKillAtEveryBoundary(t *testing.T) {
 package app
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"syscall"
+	"testing"
 )
 
-const killedExitCode = -1
-
 func killSelf() { _ = syscall.Kill(os.Getpid(), syscall.SIGKILL); select {} }
+
+// diedByTheKill says whether the error Wait returned for a child means that the child was ended
+// by SIGKILL. Anything else is not a kill: no error (it exited 0), no error value that carries a
+// process state (it never started), a plain exit code, or any other signal. The old test took
+// every exit code of -1 for a kill, and -1 is also what ExitCode reports for a child that never
+// started and for one that died by SIGTERM, so a helper that never ran passed.
+func diedByTheKill(err error) bool {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return false
+	}
+	ws, ok := ee.ProcessState.Sys().(syscall.WaitStatus)
+	return ok && ws.Signaled() && ws.Signal() == syscall.SIGKILL
+}
+
+// TestKillClassifierAcceptsOnlyARealSIGKILL pins how strict the kill test is, so the strictness
+// cannot regress without this test going red. Each case is a real child process.
+func TestKillClassifierAcceptsOnlyARealSIGKILL(t *testing.T) {
+	sh := func(script string) error { return exec.Command("sh", "-c", script).Run() }
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"no error", nil, false},
+		{"exit 0", sh("exit 0"), false},
+		{"plain exit 1", sh("exit 1"), false},
+		{"a child that never started", exec.Command("/nonexistent/wikory-kill-test-helper").Run(), false},
+		{"SIGTERM", sh("kill -TERM $$"), false},
+		{"SIGKILL", sh("kill -KILL $$"), true},
+	}
+	for _, c := range cases {
+		if got := diedByTheKill(c.err); got != c.want {
+			t.Errorf("%s: diedByTheKill(%v) = %v, want %v", c.name, c.err, got, c.want)
+		}
+	}
+}
 ```
 
 `internal/app/bootstrap_kill_windows_test.go`:
@@ -16529,21 +16687,64 @@ func killSelf() { _ = syscall.Kill(os.Getpid(), syscall.SIGKILL); select {} }
 ```go
 //go:build windows
 
+// The Windows leg of the kill test has been compiled and vetted (GOOS=windows go vet and go test
+// -c) but never run: no Windows machine was available when it was written. A kill there is
+// os.Exit(77), which runs no deferred call but is not a signal. Run it on windows-latest in CI
+// before relying on it.
+
 package app
 
-import "os"
+import (
+	"errors"
+	"os"
+	"os/exec"
+	"testing"
+)
 
 const killedExitCode = 77
 
-func killSelf() { os.Exit(77) }
+func killSelf() { os.Exit(killedExitCode) }
+
+// diedByTheKill says whether the error Wait returned for a child means that the child exited
+// with the code killSelf uses. No error, a child that never started and any other exit code are
+// not a kill.
+func diedByTheKill(err error) bool {
+	var ee *exec.ExitError
+	return errors.As(err, &ee) && ee.ExitCode() == killedExitCode
+}
+
+// TestKillClassifierAcceptsOnlyARealSIGKILL pins how strict the kill test is. The name is shared
+// with the unix leg so that one exit check names both; here the kill is exit code 77.
+func TestKillClassifierAcceptsOnlyARealSIGKILL(t *testing.T) {
+	cmd := func(script string) error { return exec.Command("cmd", "/c", script).Run() }
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"no error", nil, false},
+		{"exit 0", cmd("exit 0"), false},
+		{"plain exit 1", cmd("exit 1"), false},
+		{"a child that never started", exec.Command(`C:\nonexistent\wikory-kill-test-helper.exe`).Run(), false},
+		{"exit 78", cmd("exit 78"), false},
+		{"exit 77", cmd("exit 77"), true},
+	}
+	for _, c := range cases {
+		if got := diedByTheKill(c.err); got != c.want {
+			t.Errorf("%s: diedByTheKill(%v) = %v, want %v", c.name, c.err, got, c.want)
+		}
+	}
+}
 ```
 
-A step name that a fixture this size cannot reach makes the helper exit normally, and the test says so ("the helper was not killed"); drop that step rather than weaken the check. `maxOpsPerJob` is a variable (Task 13) so the helper can force three jobs of two pages.
+The Windows leg has been compiled and vetted (`GOOS=windows go vet ./internal/app/` and `go test -c`) but never run; the file says so at its top.
+
+A step name that a fixture this size cannot reach makes the helper exit normally, and the test says so ("the helper was not killed"); drop that step rather than weaken the check. The replace test's step names (`confine:S:N`, the Nth call of confine's step S) stop at `installed:1` for the same reason: the fixture replaces two pages. `maxOpsPerJob` is a variable (Task 13) so the helper can force three jobs of two pages.
 
 - [ ] **Step 2: Run it**
 
-Run: `go test ./internal/app/ -run TestFinishSurvivesAProcessKillAtEveryBoundary -count=1 -v`
-Expected: PASS for each boundary. A `conflict` outcome on the rerun means `PlanOps` or the recording of unchanged pages (Task 13) lost a page this bootstrap wrote itself; check that `RenderPages` is deterministic across the two runs (`Date` must come from `run.CreatedAt`, not the clock).
+Run: `go test ./internal/app/ -run 'TestFinishSurvivesAProcessKillAtEveryBoundary|TestASecondBootstrapFinishSurvivesAKillInsideAReplaceOfAnEarlierPage|TestKillClassifierAcceptsOnlyARealSIGKILL' -count=1 -v`
+Expected: PASS for each boundary (17 and 5 subtests) and for each classifier row. A `conflict` outcome on the rerun means `PlanOps` or the recording of unchanged pages (Task 13) lost a page this bootstrap wrote itself; check that `RenderPages` is deterministic across the two runs (`Date` must come from `run.CreatedAt`, not the clock).
 
 Prove the recovery assertions can fail:
 
@@ -16551,9 +16752,24 @@ Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'written[u] = publish.H
 Run: `scripts/inject.sh internal/bootstrap/pages.go 'if cur == publish.HashContent(pg.Content) {' 'if false {' ./internal/app/ 'TestFinishSurvivesAProcessKillAtEveryBoundary' 'this very bootstrap wrote'`
 Expected: each exits 0 (RED). The first stops pages that a killed finish had already written from being recorded on the rerun; the second makes the rerun take them for a person's edits.
 
+Prove the kill itself is checked (fix round 1; each exits 0 and prints "RED as predicted", and a mutation that does not compile exits 2 and must be rewritten). In the `internal/app/bootstrap_kill_unix_test.go` rows `U`, in `internal/app/bootstrap_kill_test.go` rows `K`; `T1` is `TestFinishSurvivesAProcessKillAtEveryBoundary`, `T2` the replace test and `T3` `TestKillClassifierAcceptsOnlyARealSIGKILL`:
+
+| Mutation | File | Test | Predicted failure text |
+|---|---|---|---|
+| accept any signal: `ws.Signaled() && ws.Signal() == syscall.SIGKILL` becomes `ws.Signaled()` | U | T3 | `SIGTERM: diedByTheKill(` |
+| accept any non-zero exit code | U | T3 | `plain exit 1: diedByTheKill(` |
+| a failed start counts as a kill (`return false` becomes `return err != nil` after `errors.As`) | U | T3 | `a child that never started: diedByTheKill(` |
+| the marker is never written | K | T1 | `left no kill marker` |
+| the marker names another step | K | T1 and T2 | `not at the named step` |
+| the helper dies by SIGTERM | U | T1 | `the helper was not killed` |
+| the helper exits 1 after writing the marker | K | T1 | `the helper was not killed` |
+| the helper never starts (`exe+"-missing"`) | K | T1 | `the helper was not killed` |
+| a bad step count is swallowed (`"confine:moved:x"`) | K | T2 | `has no valid count` |
+| `killPoint("before-record")` removed | `internal/app/bootstrap_finish.go` | T1 | `the helper was not killed` |
+
 - [ ] **Step 3: Add the stage 2 checks to `scripts/exit-checks.sh`**
 
-Insert before `exit $fail`:
+Insert before `exit $fail`. This block is the brief's, with the two names that review renames changed and the replace test added; the script itself grew to 113 lines of checks as the fix rounds added tests (grouped by label, one package per line), and `scripts/exit-checks.sh` is the list to trust:
 
 ```bash
 # Stage 2: bootstrap (design 2026-11-02).
@@ -16574,12 +16790,13 @@ check "human-edited pages never replaced (plan)" 'TestPlanOpsCreatesUnchangedAnd
 check "human-edited pages never replaced (finish)" 'TestFinishNeverOverwritesAHumanEditedPage' ./internal/app/
 check "coverage names skips, never text"        'TestCoverageReportsReadSkippedSecretsAndRetirement|TestCoverageNeverContainsSecretTextOrClaimText' ./internal/bootstrap/
 check "finish: complete, current, searchable"   'TestFinishPublishesPagesAndTheyAreSearchable|TestFinishRefusesWhenTheRepositoryMovedSinceThePlan' ./internal/app/
-check "finish survives a real process kill"     'TestFinishSurvivesAProcessKillAtEveryBoundary' ./internal/app/
+check "finish survives a real process kill"     'TestFinishSurvivesAProcessKillAtEveryBoundary|TestKillClassifierAcceptsOnlyARealSIGKILL' ./internal/app/
+check "kill inside a replace leaves no residue" 'TestASecondBootstrapFinishSurvivesAKillInsideAReplaceOfAnEarlierPage' ./internal/app/
 check "cost gate needs the plan hash"           'TestConfirmNeedsTheExactPlanHash|TestASampledRunNeedsTheSampleConfirmationFirst' ./internal/app/
 check "the sample is measured"                  'TestMeasureReportsDurationTokensAcceptanceAndAProjection' ./internal/bootstrap/
 check "plan prints no secret and refuses dirt"  'TestBootstrapPlanNeverPrintsSecretText|TestBootstrapPlanRefusesAFeatureBranchAndADirtyTree' ./internal/app/
-check "plugin agents are least privilege"       'TestExtractorAndVerifierAreLeastPrivilege|TestBootstrapCommandCanOnlyRunWikoryBootstrapAndKeepsItsSafetyRules' ./internal/app/
-check "hostile source text stays data"          'TestHostileSourceTextBecomesDataAndCannotRaiseAStatus' ./internal/app/
+check "plugin agents are least privilege"       'TestExtractorAndVerifierToolListsAreMinimal|TestBootstrapCommandKeepsItsSafetyRules' ./internal/app/
+check "hostile source text stays data"          'TestHostileSourceTextBecomesDataAndStaysUnverified' ./internal/app/
 check "progress: tty, stages, estimates"        'TestIsTTYIsFalseForBuffersAndTheNullDevice|TestProgressShowsStageNameAndAnEstimatedTimeLeft|TestProgressJSONCarriesStageAndLabelsTheEstimate' ./internal/app/
 check "origin frontmatter parses"               'TestPageOriginIsParsedAndNoLongerFlagged' ./internal/claim/
 check "model output is scanned, nothing echoed" 'TestCheckTextRefusesASecretAndNeverQuotesIt|TestSubmitRefusesAClaimThatCarriesASecretAndEchoesNothing|TestSubmitDoesNotRepeatAnItemIDItWasGiven|TestAContradictionCannotCarryASecretIntoTheWiki|TestAHostileEvidencePathIsNeverEchoed' ./internal/bootstrap/
@@ -16620,7 +16837,7 @@ time /tmp/wikory-dryrun/wikory bootstrap plan --sample 5
 
 Record in `docs/superpowers/notes/2026-11-bootstrap-dry-run.md`: the wall time of `plan`; the source counts by disposition; the component list with ranks; the estimates per stage and the batch count; whether any file was skipped for a secret (and that no secret text appeared in the output: `plan ... 2>&1 | rg -c 'hunter|AKIA|BEGIN'` should print 0 or nothing); and the plan hash. If `plan` takes more than 10 seconds on this repository, note the slowest stage; the cost is in `Inventory` reading every blob, and `PrepareWork` reading the queued ones again.
 
-Why the two extra commands: this repository commits its own `project-memory/`, and `init` records a pre-existing `project-memory/` as untrusted (there is no trust command until stage 1d), so the throwaway clone drops it first. A real project that has never run Wikory has none. When the plan was run this way on a scratch copy at the time of writing it printed 288 queued sources, 23 components (12 to be verified), 97 extract items and 12 verify items, about 189k input and 68k output tokens for extraction, 15 batches, in about 7 seconds, and skipped 16 files for secret-shaped text (this repository's own redaction tests and fixtures; expected here, worth a look elsewhere). Treat those as a reference point, not a target.
+Why the two extra commands: this repository commits its own `project-memory/`, and `init` records a pre-existing `project-memory/` as untrusted (there is no trust command until stage 1d), so the throwaway clone drops it first. A real project that has never run Wikory has none. When the plan was run this way on a scratch copy at the time of writing it printed 288 queued sources, 23 components (12 to be verified), 97 extract items and 12 verify items, about 189k input and 68k output tokens for extraction, 15 batches, in about 7 seconds, and skipped 16 files for secret-shaped text (this repository's own redaction tests and fixtures; expected here, worth a look elsewhere). Treat those as a reference point, not a target. Run again on the finished branch it printed about 200.7k input tokens, and every commit from the first with a `plan` command onwards gives the same figure, so the difference from the 189k is not a fix round's doing and is unexplained (see the dry-run note). Identifier values such as `max_tokens`, `tokenizer`, `BudgetTokens` match the assignment rule and the whole file is skipped as secret (fail closed); the coverage report lists these as `skipped:secret` with no marker for false positives; expect it on any codebase that handles LLM tokens. Six of the sixteen skipped files here are that class, not secrets (Known limit 21).
 
 Expected: the run completes (the clone is of `main`, so it holds stages 0 and 1a, and the binary is the one built from your branch), `Components` includes `internal/store`, `internal/app`, `plugins` and `scripts`, and `Sources` shows `project-memory/` as `skipped:wikory`. The clone must be on the default branch, which `-b main` ensures; bootstrap refuses any other branch.
 
@@ -16628,14 +16845,16 @@ Then remove the throwaway: `rm -rf /tmp/wikory-dryrun` (this directory is yours;
 
 - [ ] **Step 6: Windows**
 
-Run: push the branch (pushing is Terry's call; ask first) and read the CI matrix for `windows-latest` (ubuntu, macOS and Windows already run `go test ./...`). Expected: green. Tests that need symlinks (`TestDirReaderWalksThroughTheConfinedRootAndNeverFollowsLinks`) skip on Windows; `TestWorkFileIsRedactedPrivateAndReadable` skips its mode check on Windows. A Windows failure in `gitx` churn or tree listing is most likely path separators in `git` output: git prints forward slashes on every platform, so compare with `path`, never `filepath`, in `internal/bootstrap`.
+The Windows kill leg (`os.Exit(77)`) has been compiled and vetted only, never run. Run: push the branch (pushing is Terry's call; ask first) and read the CI matrix for `windows-latest` (ubuntu, macOS and Windows already run `go test ./...`). Expected: green. Tests that need symlinks (`TestDirReaderWalksThroughTheConfinedRootAndNeverFollowsLinks`) skip on Windows; `TestWorkFileIsRedactedPrivateAndReadable` skips its mode check on Windows. A Windows failure in `gitx` churn or tree listing is most likely path separators in `git` output: git prints forward slashes on every platform, so compare with `path`, never `filepath`, in `internal/bootstrap`.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add scripts/exit-checks.sh internal/app/bootstrap_kill_test.go docs/superpowers/notes/2026-11-bootstrap-dry-run.md
+git add scripts/exit-checks.sh internal/app/bootstrap_kill_test.go internal/app/bootstrap_kill_unix_test.go internal/app/bootstrap_kill_windows_test.go docs/superpowers/notes/2026-11-bootstrap-dry-run.md
 git commit -m "test: add stage 2 exit checks, a finish kill test and the dry run notes"
 ```
+
+**Fix round 1 (review findings).** (1) The exit check "finish survives a real process kill" did not list the replace test, the only test where the temporary and backup file assertion can fail; it now does, as its own labelled check, and the classifier test joins the first. (2) The kill proof could be vacuous: `killedExitCode = -1` is what `ExitCode()` also returns for a child that never started or died by another signal, and the start error was discarded. A child now counts as killed only if `diedByTheKill` says so (an `*exec.ExitError` whose wait status is SIGKILL on unix, exit code 77 on Windows); any other error is fatal with the child's output. `dieAt` writes a marker naming the step immediately before the kill and the parent asserts it, so the death is proved to be at the named step. `TestKillClassifierAcceptsOnlyARealSIGKILL` pins the classifier with real children (no error, exit 0, exit 1, a failed start, SIGTERM, SIGKILL). The strconv error of a `confine:S:N` step is reported, not swallowed. Every new assertion was shown to fail by `scripts/inject.sh` (table in Step 2). (3) Dry-run note: the six files skipped for token-named identifiers were judged from the matching line only, and the 189k against 200,696 token difference is recorded as unexplained after ruling out every commit from `cc981fb` on. (4) Identifier values such as `max_tokens`, `tokenizer`, `BudgetTokens` match the assignment rule and the whole file is skipped as secret (fail closed); the coverage report lists these as `skipped:secret` with no marker for false positives; expect it on any codebase that handles LLM tokens (Known limit 21). `internal/redact` was not changed: the scanner rule is Terry's call. The same `-1` pattern remains in `internal/publish/kill_test.go` and `internal/store/lock_test.go`; they were not in this task's scope.
 
 ---
 
@@ -16685,6 +16904,7 @@ Astra also checked and found sound, with no change: the plan-hash gate on every 
 18. **The sample does not run verification.** Design 4.5 says `--sample N` runs the real pipeline. Verification needs every extract item closed, so the sample (extract items only) cannot reach it, and the projection covers extraction only. Extending it means a second sampled set over inspected components and a `verify` branch in `settleSample`; it is a small change but it is a design call, so it is left for Terry. The plan's per-stage estimate is the only figure for verification until the full run's first verify batch.
 19. **A requeued verify item costs another verification.** If a verdict write finds a claim changed since it was read (`errClaimMoved`), nothing is written and the item is requeued. With one owner per claim this should not happen in normal use; it is the guard, not an expected path.
 20. **Files a digest leaves out are not in the coverage report.** `BuildDigest` drops a file that does not fit its size budget and lists it at the end of the digest text, but that list is not carried into the coverage report, so a component can show as inspected while some of its files were never summarised. The report's `NotExtracted` count covers whole components that were not inspected, not files cut from an inspected one. Recording the omitted paths per component is a small follow-up (a column on `bs_components`).
+21. **Identifier values that mention tokens are skipped as secret.** Identifier values such as `max_tokens`, `tokenizer`, `BudgetTokens` match the assignment rule and the whole file is skipped as secret (fail closed); the coverage report lists these as `skipped:secret` with no marker for false positives; expect it on any codebase that handles LLM tokens. The dry run on this repository lost six core files that way (`internal/store/schema.go`, `internal/app/project.go`, `internal/app/init_cmd.go`, `internal/app/briefing.go`, `internal/publish/publish.go`, `internal/spikes/fts5_spike_test.go`) from digests and extraction. Whether to treat a name that merely contains "token" as a key only when the value looks like one is a change to `internal/redact` and is Terry's call.
 
 ## Self-review
 
