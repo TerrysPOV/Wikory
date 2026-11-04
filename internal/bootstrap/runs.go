@@ -196,6 +196,24 @@ func (r *Runs) Roots(ctx context.Context, id string) (map[string]string, error) 
 	return out, err
 }
 
+// nextRemedy says what to do instead of asking a run in state for work. Only a run that a
+// confirm can still start is pointed at confirm.
+func nextRemedy(state string) string {
+	switch state {
+	case StatePlanned:
+		return "it has not been confirmed yet (wikory bootstrap confirm, after the person's yes to the plan)"
+	case StateAwaiting:
+		return "its sample is done: show the measurements and, after the person's yes, confirm the full run (wikory bootstrap confirm without --sample)"
+	case StateFinishing:
+		return "it is being finished: run wikory bootstrap finish"
+	case StateDone:
+		return "it is finished: wikory bootstrap status shows its report; plan again for a new baseline"
+	case StateAbandoned:
+		return "it was abandoned: plan again"
+	}
+	return "see wikory bootstrap status"
+}
+
 func boolInt(b bool) int {
 	if b {
 		return 1
@@ -280,7 +298,7 @@ func (r *Runs) Next(ctx context.Context, id string, max int) (Batch, error) {
 			return err
 		}
 		if run.State != StateSampling && run.State != StateRunning {
-			return fmt.Errorf("%w: the run is %s; work is handed out only while it is sampling or running (wikory bootstrap confirm)", ErrState, run.State)
+			return fmt.Errorf("%w: the run is %s; work is handed out only while it is sampling or running; %s", ErrState, run.State, nextRemedy(run.State))
 		}
 		restrict := boolInt(run.State == StateSampling)
 		cutoff := r.Now().Add(-LeaseTTL).UTC().Format(tsLayout)
