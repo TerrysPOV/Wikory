@@ -56,7 +56,7 @@ func bootstrapConfirm(ctx context.Context, env *Env, args []string) (Result, err
 		return Result{}, err
 	}
 	if head != run.Head {
-		return Result{}, &UsageError{Msg: fmt.Sprintf("the repository moved from %.12s to %.12s since this run was planned; the baseline describes the planned commit, so plan again", run.Head, head)}
+		return Result{}, errRepoMoved(run.Head, head)
 	}
 	sample := len(fl["sample"]) > 0
 	switch {

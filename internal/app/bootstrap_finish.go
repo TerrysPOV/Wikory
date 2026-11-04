@@ -63,7 +63,7 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 			// commit, so name the way out instead of refusing for ever.
 			return Result{}, &UsageError{Msg: fmt.Sprintf("the repository moved from %.12s to %.12s while this run was finishing, so it can never be finished; drop it with wikory bootstrap abandon --run %s, then plan again (pages it already wrote are still recognised as Wikory's own)", run.Head, head, run.ID)}
 		}
-		return Result{}, &UsageError{Msg: fmt.Sprintf("the repository moved from %.12s to %.12s since this run was planned; the baseline describes the planned commit, so plan again", run.Head, head)}
+		return Result{}, errRepoMoved(run.Head, head)
 	}
 	if cur := branchLabel(ctx, p); cur != run.Branch {
 		// The pages describe the default branch at the planned commit; a checkout on another

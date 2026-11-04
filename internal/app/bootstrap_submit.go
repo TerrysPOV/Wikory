@@ -36,6 +36,11 @@ type submitReport struct {
 	Status   string         `json:"status"`
 }
 
+// errRepoMoved is the refusal for a run whose repository has moved on from the planned commit.
+func errRepoMoved(runHead, head string) error {
+	return &UsageError{Msg: fmt.Sprintf("the repository moved from %.12s to %.12s since this run was planned; the baseline describes the planned commit, so plan again", runHead, head)}
+}
+
 func bootstrapSubmit(ctx context.Context, env *Env, args []string) (Result, error) {
 	fl, err := parseFlags(args, map[string]bool{"run": true, "batch": true})
 	if err != nil {
@@ -71,8 +76,19 @@ func bootstrapSubmit(ctx context.Context, env *Env, args []string) (Result, erro
 		return Result{}, err
 	}
 	defer p.Close()
-	if _, err := runs.Get(ctx, runID); err != nil {
+	run, err := runs.Get(ctx, runID)
+	if err != nil {
 		return Result{}, err
+	}
+	// Evidence lines are checked against the blobs the plan recorded, and the validator records
+	// the blobs at HEAD. They are the same blobs only while HEAD is the planned commit, so a
+	// submission after the repository moved is refused with nothing recorded.
+	head, err := p.Repo.HeadCommit(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	if head != run.Head {
+		return Result{}, errRepoMoved(run.Head, head)
 	}
 	wf := bootstrap.WorkFiles{Root: p.Store.Root, CheckoutID: p.Checkout.ID}
 	// Every result is read and checked before any is submitted, so a bad one later in the batch
