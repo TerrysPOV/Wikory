@@ -1,0 +1,190 @@
+package app
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/TerrysPOV/Wikory/internal/bootstrap"
+	"github.com/TerrysPOV/Wikory/internal/confine"
+)
+
+var sourceName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
+
+type planReport struct {
+	RunID      string               `json:"run_id"`
+	PlanHash   string               `json:"plan_hash"`
+	Scope      string               `json:"scope"`
+	Head       string               `json:"head"`
+	Sample     int                  `json:"sample"`
+	Sources    map[string]int       `json:"sources"`
+	Components int                  `json:"components"`
+	Inspected  int                  `json:"inspected"`
+	Batches    int                  `json:"batches"`
+	Estimates  []bootstrap.Estimate `json:"estimates"`
+	Next       string               `json:"next"`
+}
+
+func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error) {
+	fl, err := parseFlags(args, map[string]bool{"source": true, "sample": true})
+	if err != nil {
+		return Result{}, err
+	}
+	sample := 0
+	if v := fl["sample"]; len(v) > 0 {
+		if sample, err = strconv.Atoi(v[len(v)-1]); err != nil || sample < 1 {
+			return Result{}, &UsageError{Msg: "--sample needs a whole number of at least 1"}
+		}
+	}
+	p, err := openProject(ctx, env, false)
+	if err != nil {
+		return Result{}, err
+	}
+	defer p.Close()
+	if !servable(p) {
+		return Result{}, fmt.Errorf("this checkout is not registered and trusted; run wikory init")
+	}
+	if err := requireCleanDefaultBranch(ctx, p); err != nil {
+		return Result{}, err
+	}
+	head, err := p.Repo.HeadCommit(ctx)
+	if err != nil || head == "" {
+		return Result{}, &UsageError{Msg: "the repository has no commits to baseline"}
+	}
+	readers := []bootstrap.Reader{bootstrap.NewRepoReader(p.Repo, head)}
+	scope := []string{"repo"}
+	roots := map[string]string{}
+	for _, spec := range fl["source"] {
+		name, dir, ok := strings.Cut(spec, "=")
+		if !ok || !sourceName.MatchString(name) || name == "repo" || dir == "" {
+			return Result{}, &UsageError{Msg: fmt.Sprintf("--source %q: want NAME=DIR with NAME like notes (lower case, not \"repo\")", spec)}
+		}
+		if _, dup := roots[name]; dup {
+			return Result{}, &UsageError{Msg: fmt.Sprintf("--source %s was given twice; each source needs its own name", name)}
+		}
+		if strings.ContainsAny(dir, "\n\r") {
+			return Result{}, &UsageError{Msg: fmt.Sprintf("--source %s: the directory name has a line break in it", name)}
+		}
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(p.Repo.Top, dir)
+		}
+		roots[name] = dir
+		root, err := confine.Open(dir)
+		if err != nil {
+			return Result{}, &UsageError{Msg: fmt.Sprintf("--source %s: cannot open %s: %v", name, spec[len(name)+1:], describeConfine(err))}
+		}
+		defer root.Close()
+		readers = append(readers, bootstrap.NewDirReader(name, root))
+		scope = append(scope, name)
+	}
+	sort.Strings(scope[1:]) // the plan hash covers the scope: the order the flags were typed in must not
+	churn, err := p.Repo.Churn(ctx, time.Now().AddDate(0, 0, -90))
+	if err != nil {
+		return Result{}, err
+	}
+	changed, err := p.Repo.LastChanged(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	branches, err := p.Repo.Branches(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	trees, err := p.Repo.Worktrees(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	prog := NewProgress(env.IO.Err, env.JSON, IsTTY(env.IO.Err), time.Now)
+	started := false
+	res, err := bootstrap.Inventory(ctx, readers, bootstrap.Options{MaxFileBytes: bootstrap.MaxFileBytes, Churn: churn, Budget: bootstrap.InspectBudget,
+		LastChanged: changed, Unread: bootstrap.UnreadSources(p.Repo.DefaultBranch(ctx), branches, trees),
+		Progress: func(done, total int) {
+			if !started {
+				started = true
+				prog.Begin("inventory", total, time.Duration(total/200)*time.Second, "Reading and scanning "+strconv.Itoa(total)+" files (estimate, not yet measured). Nothing is sent anywhere.")
+			}
+			prog.Step(done)
+		}})
+	prog.End()
+	if err != nil {
+		return Result{}, err
+	}
+	plan := bootstrap.BuildPlan(res, strings.Join(scope, "+"), head, sample)
+	plan.Roots = roots
+	run, err := newRuns(p).Create(ctx, plan, bootstrap.ExtractSpecs(res))
+	if err != nil {
+		return Result{}, err
+	}
+	rep := planReport{RunID: run.ID, PlanHash: plan.Hash, Scope: plan.Scope, Head: head, Sample: sample,
+		Sources: map[string]int{}, Components: len(res.Components), Batches: plan.Batches, Estimates: plan.Estimates}
+	for _, s := range res.Sources {
+		rep.Sources[s.Disposition]++
+	}
+	for _, c := range res.Components {
+		if c.Inspected {
+			rep.Inspected++
+		}
+	}
+	rep.Next = fmt.Sprintf("wikory bootstrap confirm --run %s --plan-hash %s", run.ID, plan.Hash)
+	return Result{Data: rep, Text: planText(rep)}, nil
+}
+
+// requireCleanDefaultBranch is the baseline precondition: bootstrap describes the default
+// branch at HEAD, so a feature branch or uncommitted work would make the baseline say things
+// the default branch does not. Uncommitted changes under project-memory/ are ignored: that is
+// where Wikory itself writes.
+func requireCleanDefaultBranch(ctx context.Context, p *project) error {
+	def, cur := p.Repo.DefaultBranch(ctx), p.Repo.Branch(ctx)
+	if def == "" || cur != def {
+		return &UsageError{Msg: fmt.Sprintf("bootstrap baselines the default branch (%q) and this checkout is on %q; switch to a clean checkout of the default branch", def, cur)}
+	}
+	dirty, err := p.Repo.Dirty(ctx, ".")
+	if err != nil {
+		return err
+	}
+	var real []string
+	for _, d := range dirty {
+		if !strings.HasPrefix(d, pmDir+"/") {
+			real = append(real, d)
+		}
+	}
+	if len(real) > 0 {
+		sort.Strings(real)
+		return &UsageError{Msg: fmt.Sprintf("the working tree has uncommitted changes (first: %s); commit or stash them so the baseline matches HEAD", real[0])}
+	}
+	return nil
+}
+
+func planText(r planReport) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Bootstrap plan %s (scope %s, HEAD %.12s)\n", r.RunID, r.Scope, r.Head)
+	keys := make([]string, 0, len(r.Sources))
+	for k := range r.Sources {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	b.WriteString("Sources:")
+	for _, k := range keys {
+		fmt.Fprintf(&b, " %s=%d", k, r.Sources[k])
+	}
+	fmt.Fprintf(&b, "\nComponents: %d found, %d to be verified\n", r.Components, r.Inspected)
+	if n := r.Sources[bootstrap.DispUnmergedBranch]; n > 0 || r.Sources[bootstrap.DispOtherWorktree] > 0 {
+		fmt.Fprintf(&b, "Not read: %d branch(es) with unmerged commits and %d other worktree(s). The baseline is the default branch at HEAD; work that lives elsewhere is not in it.\n", n, r.Sources[bootstrap.DispOtherWorktree])
+	}
+	if n := r.Sources[bootstrap.DispTooDeep] + r.Sources[bootstrap.DispUnreadable] + r.Sources[bootstrap.DispLink]; n > 0 {
+		fmt.Fprintf(&b, "Not read: %d item(s) in the --source directories were too deep, unreadable or links; finish lists each by name.\n", n)
+	}
+	for _, e := range r.Estimates {
+		fmt.Fprintf(&b, "  %-8s %4d items, about %d input and %d output tokens (estimate, bytes/4; not yet measured)\n", e.Stage, e.Items, e.InputTokens, e.OutputTokens)
+	}
+	fmt.Fprintf(&b, "Batches: %d\n", r.Batches)
+	b.WriteString("No per-token price is shown: none is configured, and on a subscription plan there is none.\n")
+	fmt.Fprintf(&b, "Plan hash: %s\n", r.PlanHash)
+	b.WriteString("Nothing has been sent to a model. To go ahead, a person must say yes, then run:\n  " + r.Next + "\n")
+	return b.String()
+}
