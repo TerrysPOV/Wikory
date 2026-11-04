@@ -4175,6 +4175,27 @@ git commit -m "feat: add bootstrap estimates, extract specs and plan hash"
 
 ---
 
+#### Final whole-branch review fixes (2026-11-04)
+
+- A3 (`403d1ef`): the plan hash no longer depends on the clock or on data local to one clone. `bootstrap plan` counts churn from `churnSince(ctx, repo)`, HEAD's committer time (`gitx.HeadTime`) minus `churnWindow` (90 days), not `time.Now()`: churn feeds the ranking and the ranking is hashed. `planHash` leaves out every source for which `unread(s)` is true (dispositions `skipped:unmerged-branch` and `skipped:other-worktree`), so local branch names, how far ahead they are, other worktrees and the default branch name taken from `origin/HEAD` no longer move it; the records are still stored and reported. The hash version is `V: 3`. `--source` refuses the name "git" as well as "repo". Tests: `TestBootstrapPlanHashIsTheSameInAnotherCloneAndOnAnotherDay` (a second clone with its own local branches plans the same hash), `TestChurnWindowIsAnchoredOnHeadNotTheClock`, `TestUnreadRecordsCannotCollideWithARepositoryFile`. `TestPlanHashDoesNotDependOnWhereAWorktreeLives` and `TestBootstrapPlanListsUnmergedBranchesAndOtherWorktreesAsNotRead` now assert that another branch or worktree leaves the hash unchanged (they asserted the reverse).
+- A4 (`86fdd47`): a component digest's estimate counts a header line per file (`headerBytes(path)`) as well as the file bytes, capped at `DigestMaxBytes`, because the digest itself now counts headers against that bound. Test: `TestDigestEstimateCountsHeaderLines`; `TestEstimateStagesCountsItemsAndTokens` adds the header to its expected digest bytes.
+- A6 (`3bb75c6`): `ExtractSpecs` skips an inspected component whose `ComponentFiles` list is empty, and the verify estimate counts only inspected components with files. Test: `TestAnInspectedComponentWithNoFilesGetsNoExtractItemAndNoVerifyTarget`.
+- B5 and B6 (`c908777`): `--source` resolves its directory (links followed) and refuses one equal to or inside `<Top>/project-memory`; one elsewhere inside the repository is allowed with a notice. The plan report gains `roots` (name to directory) and the text lists every `--source NAME=DIR` under "Directories outside the repository that will be read". Tests: `TestPlanRefusesASourceInsideProjectMemoryAndWarnsForOneInsideTheRepository`, `TestPlanShowsEverySourceDirectory`.
+- B11 (`02eb215`): `Plan.Branch` (not hashed) records the branch the checkout was on, or `detached`, through `branchLabel`.
+- C3 (`0f2b764`): `CountInspected(cs)` counts inspected components for the plan report and the progress estimate.
+
+Run: `scripts/inject.sh internal/bootstrap/estimate.go '		if unread(s) {
+			continue
+		}
+' '' ./internal/bootstrap/ 'TestPlanHashDoesNotDependOnWhereAWorktreeLives' 'must not change the hash'`
+Run: `scripts/inject.sh internal/app/bootstrap_plan.go 'return t.Add(-churnWindow), nil' 'return time.Now().Add(-churnWindow + 0*time.Duration(t.Unix())), nil' ./internal/app/ 'TestChurnWindowIsAnchoredOnHeadNotTheClock' '90 days before HEAD'`
+Run: `scripts/inject.sh internal/bootstrap/estimate.go 'total += f.Size + int64(headerBytes(f.Path))' 'total += f.Size + 0*int64(headerBytes(f.Path))' ./internal/bootstrap/ 'TestDigestEstimateCountsHeaderLines' 'file bytes plus a header line'`
+Run: `scripts/inject.sh internal/bootstrap/estimate.go '		if !c.Inspected || len(files[c.Prefix]) == 0 {' '		if !c.Inspected {' ./internal/bootstrap/ 'TestAnInspectedComponentWithNoFiles' 'got an extract item'`
+Run: `scripts/inject.sh internal/app/bootstrap_plan.go '	case within(filepath.Join(root, pmDir)):' '	case false && within(filepath.Join(root, pmDir)):' ./internal/app/ 'TestPlanRefusesASourceInsideProjectMemory' 'must be refused'`
+Run: `scripts/inject.sh internal/app/bootstrap_plan.go '	if len(r.Roots) > 0 {' '	if false && len(r.Roots) > 0 {' ./internal/app/ 'TestPlanShowsEverySourceDirectory' 'must name each source directory'`
+
+Expected: each exits 0 (RED).
+
 ### Task 7: Progress fixes (TTY detection, stage names, estimated time left)
 
 **Files:**
