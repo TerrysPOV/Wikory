@@ -78,17 +78,35 @@ type VerifyReport struct {
 	Requeued     bool     `json:"requeued"`
 }
 
-// ClaimsFor returns the claims a component's verifier could judge: those not yet decided
-// that came from the component's digest or name it by path. The root component "." matches by
-// digest only, because "." appears in ordinary text. A claim can match several components;
-// AssignClaims decides which one judges it.
+// claimTouches reports whether a claim came from c's digest or names c by path. The root
+// component "." matches by digest only, because "." appears in ordinary text. It is the one
+// match rule: ClaimsFor, AssignClaims, and through AssignClaims the coverage report and the page
+// a claim is placed on, all use it.
+func claimTouches(c Component, s StoredClaim) bool {
+	return s.Ref == "comp:"+c.Prefix || (c.Prefix != "." && strings.Contains(s.Text, c.Prefix))
+}
+
+// isUndecided reports whether verification can still change a claim's status.
+func isUndecided(s StoredClaim) bool { return s.Status == "unverified" || s.Status == "historical" }
+
+// undecidedClaims is the claims verification can still change, in their order.
+func undecidedClaims(claims []StoredClaim) []StoredClaim {
+	var out []StoredClaim
+	for _, s := range claims {
+		if isUndecided(s) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// ClaimsFor returns the claims a component's verifier could judge: those not yet decided that
+// touch it (see claimTouches). A claim can match several components; AssignClaims decides which
+// one judges it.
 func ClaimsFor(c Component, claims []StoredClaim) []StoredClaim {
 	var out []StoredClaim
 	for _, s := range claims {
-		if s.Status != "unverified" && s.Status != "historical" {
-			continue
-		}
-		if s.Ref == "comp:"+c.Prefix || (c.Prefix != "." && strings.Contains(s.Text, c.Prefix)) {
+		if isUndecided(s) && claimTouches(c, s) {
 			out = append(out, s)
 		}
 	}
@@ -96,12 +114,14 @@ func ClaimsFor(c Component, claims []StoredClaim) []StoredClaim {
 	return out
 }
 
-// AssignClaims gives every undecided claim to exactly one inspected component, keyed by the
-// component's prefix. A claim that names two components is therefore judged once, and two
-// verifiers can never race over it. A claim that came from a component's own digest belongs to
-// that component; any other goes to the component whose path it names most specifically (the
-// longest prefix), then the better rank, then the lower name. Components that are not inspected
-// receive nothing.
+// AssignClaims gives every claim it is given, whatever its status, to at most one inspected
+// component, keyed by the component's prefix: ownership. A claim that names two components is
+// therefore judged once, and two verifiers can never race over it. A claim that came from a
+// component's own digest belongs to that component; any other goes to the component whose path
+// it names most specifically (the longest prefix), then the better rank, then the lower name.
+// Components that are not inspected receive nothing. Callers that want only the work still to
+// judge pass undecidedClaims; the verifier's ownership check, the coverage report and the page a
+// claim is placed on pass every claim, so all three name the same component.
 func AssignClaims(comps []Component, claims []StoredClaim) map[string][]StoredClaim {
 	var inspected []Component
 	for _, c := range comps {
@@ -114,7 +134,7 @@ func AssignClaims(comps []Component, claims []StoredClaim) map[string][]StoredCl
 		var best Component
 		found := false
 		for _, c := range inspected {
-			if len(ClaimsFor(c, []StoredClaim{s})) == 0 {
+			if !claimTouches(c, s) {
 				continue
 			}
 			if !found || ownsBetter(c, best, s) {
@@ -230,7 +250,7 @@ func VerifyOwed(ctx context.Context, runs *Runs, runID string) (int, error) {
 		return 0, err
 	}
 	files := ComponentFiles(Result{Sources: srcs, Components: comps})
-	return len(verifyTargets(comps, AssignClaims(comps, claims), files)), nil
+	return len(verifyTargets(comps, AssignClaims(comps, undecidedClaims(claims)), files)), nil
 }
 
 // PrepareVerify creates the verify items once every extract item is closed: one per inspected
@@ -257,7 +277,7 @@ func PrepareVerify(ctx context.Context, runs *Runs, w WorkFiles, runID string) (
 		return 0, err
 	}
 	files := ComponentFiles(Result{Sources: srcs, Components: comps})
-	assigned := AssignClaims(comps, claims)
+	assigned := AssignClaims(comps, undecidedClaims(claims))
 	var specs []ItemSpec
 	for _, c := range verifyTargets(comps, assigned, files) {
 		related := assigned[c.Prefix]
@@ -350,14 +370,9 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 	// another component is told the same as for any claim that is not its own. judge is the part
 	// of the component's work that is still undecided.
 	owns, judge := map[string]bool{}, map[string]bool{}
-	undecided := make([]StoredClaim, len(all))
-	for i, s := range all {
-		undecided[i] = s
-		undecided[i].Status = "unverified"
-	}
-	for _, s := range AssignClaims(comps, undecided)[comp.Prefix] {
+	for _, s := range AssignClaims(comps, all)[comp.Prefix] {
 		owns[s.ClaimID] = true
-		if st := byID[s.ClaimID].Status; st == "unverified" || st == "historical" {
+		if isUndecided(s) {
 			judge[s.ClaimID] = true
 		}
 	}

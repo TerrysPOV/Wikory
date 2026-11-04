@@ -263,6 +263,7 @@ func BuildCoverage(ctx context.Context, runs *Runs, runID string, pages []PageOu
 		}
 	}
 	cov.Components.Total = len(comps)
+	owned := AssignClaims(comps, claims) // the same owner the verifier and the page use
 	for _, c := range comps {
 		if !c.Inspected {
 			cov.Components.NotInspected = append(cov.Components.NotInspected, safeLabel(c.Prefix))
@@ -270,10 +271,7 @@ func BuildCoverage(ctx context.Context, runs *Runs, runID string, pages []PageOu
 		}
 		cov.Components.Inspected++
 		verified, conflicting := false, false
-		for _, cl := range claims {
-			if cl.Ref != "comp:"+c.Prefix && !(c.Prefix != "." && strings.Contains(cl.Text, c.Prefix)) {
-				continue
-			}
+		for _, cl := range owned[c.Prefix] {
 			verified = verified || cl.Status == "verified"
 			conflicting = conflicting || cl.Status == "conflicting"
 		}

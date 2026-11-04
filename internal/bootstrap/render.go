@@ -143,21 +143,17 @@ func byRank(cs []Component) []Component {
 	return out
 }
 
-// componentFor names the inspected component a claim belongs to, or "" for the general page. A
-// claim about a component that was not inspected has no page of its own to land on.
-func componentFor(c StoredClaim, inspected []Component) string {
-	if prefix, ok := strings.CutPrefix(c.Ref, "comp:"); ok {
-		if slices.ContainsFunc(inspected, func(comp Component) bool { return comp.Prefix == prefix }) {
-			return prefix
-		}
-		return ""
-	}
-	for _, comp := range inspected {
-		if comp.Prefix != "." && strings.Contains(c.Text, comp.Prefix) {
-			return comp.Prefix
+// claimOwners maps each claim id to the inspected component that owns it (AssignClaims), so a
+// claim sits on the page of the component whose verifier judged it and that the coverage report
+// credits. A claim no inspected component owns maps to nothing and goes on the general page.
+func claimOwners(comps []Component, claims []StoredClaim) map[string]string {
+	out := map[string]string{}
+	for prefix, list := range AssignClaims(comps, claims) {
+		for _, c := range list {
+			out[c.ClaimID] = prefix
 		}
 	}
-	return ""
+	return out
 }
 
 type placement struct {
@@ -167,12 +163,7 @@ type placement struct {
 
 func place(m RenderModel) placement {
 	pl := placement{byComponent: map[string][]StoredClaim{}}
-	var inspected []Component
-	for _, c := range byRank(m.Components) {
-		if c.Inspected {
-			inspected = append(inspected, c)
-		}
-	}
+	owners := claimOwners(m.Components, m.Claims)
 	cs := append([]StoredClaim(nil), m.Claims...)
 	sort.SliceStable(cs, func(i, j int) bool {
 		a, b := cs[i], cs[j]
@@ -197,7 +188,7 @@ func place(m RenderModel) placement {
 		case c.Kind == "hypothesis":
 			pl.hypotheses = append(pl.hypotheses, c)
 		default:
-			if comp := componentFor(c, inspected); comp != "" {
+			if comp := owners[c.ClaimID]; comp != "" {
 				pl.byComponent[comp] = append(pl.byComponent[comp], c)
 			} else {
 				pl.general = append(pl.general, c)

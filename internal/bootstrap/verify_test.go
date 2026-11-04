@@ -299,7 +299,12 @@ func TestAClaimNamingTwoComponentsGoesToExactlyOneVerifier(t *testing.T) {
 		{ClaimID: "c", Text: "internal/idle does nothing until internal/queue wakes it", Status: "unverified", Ref: "src:repo:docs/x.md"},
 		{ClaimID: "d", Text: "internal/queue acks late", Status: "verified", Ref: "src:repo:docs/x.md"},
 	}
-	got := AssignClaims(comps, cs)
+	// Ownership does not depend on status: the decided claim d still has an owner, so the verifier,
+	// the coverage report and the page agree on it. The work still to judge is the undecided part.
+	if owned := AssignClaims(comps, cs)["internal/queue"]; len(owned) != 3 {
+		t.Errorf("ownership covers decided claims too: %+v", owned)
+	}
+	got := AssignClaims(comps, undecidedClaims(cs))
 	times := map[string]int{}
 	for _, list := range got {
 		for _, c := range list {
