@@ -17130,6 +17130,14 @@ Astra also checked and found sound, with no change: the plan-hash gate on every 
 20. **Files a digest leaves out are not in the coverage report.** `BuildDigest` drops a file that does not fit its size budget and lists it at the end of the digest text, but that list is not carried into the coverage report, so a component can show as inspected while some of its files were never summarised. The report's `NotExtracted` count covers whole components that were not inspected, not files cut from an inspected one. Recording the omitted paths per component is a small follow-up (a column on `bs_components`).
 21. **Identifier values that mention tokens are skipped as secret.** Identifier values such as `max_tokens`, `tokenizer`, `BudgetTokens` match the assignment rule and the whole file is skipped as secret (fail closed); the coverage report lists these as `skipped:secret` with no marker for false positives; expect it on any codebase that handles LLM tokens. The dry run on this repository lost six core files that way (`internal/store/schema.go`, `internal/app/project.go`, `internal/app/init_cmd.go`, `internal/app/briefing.go`, `internal/publish/publish.go`, `internal/spikes/fts5_spike_test.go`) from digests and extraction. Whether to treat a name that merely contains "token" as a key only when the value looks like one is a change to `internal/redact` and is Terry's call.
 
+Final whole-branch review (2026-11-04), recorded and not fixed, for Terry:
+
+- The verifier's `corrected` text is the one model output not tied to an excerpt of a work file, and the verifier's `Read` and `Grep` are not path-limited, so a hostile repository could steer it to copy private text that is not credential-shaped into a page. A design is proposed in the final-fixes report (bound `corrected` to an edit of the claim text by similarity, or require it to quote the cited line); not implemented.
+- Claim text written by the extractor reaches the verifier's work file unchanged, so a hostile source can try to inject instructions into the verifier; the binary checks that evidence belongs to the component, not that it supports the verdict.
+- A checkout with `core.autocrlf` rewrites line endings, so a page Wikory recorded reads as a person's edit on the next bootstrap: fail-safe (a conflict, never an overwrite). The Windows leg is compiled and vetted only.
+- Page ownership is decided from `bs_pages` hashes alone, never from an `origin: bootstrap` a person could write in frontmatter; `Page.Origin` is parsed and unused.
+- `abandon` and skipping components with no files are behaviour the design does not spell out; both were added in the final review without Terry and are listed in the report.
+
 ## Self-review
 
 **Spec coverage** (design `2026-11-02-wikory-bootstrap-design.md`):
