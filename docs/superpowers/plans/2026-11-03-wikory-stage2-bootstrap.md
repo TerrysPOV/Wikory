@@ -2300,6 +2300,7 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -2366,14 +2367,17 @@ func TestInventoryDisposesEachSourceAndNeverKeepsSecretText(t *testing.T) {
 	if srcBy(res, "internal/queue/queue.go").Hash == "" || srcBy(res, "vendor/x/y.go").Hash != "" {
 		t.Fatal("only read sources have a content hash")
 	}
+	if srcBy(res, "internal/queue/cfg.go").Hash != "" {
+		t.Fatal("a source skipped for a secret carries no content hash")
+	}
 }
 
 func TestInventorySignalsAndTiers(t *testing.T) {
 	ctx := context.Background()
 	repo := &memReader{name: "repo", files: map[string]string{
-		"internal/queue/queue.go": "package queue\n",
-		"internal/other/other.go": "package other\n",
-		"docs/design.md":          "See internal/queue for acks. Also internal/queue again.\n",
+		"internal/queue/queue.go":                 "package queue\n",
+		"internal/other/other.go":                 "package other\n",
+		"docs/design.md":                          "See internal/queue for acks. Also internal/queue again.\n",
 		".claude/handoffs/PRIOR_SESSION_STATE.md": "internal/queue is half done.\n",
 	}}
 	res, err := Inventory(ctx, []Reader{repo}, Options{MaxFileBytes: MaxFileBytes, Budget: 1,
@@ -2534,6 +2538,126 @@ func TestUnreadSourcesNameBranchesAndWorktreesAndInventoryNeverReadsThem(t *test
 		}
 	}
 }
+
+func TestCountMentionsNamesAComponentOnlyAtAPathBoundary(t *testing.T) {
+	cases := []struct {
+		name, prefix, text string
+		want               bool
+	}{
+		{"file under the directory", "internal/queue", "see internal/queue/queue.go for the loop", true},
+		{"backticks", "internal/queue", "the `internal/queue` package", true},
+		{"parentheses", "internal/queue", "acks (internal/queue) after the handler", true},
+		{"start of text", "internal/queue", "internal/queue acks", true},
+		{"end of text", "internal/queue", "owned by internal/queue", true},
+		{"full stop at the end of a sentence", "internal/queue", "It lives in internal/queue. Next.", true},
+		{"colon after", "internal/queue", "internal/queue: acks", true},
+		{"single segment with a slash", "web", "the web/ directory", true},
+		{"longer sibling name", "internal/queue", "see internal/queue2 instead", false},
+		{"suffix after underscore", "internal/queue", "internal/queue_test is a file", false},
+		{"suffix after hyphen", "cmd/wikory", "run cmd/wikory-admin", false},
+		{"suffix after dot", "internal/queue", "open internal/queue.go", false},
+		{"nested under another directory", "internal/queue", "see x/internal/queue for it", false},
+		{"inside a longer word", "internal/queue", "myinternal/queue", false},
+		{"inside a URL", "api", "call https://x.example/api/v1 now", false},
+		{"word that ends in the name", "lib", "a cobweb/ of lib-like things", false},
+		{"bare single segment word", "web", "the web is big", false},
+	}
+	for _, tc := range cases {
+		comps := []Component{{Name: tc.prefix, Prefix: tc.prefix}}
+		countMentions(comps, "docs/x.md", tc.text)
+		if got := comps[0].DocRefs == 1; got != tc.want {
+			t.Errorf("%s: %q names %q = %v, want %v", tc.name, tc.text, tc.prefix, got, tc.want)
+		}
+	}
+}
+
+func TestInventoryAttributesChurnOnlyToQueuedImplementationSources(t *testing.T) {
+	ctx := context.Background()
+	repo := &memReader{name: "repo", files: map[string]string{
+		"main.go":                 "package main\n",
+		"internal/queue/queue.go": "package queue\n",
+		"internal/queue/NOTES.md": "notes\n",
+		"docs/x.md":               "doc\n",
+		"vendor/z/v.go":           "package v\n",
+		"go.sum":                  "x\n",
+	}}
+	res, err := Inventory(ctx, []Reader{repo}, Options{Budget: 5, Churn: map[string]int{
+		"internal/queue/queue.go": 2,
+		"internal/queue/NOTES.md": 5,
+		"docs/x.md":               9,
+		"vendor/z/v.go":           9,
+		"go.sum":                  9,
+		"deleted/gone.go":         9,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range res.Components {
+		switch c.Prefix {
+		case "internal/queue":
+			if c.Churn != 2 {
+				t.Errorf("queue churn = %d, want 2 (only its queued implementation source counts)", c.Churn)
+			}
+		case ".":
+			if c.Churn != 0 {
+				t.Errorf("root churn = %d, want 0 (no implementation source owns those paths)", c.Churn)
+			}
+		}
+	}
+}
+
+// failingReader lists the embedded files and fails every Read with err, after running hook.
+type failingReader struct {
+	*memReader
+	err  error
+	hook func()
+}
+
+func (f *failingReader) Read(ctx context.Context, e Entry, _ int64) ([]byte, error) {
+	if f.hook != nil {
+		f.hook()
+	}
+	return nil, f.err
+}
+
+func TestInventoryStopsOnACancelledContextInsteadOfReturningAResult(t *testing.T) {
+	files := map[string]string{"a.go": "package a\n", "b.go": "package b\n"}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	res, err := Inventory(ctx, []Reader{&memReader{name: "repo", files: files}}, Options{Budget: 5})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a context cancelled before the loop must be returned, got err=%v result=%+v", err, res)
+	}
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	fr := &failingReader{memReader: &memReader{name: "repo", files: map[string]string{"a.go": "package a\n"}}, err: errors.New("read aborted"), hook: cancel2}
+	res, err = Inventory(ctx2, []Reader{fr}, Options{Budget: 5})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a read that fails because the context was cancelled must return the context error, got err=%v result=%+v", err, res)
+	}
+}
+
+func TestInventoryMapsAnOversizeReadErrorToTheOversizeDisposition(t *testing.T) {
+	for name, readErr := range map[string]error{
+		"git":     gitx.ErrTooLarge,
+		"confine": fmt.Errorf("read a.go: %w", confine.ErrTooLarge),
+		"other":   errors.New("disk on fire"),
+	} {
+		fr := &failingReader{memReader: &memReader{name: "repo", files: map[string]string{"a.go": "package a\n"}}, err: readErr}
+		res, err := Inventory(context.Background(), []Reader{fr}, Options{Budget: 5})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		want := DispOversize
+		if name == "other" {
+			want = DispUnreadable
+		}
+		if got := srcBy(res, "a.go").Disposition; got != want {
+			t.Errorf("%s: a read that fails with %v is %q, want %q", name, readErr, got, want)
+		}
+	}
+}
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -2542,6 +2666,8 @@ Run: `go test ./internal/bootstrap/ -run 'TestDetectComponents|TestScore|TestRan
 Expected: FAIL to compile: `undefined: DetectComponents`, `Score`, `Rank`, `Inventory`, `Options`.
 
 - [ ] **Step 3: Implement**
+
+First add `DispOversize = "skipped:oversize"` to the source disposition constants in `types.go` (next to `DispUnreadable`) and return it from `Exclusion` in `exclude.go` instead of the literal.
 
 `components.go`:
 
@@ -2697,10 +2823,14 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/TerrysPOV/Wikory/internal/confine"
+	"github.com/TerrysPOV/Wikory/internal/gitx"
 	"github.com/TerrysPOV/Wikory/internal/ids"
 	"github.com/TerrysPOV/Wikory/internal/redact"
 )
@@ -2768,6 +2898,7 @@ func Inventory(ctx context.Context, readers []Reader, opt Options) (Result, erro
 	})
 
 	var implPaths []string
+	impl := map[string]bool{}
 	for i := range all {
 		s := &all[i].s
 		if s.Disposition != "" {
@@ -2777,6 +2908,7 @@ func Inventory(ctx context.Context, readers []Reader, opt Options) (Result, erro
 			s.Disposition = why
 		} else if s.Tier == TierImplementation && s.Name == "repo" {
 			implPaths = append(implPaths, s.Path)
+			impl[s.Path] = true
 		}
 	}
 	comps := DetectComponents(implPaths)
@@ -2789,12 +2921,20 @@ func Inventory(ctx context.Context, readers []Reader, opt Options) (Result, erro
 		idx[comps[i].Prefix] = &comps[i]
 	}
 	for p, n := range opt.Churn {
+		// Churn comes from git history, which names docs, vendored and generated files, and paths
+		// that no longer exist. Only a queued implementation source can say a component is active.
+		if !impl[p] {
+			continue
+		}
 		if c := idx[ownerOf(p, prefixes)]; c != nil {
 			c.Churn += n
 		}
 	}
 
 	for i := range all {
+		if err := ctx.Err(); err != nil {
+			return Result{}, fmt.Errorf("bootstrap: inventory stopped: %w", err)
+		}
 		s := &all[i].s
 		if opt.Progress != nil {
 			opt.Progress(i, len(all))
@@ -2804,7 +2944,14 @@ func Inventory(ctx context.Context, readers []Reader, opt Options) (Result, erro
 		}
 		data, err := all[i].r.Read(ctx, all[i].e, opt.MaxFileBytes)
 		if err != nil {
-			s.Disposition = "skipped:unreadable"
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return Result{}, fmt.Errorf("bootstrap: inventory stopped reading %s: %w", s.Path, ctxErr)
+			}
+			if errors.Is(err, gitx.ErrTooLarge) || errors.Is(err, confine.ErrTooLarge) {
+				s.Disposition = DispOversize // it grew between List and Read
+			} else {
+				s.Disposition = DispUnreadable
+			}
 			continue
 		}
 		if why := Exclusion(s.Path, int64(len(data)), data); why != "" {
@@ -2845,12 +2992,13 @@ func dateOf(t time.Time) string {
 
 // countMentions adds one to each component the text names by path. A handoff counts toward
 // HandoffMentions and any other non-code file toward DocRefs. A component is named at most
-// once per file, so a file that repeats a path cannot inflate its score.
+// once per file, so a file that repeats a path cannot inflate its score. Doc text is untrusted,
+// so a name counts only on path boundaries: see mentionsPath.
 func countMentions(comps []Component, p, text string) {
 	handoff := IsHandoff(p)
 	for i := range comps {
 		pre := comps[i].Prefix
-		if pre == "." || !(strings.Contains(text, pre+"/") || (strings.Contains(pre, "/") && strings.Contains(text, pre))) {
+		if pre == "." || !mentionsPath(text, pre, !strings.Contains(pre, "/")) {
 			continue
 		}
 		if handoff {
@@ -2860,6 +3008,47 @@ func countMentions(comps []Component, p, text string) {
 		}
 	}
 }
+
+// mentionsPath reports whether text names the directory pre as a whole path. The name must
+// start the text or follow whitespace or one of "'`([{<,;=*| (never a letter, digit, "_", "-",
+// "." or "/", so x/internal/queue and https://h/api/ do not count), and must end the text or be
+// followed by "/" (so internal/queue/queue.go counts), whitespace, a quote, a closing bracket,
+// one of ,;:*|, or a full stop that ends a sentence (so internal/queue2, internal/queue_test,
+// cmd/wikory-admin and internal/queue.go do not). A single-segment name such as web or api is
+// too common a word to count bare, so it must be followed by "/" (needSlash).
+func mentionsPath(text, pre string, needSlash bool) bool {
+	for from := 0; ; {
+		k := strings.Index(text[from:], pre)
+		if k < 0 {
+			return false
+		}
+		i := from + k
+		from = i + 1
+		if i > 0 && !strings.ContainsRune(boundaryBefore, rune(text[i-1])) && !isSpace(text[i-1]) {
+			continue
+		}
+		j := i + len(pre)
+		if j < len(text) && text[j] == '/' {
+			return true
+		}
+		if needSlash {
+			continue
+		}
+		if j == len(text) || isSpace(text[j]) || strings.ContainsRune(boundaryAfter, rune(text[j])) {
+			return true
+		}
+		if text[j] == '.' && (j+1 == len(text) || isSpace(text[j+1])) {
+			return true
+		}
+	}
+}
+
+const (
+	boundaryBefore = "\"'`([{<,;=*|"
+	boundaryAfter  = "\"'`)]}>,;:*|"
+)
+
+func isSpace(b byte) bool { return b == ' ' || b == '\t' || b == '\n' || b == '\r' }
 ```
 
 `unread.go`:
@@ -2913,6 +3102,14 @@ Run: `scripts/inject.sh internal/bootstrap/inventory.go 'if sk, ok := r.(Skipper
 Run: `scripts/inject.sh internal/bootstrap/inventory.go 'all = append(all, listed{s: u})' '_ = u' ./internal/bootstrap/ 'TestUnreadSourcesNameBranchesAndWorktreesAndInventoryNeverReadsThem' 'listed as not read'`
 Run: `scripts/inject.sh internal/bootstrap/inventory.go 'continue // a reader already recorded why this was not read' '_ = s' ./internal/bootstrap/ 'TestUnreadSourcesNameBranchesAndWorktreesAndInventoryNeverReadsThem' 'never replaced by an exclusion rule'`
 Run: `scripts/inject.sh internal/bootstrap/inventory.go 'date = dateOf(opt.LastChanged[e.Path])' 'date = ""' ./internal/bootstrap/ 'TestInventoryDatesRepositoryFilesByCommitTimeAndDirectoryFilesByModificationTime' 'last commit'`
+Run: `scripts/inject.sh internal/bootstrap/inventory.go 's.Disposition, s.SecretSpans = "skipped:secret", len(spans)' 's.Disposition, s.SecretSpans, s.Hash = "skipped:secret", len(spans), ids.SHA256Hex(data)' ./internal/bootstrap/ 'TestInventoryDisposesEachSourceAndNeverKeepsSecretText' 'carries no content hash'`
+Run: `scripts/inject.sh internal/bootstrap/inventory.go 'if i > 0 && !strings.ContainsRune(boundaryBefore' 'if false && i > 0 && !strings.ContainsRune(boundaryBefore' ./internal/bootstrap/ 'TestCountMentionsNamesAComponentOnlyAtAPathBoundary' 'want false'`
+Run: `scripts/inject.sh internal/bootstrap/inventory.go 'if j == len(text) || isSpace(text[j]) ||' 'if true || isSpace(text[j]) ||' ./internal/bootstrap/ 'TestCountMentionsNamesAComponentOnlyAtAPathBoundary' 'want false'`
+Run: `scripts/inject.sh internal/bootstrap/inventory.go 'if !impl[p] {' 'if false && !impl[p] {' ./internal/bootstrap/ 'TestInventoryAttributesChurnOnlyToQueuedImplementationSources' 'root churn'`
+Run: `scripts/inject.sh internal/bootstrap/inventory.go 'if err := ctx.Err(); err != nil {' 'if err := ctx.Err(); err != nil && false {' ./internal/bootstrap/ 'TestInventoryStopsOnACancelledContextInsteadOfReturningAResult' 'cancelled before the loop'`
+Run: `scripts/inject.sh internal/bootstrap/inventory.go 'if ctxErr := ctx.Err(); ctxErr != nil {' 'if ctxErr := ctx.Err(); ctxErr != nil && false {' ./internal/bootstrap/ 'TestInventoryStopsOnACancelledContextInsteadOfReturningAResult' 'must return the context error'`
+Run: `scripts/inject.sh internal/bootstrap/inventory.go 'errors.Is(err, gitx.ErrTooLarge) ||' 'errors.Is(err, gitx.ErrTooLarge) && false ||' ./internal/bootstrap/ 'TestInventoryMapsAnOversizeReadErrorToTheOversizeDisposition' 'want "skipped:oversize"'`
+Run: `scripts/inject.sh internal/bootstrap/inventory.go '|| errors.Is(err, confine.ErrTooLarge) {' '|| errors.Is(err, confine.ErrTooLarge) && false {' ./internal/bootstrap/ 'TestInventoryMapsAnOversizeReadErrorToTheOversizeDisposition' 'want "skipped:oversize"'`
 Expected: each exits 0 (RED).
 
 - [ ] **Step 6: Commit**
