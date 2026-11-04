@@ -4459,7 +4459,7 @@ func (r *Runs) Roots(ctx, id string) (map[string]string, error) // the --source 
 
 Sampling is hash-gated like the full run (plan-level decision 4 extended): `confirm --sample` moves `planned` to `sampling`; `confirm` moves `planned` or `awaiting-confirm` to `running`. `confirm` itself is Task 14; here `Next` simply refuses any state other than `sampling` and `running`.
 
-`Transition` into `sampling` is refused with `ErrState` for a run whose stored `Sample` is 0: a sample of nothing would settle at once with zero measured cost, a hollow figure for the go-ahead to rest on. A run with `Sample > 0` but no sampled item (an empty extract list) still settles at once. `FailCounted` adds the submission's accepted and rejected counts to the run in the same transaction as the item's failure, before the sample settles, so a sample that closes on a failure freezes the final counts; the tests read `sample_in`, `sample_out`, `sample_acc` and `sample_rej` straight from `bs_runs`.
+`Transition` into `sampling` is refused with `ErrState` for a run whose stored `Sample` is 0: a sample of nothing would settle at once with zero measured cost, a hollow figure for the go-ahead to rest on. A run with `Sample > 0` but no sampled item (an empty extract list) still settles at once. `FailCounted` adds the submission's accepted and rejected counts to the run in the same transaction as the item's failure, before the sample settles, so a sample that closes on a failure freezes the final counts; the tests read `sample_in`, `sample_out`, `sample_acc` and `sample_rej` straight from `bs_runs`. Task 13 added `requireWorking`: `Complete` and `FailCounted` check the run's state inside their transaction and refuse with `ErrState`, storing nothing, when it is not `sampling` or `running`, so an item leased before the run finished (or was abandoned) cannot commit claims or usage into it later. Its tests are in Task 13.
 
 - [ ] **Step 1: Write the failing tests for the run store**
 
@@ -5292,6 +5292,24 @@ func (r *Runs) Next(ctx context.Context, id string, max int) (Batch, error) {
 	return b, err
 }
 
+// requireWorking refuses a commit into a run that is not sampling or running. An item leased
+// before the run finished or was abandoned must not be able to store claims or add usage later:
+// the end marker and the published pages describe the run as it stood.
+func requireWorking(ctx context.Context, tx *sql.Tx, runID, checkout string) error {
+	var state string
+	err := tx.QueryRowContext(ctx, `SELECT state FROM bs_runs WHERE run_id=? AND checkout_id=?`, runID, checkout).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNoRun
+	}
+	if err != nil {
+		return err
+	}
+	if state != StateSampling && state != StateRunning {
+		return fmt.Errorf("%w: the run is %s; submissions are accepted only while it is sampling or running", ErrState, state)
+	}
+	return nil
+}
+
 func loadItem(ctx context.Context, tx *sql.Tx, id, checkout string) (Item, error) {
 	it := Item{ID: id}
 	err := tx.QueryRowContext(ctx, `SELECT run_id,stage,ref,input_hash,state,epoch,attempts FROM bs_items WHERE item_id=? AND checkout_id=?`, id, checkout).
@@ -5314,6 +5332,9 @@ func (r *Runs) Complete(ctx context.Context, itemID string, epoch int, u Usage, 
 		}
 		if it.State != "leased" || it.Epoch != epoch {
 			return ErrStaleLease
+		}
+		if err := requireWorking(ctx, tx, it.RunID, r.CheckoutID); err != nil {
+			return err
 		}
 		if fn != nil {
 			if err := fn(ctx, tx, it); err != nil {
@@ -5349,6 +5370,9 @@ func (r *Runs) FailCounted(ctx context.Context, itemID string, epoch, accepted, 
 		}
 		if it.State != "leased" || it.Epoch != epoch {
 			return ErrStaleLease
+		}
+		if err := requireWorking(ctx, tx, it.RunID, r.CheckoutID); err != nil {
+			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE bs_runs SET accepted=accepted+?, rejected=rejected+?, tokens_in=tokens_in+?, tokens_out=tokens_out+? WHERE run_id=?`,
 			accepted, rejected, u.InputTokens, u.OutputTokens, it.RunID); err != nil {
@@ -5611,7 +5635,12 @@ type statusReport struct {
 	Components   int                       `json:"components"`
 	Summary      string                    `json:"summary"`
 	TokensNote   string                    `json:"tokens_note"`
+	// AdmissionsNote says what run.claims_accepted and run.claims_rejected count (Task 13).
+	AdmissionsNote string `json:"admissions_note"`
 }
+
+// admissionsNote is the plain meaning of a run's accepted and rejected counts.
+const admissionsNote = "claims_accepted and claims_rejected count extract submissions only (claims admitted or rejected when first proposed); verify verdicts are not counted in them"
 
 func bootstrapStatus(ctx context.Context, env *Env, args []string) (Result, error) {
 	p, runs, fl, err := openRun(ctx, env, args, map[string]bool{"run": true})
@@ -5632,8 +5661,9 @@ func bootstrapStatus(ctx context.Context, env *Env, args []string) (Result, erro
 		return Result{}, err
 	}
 	rep := statusReport{Run: st.Run, Items: st.Items, Dispositions: st.Dispositions, Components: st.Components, Summary: statusLine(st),
-		TokensNote: "token counts are asserted by the driver; the binary cannot measure them"}
-	text := fmt.Sprintf("%s\ntokens (asserted): %d in, %d out\n", rep.Summary, st.Run.TokensIn, st.Run.TokensOut)
+		TokensNote: bootstrap.TokensNote, AdmissionsNote: admissionsNote}
+	text := fmt.Sprintf("%s\nextract admissions: %d accepted, %d rejected (verify verdicts are not counted here)\ntokens (asserted): %d in, %d out\n",
+		rep.Summary, st.Run.Accepted, st.Run.Rejected, st.Run.TokensIn, st.Run.TokensOut)
 	return Result{Data: rep, Text: text}, nil
 }
 ```
@@ -8626,8 +8656,9 @@ type VerifyInput struct{ Runs *Runs; Env validate.Env; Mint func() string; Blob 
 type VerifyReport struct{ Item string; Confirmed, Contradicted, Undetermined, Ignored int; Rejected []Reject; Findings []string; Requeued bool }
 func ClaimsFor(c Component, claims []StoredClaim) []StoredClaim
 func AssignClaims(comps []Component, claims []StoredClaim) map[string][]StoredClaim // each claim to exactly one inspected component
-func PrepareVerify(ctx context.Context, runs *Runs, w WorkFiles, runID string) (int, error)
-func (r *Runs) EnqueueVerify(ctx context.Context, runID string, specs []ItemSpec) error
+func PrepareVerify(ctx context.Context, runs *Runs, w WorkFiles, runID string) (int, error) // the number of verify items it queued
+func (r *Runs) EnqueueVerify(ctx context.Context, runID string, specs []ItemSpec) error      // adds nothing to a run that is not running
+func VerifyOwed(ctx context.Context, runs *Runs, runID string) (int, error)                   // components still owed a verify item (Task 13)
 func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error)
 ```
 
@@ -8638,6 +8669,8 @@ Review round 1 changed this task as follows (the code blocks below are the tree 
 The review fixes: (1) `checkLines` returns `(reason, error)`. A range that does not match, runs backwards or ends beyond the file is the model's fault and a reject; a blob that cannot be read is an error, and a stored claim whose metadata no longer parses is an error too (corrupt store data). Both return `quietReport` and the error, so the item stays leased, nothing is stored and no attempt is burned. (2) When `validate.Authoring` returns a status other than `verified` for a `confirmed` verdict, nothing is written for that claim: status, metadata, evidence, dependencies and location stay exactly as they were (a `historical` claim stays `historical`), and it is counted `Undetermined` with the validator's findings reported. (3) Whether a claim belongs to this component is decided before whether it is decided, and by the same text for an unknown id, so a verifier cannot learn that another component's claim exists or is final, and an `Ignored` count cannot hold back the all-rejected requeue. Ownership is computed with every status treated as undecided. (4) A completion that fails for any reason other than `errClaimMoved` returns `quietReport` with the error, since the rolled-back writes were never stored; the `errClaimMoved` requeue clears `Ignored`, `Rejected` and `Findings` as well as the counts. (5) A `contradicted` verdict whose evidence the validator could not resolve at HEAD (any blob evidence of the rendered replacement claim left without an object id, which `validate.Authoring` clears for evidence that is uncommitted, dirty or stale) is rejected with `evidence-unresolved` and writes nothing, so a verifier cannot plant a `conflicting` pair that points at nothing. (6) `TestEvidenceInTheComponentsOwnDirectoryMustStillBeQueuedCode` pins the tier and disposition filters of `ComponentFiles` for evidence with a document and a skipped file inside the component's own directory.
 
 `Run.Accepted` and `Run.Rejected` (`claims_accepted` and `claims_rejected`) count extract admissions only. The verify stage adds nothing to them, so verify rejects and the replacement claims of a contradiction are not counted; Tasks 13 and 14 must not present them as whole-run figures.
+
+Task 13's fix round changed `EnqueueVerify` and `PrepareVerify`. `EnqueueVerify` reads the run's state inside its own write transaction and, unless the run is `running`, inserts nothing and returns nil, so a `next` that read the run as running before `finish` moved it on cannot put verify rows into a finishing or finished run (rows that could never be handed out or committed, and that would make every later `finish` refuse). The inner `enqueueVerify` reports how many rows went in, and `PrepareVerify` returns that count, not the number of specs it asked for. `verifyTargets` (the inspected components that have claims to judge) is shared by `PrepareVerify` and the new `VerifyOwed`, which gives the number of components still owed a verify item in any run state and changes nothing: none when verify items exist, otherwise the targets. `finish` asks it after the move to `finishing`. `TestAVerifyItemIsQueuedOncePerComponent` now moves its run to `running` first, which is the state in which items are queued.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -9103,6 +9136,7 @@ func TestAVerifyItemIsQueuedOncePerComponent(t *testing.T) {
 	ctx := context.Background()
 	r, _, _, _ := newTestRuns(t)
 	run, _ := r.Create(ctx, planWith(0), specsN(1))
+	_ = r.Transition(ctx, run.ID, StateRunning, StatePlanned)
 	spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: "h"}
 	for i := 0; i < 2; i++ {
 		if err := r.EnqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil {
@@ -10058,18 +10092,82 @@ func ownsBetter(a, b Component, s StoredClaim) bool {
 }
 
 // EnqueueVerify adds verify items to a run. A component that already has one is left alone, so
-// two callers racing to prepare the same run queue one paid verification per component.
+// two callers racing to prepare the same run queue one paid verification per component. It adds
+// nothing, and says nothing, to a run that is not running: the state is read inside the write
+// transaction, so a next call that read the run as running before finish moved it on cannot put
+// rows in a finishing or finished run, where they could never be handed out or committed.
 func (r *Runs) EnqueueVerify(ctx context.Context, runID string, specs []ItemSpec) error {
-	return r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	_, err := r.enqueueVerify(ctx, runID, specs)
+	return err
+}
+
+// enqueueVerify is EnqueueVerify reporting how many rows it inserted.
+func (r *Runs) enqueueVerify(ctx context.Context, runID string, specs []ItemSpec) (int, error) {
+	inserted := 0
+	err := r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		inserted = 0
+		var state string
+		err := tx.QueryRowContext(ctx, `SELECT state FROM bs_runs WHERE run_id=? AND checkout_id=?`, runID, r.CheckoutID).Scan(&state)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNoRun
+		}
+		if err != nil {
+			return err
+		}
+		if state != StateRunning {
+			return nil
+		}
 		for _, sp := range specs {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO bs_items(item_id,run_id,checkout_id,stage,ref,input_hash,state) VALUES(?,?,?,'verify',?,?,'pending')
+			res, err := tx.ExecContext(ctx, `INSERT INTO bs_items(item_id,run_id,checkout_id,stage,ref,input_hash,state) VALUES(?,?,?,'verify',?,?,'pending')
 				ON CONFLICT(run_id, stage, ref) DO NOTHING`,
-				r.NewID("itm_"), runID, r.CheckoutID, sp.Ref, sp.InputHash); err != nil {
+				r.NewID("itm_"), runID, r.CheckoutID, sp.Ref, sp.InputHash)
+			if err != nil {
 				return err
 			}
+			n, _ := res.RowsAffected()
+			inserted += int(n)
 		}
 		return nil
 	})
+	if err != nil {
+		return 0, err
+	}
+	return inserted, nil
+}
+
+// verifyTargets are the inspected components that have claims to judge: the ones that get a
+// verify item. PrepareVerify queues them and VerifyOwed counts them, so the two cannot disagree.
+func verifyTargets(comps []Component, assigned map[string][]StoredClaim) []Component {
+	var out []Component
+	for _, c := range comps {
+		if c.Inspected && len(assigned[c.Prefix]) > 0 {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// VerifyOwed is how many components still need a verify item: none when verify items exist
+// (PrepareVerify queues them all at once), otherwise the inspected components that have claims to
+// judge. It reads, and decides, the same way PrepareVerify does but works in any run state and
+// changes nothing, so finish can ask it after the run has stopped accepting new work.
+func VerifyOwed(ctx context.Context, runs *Runs, runID string) (int, error) {
+	st, err := runs.Status(ctx, runID)
+	if err != nil {
+		return 0, err
+	}
+	if len(st.Items["verify"]) > 0 {
+		return 0, nil
+	}
+	comps, err := runs.Components(ctx, runID)
+	if err != nil {
+		return 0, err
+	}
+	claims, err := runs.Claims(ctx, runID)
+	if err != nil {
+		return 0, err
+	}
+	return len(verifyTargets(comps, AssignClaims(comps, claims))), nil
 }
 
 // PrepareVerify creates the verify items once every extract item is closed: one per inspected
@@ -10098,14 +10196,8 @@ func PrepareVerify(ctx context.Context, runs *Runs, w WorkFiles, runID string) (
 	files := ComponentFiles(Result{Sources: srcs, Components: comps})
 	assigned := AssignClaims(comps, claims)
 	var specs []ItemSpec
-	for _, c := range comps {
-		if !c.Inspected {
-			continue
-		}
+	for _, c := range verifyTargets(comps, assigned) {
 		related := assigned[c.Prefix]
-		if len(related) == 0 {
-			continue
-		}
 		var b strings.Builder
 		fmt.Fprintf(&b, "COMPONENT %s\nFILES\n", c.Prefix)
 		for _, f := range files[c.Prefix] {
@@ -10121,7 +10213,7 @@ func PrepareVerify(ctx context.Context, runs *Runs, w WorkFiles, runID string) (
 		}
 		specs = append(specs, ItemSpec{Stage: "verify", Ref: "comp:" + c.Prefix, InputHash: hash})
 	}
-	return len(specs), runs.EnqueueVerify(ctx, runID, specs)
+	return runs.enqueueVerify(ctx, runID, specs)
 }
 
 // quietReport is what an infrastructure failure reports: the item the store found and nothing
@@ -11981,51 +12073,48 @@ Known gap recorded here (decision 3 of this plan): search results do not yet dis
 
 **Files:**
 - Create: `internal/bootstrap/coverage.go`, `internal/app/bootstrap_finish.go`, `internal/app/bootstrap_progress.go`
-- Modify: `internal/bootstrap/runs.go` (`Runs.Finish`), `internal/app/bootstrap_cmd.go` (dispatcher case), `internal/app/bootstrap_next.go` (progress around `PrepareVerify`)
-- Test: `internal/bootstrap/coverage_test.go`, `internal/app/bootstrap_finish_test.go`
+- Modify: `internal/bootstrap/runs.go` (`requireWorking`, called by `Complete` and `FailCounted`; Task 8), `internal/bootstrap/verify.go` (`EnqueueVerify`, `VerifyOwed`; Task 11), `internal/app/bootstrap_cmd.go` (dispatcher case), `internal/app/bootstrap_next.go` (progress around `PrepareVerify`; status labels)
+- Test: `internal/bootstrap/coverage_test.go`, `internal/bootstrap/coverage_carry_test.go`, `internal/bootstrap/verify_late_test.go`, `internal/app/bootstrap_finish_test.go`, `internal/app/bootstrap_finish_carry_test.go`, `internal/app/bootstrap_finish_race_test.go`; `forceItemsClosed` appended to `internal/app/bootstrap_plan_test.go`; `TestAVerifyItemIsQueuedOncePerComponent` (Task 11) moves its run to `running` first
 
 **Interfaces:**
-- Consumes: `RenderPages`, `PlanOps`, `ScanPages`, `Runs.*`, `PrepareVerify`, `Progress.BeginStage` (Tasks 7 to 12); `publish.Publisher` via `project.publisher()`; `GitEnv` via `project.validateEnv()`.
+- Consumes: `RenderPages`, `PlanOps`, `ScanPages`, `Unrenderable`, `Runs.*`, `PrepareVerify`, `Progress.BeginStage` (Tasks 7 to 12); `publish.Publisher` via `project.publisher()`; `GitEnv` via `project.validateEnv()`.
 - Produces:
 
 ```go
 type PageOutcome struct{ Path, Outcome string } // written | unchanged | conflict
-type Coverage struct { ... }                    // see below
+type NotRead struct{ Source, Path, Reason, Date string }
+type SecretSkip struct{ Path string; Lines []int } // never the secret; no lines means it was in the file name
+type Coverage struct { ... }                    // coverage.go below: the JSON tags are the contract
+const TokensNote = "token counts are whole-run totals asserted by the driver; the binary cannot measure them"
 func BuildCoverage(ctx context.Context, runs *Runs, runID string, pages []PageOutcome, now time.Time) (Coverage, error)
 func (c Coverage) Text() string
-func (r *Runs) Finish(ctx context.Context, id, marker string) error
+func PageLabel(path string) string // a page named for a refusal, never by a component's name
+func (r *Runs) Finish(ctx context.Context, id, marker string) error // running or finishing -> done
+func (r *Runs) EnterFinishing(ctx context.Context, id string) (moved bool, err error)
+func (r *Runs) LeaveFinishing(ctx context.Context, id string) error
+func VerifyOwed(ctx context.Context, runs *Runs, runID string) (int, error) // Task 11
 ```
 
-```go
-type Coverage struct {
-	RunID, Head, Scope string
-	Sources            struct {
-		Read    int            `json:"read"`
-		Skipped map[string]int `json:"skipped"`
-		Oldest, Newest string `json:"oldest,newest"` // source dates (RFC3339) of the files that were read
-		NotExtracted   int     `json:"not_extracted"`   // implementation files scanned but in components that were not checked
-	} `json:"sources"`
-	SecretSkips []SecretSkip   `json:"secret_skips"` // path and line numbers; never text
-	NotRead     []NotRead      `json:"not_read"`     // directories, files, branches and worktrees that were never opened, by name
-	Components  struct {
-		Total, Inspected               int
-		Verified, Conflicting, Unknown []string
-		NotInspected                   []string
-	} `json:"components"`
-	Claims       map[string]int `json:"claims"`
-	ClaimsByKind map[string]map[string]int `json:"claims_by_kind"` // kind -> status -> count
-	Proposals    struct{ Accepted, Rejected int } `json:"proposals"`
-	TokensIn     int `json:"tokens_in"`; TokensOut int `json:"tokens_out"`
-	TokensNote   string `json:"tokens_note"`
-	DurationSecs float64 `json:"duration_s"`
-	Pages        []PageOutcome `json:"pages"`
-	Retirement   []string `json:"retirement"`
-	EndMarker    string `json:"end_marker"`
-}
-type SecretSkip struct{ Path string; Kind string; Lines []int }
-```
+The end marker is `"<head12> <RFC3339 time>"`; real turn capture starts from it, and `turns/` is not touched. The retirement checklist has one entry per `--source` directory: what was read, what was skipped, that Wikory changed nothing, and that a person backs it up and deletes it by hand when satisfied (design ruling 2). `BuildCoverage` treats its `pages` argument as the full rendered set (called with nil, every recorded page is stale); only `finish` calls it with real data, and it calls it after `Finish` so that `EndMarker` is filled.
 
-(`gofmt` the struct fields in the real file; the JSON tags above are the contract.) The end marker is `"<head12> <RFC3339 time>"`; real turn capture starts from it, and `turns/` is not touched. The retirement checklist has one entry per `--source` directory: what was read, what was skipped, that Wikory changed nothing, and that a person backs it up and deletes it by hand when satisfied (design ruling 2).
+Review round 1 changed this task as follows (the code blocks below are the tree as committed in `feat: add the bootstrap coverage report, finish command and end marker` and `fix: re-check finish preconditions after entering finishing and keep late work out of a finishing run`; they replace the brief's first sketch). What was built beyond the first sketch:
+
+1. The refusal for a secret-shaped page names pages by `PageLabel` (a fixed page by its path, a component page only as "a component page (name ends -<hash6>)", capped at five plus "and N more"); the slug of a component page carries a directory name from the project. A refused finish writes nothing and records nothing.
+2. `Unrenderable(pages)` (Task 12) is reported: the ids go to `Coverage.Unindexed` (`unindexed_claims`), the text report and a notice. The page is still published, because it holds the claim, but never silently.
+3. Every project-derived name in the report goes through `safeLabel`: control, invisible and line or paragraph separator characters become `?`, a secret-shaped name is withheld and shown as a 12-character hash, and the length is capped at 200 runes. A secret in a file name has no line numbers and prints "in the file name".
+4. `Proposals.Basis`, the text line "Extract admissions: N accepted, M rejected" and `status` (`admissions_note`) say the counts cover extract submissions only. Task 14 (confirm) must read the frozen `sample_*` figures, not `tokens_*`.
+5. `requireWorking` (Task 8) in `Complete` and `FailCounted`: an item leased before the run left `running` cannot commit claims, usage or counts into a finishing, done or abandoned run.
+6. `Coverage.StalePages` (`stale_pages`, `Runs.PublishedPaths`): pages an earlier bootstrap recorded that this run did not render are listed, with a notice, and are not deleted. The recorded hash is that of the bytes on disk. Pages are published in jobs of at most `maxOpsPerJob` pages and 2 MiB.
+7. `Coverage.GivenUp` (`items_given_up`): items rejected after `MaxAttempts` are a coverage gap (a source gave no claims, a component stayed unchecked), and `finish` reports them instead of proceeding silently.
+8. Progress: `prepare-verification` in `next` (only when there is work), `prepare` and `publish` in `finish`; stdout stays one envelope and every stderr line is one JSON event in `--json` mode.
+
+Fix round 1 (a review finding and its fold-ins):
+
+- The precondition checks and the move to `finishing` were separate transactions, and `PrepareVerify` checked the run state outside the transaction that enqueues. If the last extract submit landed after `PrepareVerify` returned 0 but before the item count, `finish` saw extraction closed and no verify items and published a baseline nobody had verified; a `next` that had read `running` could insert verify rows into a `finishing` run, which no one could then close. Now `EnterFinishing` makes the move and says whether this call made it; straight after it `finishBlockers` looks again, in the one state in which nothing new can commit: no open extract or verify item, and `VerifyOwed` is 0. A refusal there calls `LeaveFinishing` if (and only if) this call made the move, and returns the same refusal as before. `EnqueueVerify` (Task 11) refuses to add to a run that is not `running`.
+- A conflict from the publisher is explained by `describePublishConflict`, which reads the job's state: `refused` means the page changed before anything was applied ("nothing was applied", plus how many earlier jobs of this finish are already written); anything else means it was found while applying and earlier operations of the job may already be applied. Both say to run `wikory bootstrap finish` again, which reports an edited page as a conflict. The publisher's own sentence about earlier operations is not repeated where it would be untrue.
+- An existing page larger than the 4 MiB read limit is not ours: it is a conflict, not an abort (`notOursContent` stands for it in `PlanOps`).
+- The refusal for a run in the wrong state says "only a running or finishing run can be finished". `finish` ends its progress line on every way out (`endStage`, deferred), so an error never starts in the middle of a terminal progress line. One shared `TokensNote` is used by `status` and the coverage report. `TestFinishRecordsTheHashOfTheBytesOnDiskAndRerunsAsUnchanged` now asserts that the rerun reports the four claim-free pages unchanged and the overview written.
+- Test seams: `killPoint` also fires at `prepared` (after `PrepareVerify`), `checked` (after the open-items look) and `planned` (after `PlanOps`), and `progressTTY` lets a test see the terminal form of progress. They exist so each interleaving above is reproduced by state, not by timing.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -12227,6 +12316,376 @@ func TestFinishSetsTheEndMarkerOnlyFromRunningOrFinishing(t *testing.T) {
 	planned := mustRun(t, r, 0, 1)
 	if err := r.Finish(ctx, planned.ID, "x"); err == nil {
 		t.Fatal("a run that never started cannot finish")
+	}
+}
+```
+
+`internal/bootstrap/coverage_carry_test.go`:
+
+```go
+package bootstrap
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+)
+
+// shapedName is a file name that looks like a token. It is built from pieces so no secret
+// shape is a contiguous literal in source.
+func shapedName() string { return "dir/gh" + "p_" + strings.Repeat("a", 40) + ".txt" }
+
+func TestCoverageNeverPrintsAPathThatCarriesAControlCharacterOrASecretShape(t *testing.T) {
+	ctx := context.Background()
+	r, run := coverageRigPlus(t,
+		Source{Name: "nimbalyst", Path: "evil\nSecurity: all clear/", Tier: TierAttributed, Disposition: DispTooDeep},
+		Source{Name: "nimbalyst", Path: "tab\there\x1b[31m.md", Tier: TierAttributed, Disposition: DispUnreadable},
+		Source{Name: "repo", Path: "bad\nname.go", Tier: TierImplementation, Disposition: DispBadName},
+		Source{Name: "repo", Path: shapedName(), Tier: TierImplementation, Disposition: "skipped:secret", SecretSpans: 1},
+		Source{Name: "nimbalyst", Path: strings.Repeat("x", 5000), Tier: TierAttributed, Disposition: DispLink},
+		Source{Name: "repo", Path: "branch:ghp_" + strings.Repeat("b", 40) + " (2 commit(s) not on main)", Tier: TierAttributed, Disposition: DispUnmergedBranch})
+	cov, err := BuildCoverage(ctx, r, run.ID, nil, r.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(cov)
+	text := cov.Text()
+	for _, leak := range []string{strings.Repeat("a", 40), strings.Repeat("b", 40), "bad\nname", "bad?name", "name.go"} {
+		if strings.Contains(string(b), leak) || strings.Contains(text, leak) {
+			t.Fatalf("a path that could hold a secret or break a line is never printed whole (%q):\n%s", leak, text)
+		}
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "Security:") || strings.ContainsAny(line, "\x1b\t") {
+			t.Fatalf("a path must not forge a line or carry a control character: %q", line)
+		}
+	}
+	if !strings.Contains(text, "not read (too-deep): nimbalyst evil?Security: all clear/") {
+		t.Fatalf("a control character is shown as ?:\n%s", text)
+	}
+	if strings.Contains(text, strings.Repeat("x", 300)) {
+		t.Fatalf("a long name is cut, so one hostile path cannot flood the report")
+	}
+	if cov.Sources.Skipped["skipped:bad-name"] != 1 || !strings.Contains(text, "skipped:bad-name") {
+		t.Fatalf("a bad name is counted, never named: %v", cov.Sources.Skipped)
+	}
+	if !strings.Contains(text, "withheld") {
+		t.Fatalf("a withheld name says so:\n%s", text)
+	}
+	if cov.Sources.Skipped["skipped:secret"] != 2 {
+		t.Fatalf("the rig's own secret skip and the shaped name are both still counted: %v", cov.Sources.Skipped)
+	}
+}
+
+func TestCoverageLabelsProposalsAsExtractAdmissionsOnly(t *testing.T) {
+	ctx := context.Background()
+	r, run := coverageRig(t)
+	cov, err := BuildCoverage(ctx, r, run.ID, nil, r.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(cov.Proposals.Basis, "extract") || !strings.Contains(cov.Proposals.Basis, "not verify") {
+		t.Fatalf("the JSON says what the counts cover: %q", cov.Proposals.Basis)
+	}
+	if !strings.Contains(cov.Text(), "Extract admissions:") {
+		t.Fatalf("the text report says what the counts cover:\n%s", cov.Text())
+	}
+}
+
+func TestCoverageListsPagesAnEarlierBootstrapWroteThatWereNotRenderedThisTime(t *testing.T) {
+	ctx := context.Background()
+	r, run := coverageRig(t)
+	if err := r.RecordPublished(ctx, run.ID, map[string]string{"p/a.md": "h1", "p/gone-2.md": "h2", "p/evil\nforged.md": "h3"}); err != nil {
+		t.Fatal(err)
+	}
+	cov, err := BuildCoverage(ctx, r, run.ID, []PageOutcome{{Path: "p/a.md", Outcome: "unchanged"}}, r.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cov.StalePages) != 2 || cov.StalePages[0] != "p/evil?forged.md" || cov.StalePages[1] != "p/gone-2.md" {
+		t.Fatalf("a recorded page that was not rendered is listed, sorted, with control characters shown as ?: %v", cov.StalePages)
+	}
+	text := cov.Text()
+	if !strings.Contains(text, "p/gone-2.md") || !strings.Contains(text, "not deleted") {
+		t.Fatalf("the text names the stale page and says it was left alone:\n%s", text)
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "forged") {
+			t.Fatalf("forged line %q", line)
+		}
+	}
+}
+
+func TestCoverageNamesClaimsThePageHoldsButTheIndexCannotRead(t *testing.T) {
+	ctx := context.Background()
+	r, run := coverageRig(t)
+	cov, err := BuildCoverage(ctx, r, run.ID, nil, r.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(cov.Text(), "cannot read") {
+		t.Fatalf("nothing to say when every claim is indexable:\n%s", cov.Text())
+	}
+	cov.Unindexed = []string{"clm_one", "clm_two"}
+	if !strings.Contains(cov.Text(), "cannot read") || !strings.Contains(cov.Text(), "clm_two") {
+		t.Fatalf("claim ids the index cannot read are named:\n%s", cov.Text())
+	}
+}
+
+func TestPageLabelNamesAFixedPageAndOnlyTheHashOfAComponentPage(t *testing.T) {
+	fixed := WikiDir + "/constraints-2.md"
+	if got := PageLabel(fixed); got != fixed {
+		t.Fatalf("a fixed page is named by its path: %q", got)
+	}
+	for _, prefix := range []string{"internal/queue", "secret-service/a.b"} {
+		base := componentBase(prefix)
+		for _, name := range []string{base + ".md", base + "-2.md", base + "-12.md"} {
+			got := PageLabel(WikiDir + "/" + name)
+			hash := shortSlugHash(prefix)
+			if !strings.Contains(got, "component page") || !strings.Contains(got, hash) {
+				t.Fatalf("%s: a component page is named by the hash suffix: %q", name, got)
+			}
+			for _, leak := range []string{"queue", "secret-service", "component-"} {
+				if strings.Contains(got, leak) {
+					t.Fatalf("%s: the component's name must not appear: %q", name, got)
+				}
+			}
+		}
+	}
+	if got := PageLabel(WikiDir + "/something-unexpected\n.md"); strings.Contains(got, "\n") || strings.Contains(got, "something") {
+		t.Fatalf("a page name that is neither fixed nor a component page is not printed: %q", got)
+	}
+}
+
+// openItem leases one item of the run and returns it.
+func openItem(t *testing.T, r *Runs, runID string) Item {
+	t.Helper()
+	b, err := r.Next(context.Background(), runID, 1)
+	if err != nil || len(b.Items) != 1 {
+		t.Fatalf("lease: %v %+v", err, b)
+	}
+	return b.Items[0]
+}
+
+func TestAnItemLeasedBeforeTheRunLeftRunningCannotCommitLater(t *testing.T) {
+	ctx := context.Background()
+	for _, to := range []string{StateFinishing, StateDone, StateAbandoned} {
+		t.Run(to, func(t *testing.T) {
+			r, run := coverageRig(t)
+			it := openItem(t, r, run.ID)
+			if _, err := r.DB.Exec(`UPDATE bs_runs SET state=? WHERE run_id=?`, to, run.ID); err != nil {
+				t.Fatal(err)
+			}
+			plant := func(ctx context.Context, tx *sql.Tx, it Item) error {
+				_, err := tx.ExecContext(ctx, `INSERT INTO bs_claims(run_id,checkout_id,item_id,ordinal,claim_id,text,kind,status,meta,tier) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+					run.ID, r.CheckoutID, it.ID, 0, "clm_late", "Late.", "intent", "unverified", "", TierIntent)
+				return err
+			}
+			if err := r.Complete(ctx, it.ID, it.Epoch, Usage{InputTokens: 5}, plant); !errors.Is(err, ErrState) {
+				t.Fatalf("a late commit into a %s run must be refused as a state error, got %v", to, err)
+			}
+			if err := r.FailCounted(ctx, it.ID, it.Epoch, 1, 1, Usage{InputTokens: 5}); !errors.Is(err, ErrState) {
+				t.Fatalf("a late failure into a %s run must be refused as a state error, got %v", to, err)
+			}
+			claims, _ := r.Claims(ctx, run.ID)
+			got, _ := r.Get(ctx, run.ID)
+			if len(claims) != 0 || got.TokensIn != 0 || got.Accepted != 0 || got.Rejected != 0 {
+				t.Fatalf("nothing may be stored by a refused late commit: %d claims, %+v", len(claims), got)
+			}
+			after, _ := r.Item(ctx, it.ID)
+			if after.State != "leased" {
+				t.Fatalf("the item is left as it was: %+v", after)
+			}
+		})
+	}
+}
+
+// Every page RenderPages can emit must get a label: a page that fell through to "unexpected"
+// would hide which page held a secret. Split parts are included.
+func TestEveryRenderedPageGetsALabelThatNeverRepeatsAComponentName(t *testing.T) {
+	m := renderModel(t)
+	for i := 0; i < 150; i++ {
+		m.Claims = append(m.Claims,
+			stored(t, "src:repo:docs/decisions/0001.md", "intent", "unverified", fmt.Sprintf("Statement %d %s", i, strings.Repeat("padding ", 60)), 100+i),
+			stored(t, "comp:internal/queue", "current-impl", "unverified", fmt.Sprintf("Queue statement %d %s", i, strings.Repeat("padding ", 60)), 300+i))
+	}
+	pages := RenderPages(m)
+	parts, comps := 0, 0
+	for _, pg := range pages {
+		got := PageLabel(pg.Path)
+		switch {
+		case strings.Contains(pg.Path, "/component-"):
+			comps++
+			if !strings.Contains(got, "a component page") || strings.Contains(got, "queue") || strings.Contains(got, "component-") {
+				t.Errorf("%s: %q", pg.Path, got)
+			}
+		case got != pg.Path:
+			t.Errorf("a fixed page is named by its path: %s -> %q", pg.Path, got)
+		}
+		if strings.Contains(pg.Path, "constraints-2") {
+			parts++
+		}
+	}
+	if parts == 0 || comps < 2 {
+		t.Fatalf("the model must exercise split fixed pages and split component pages: %d %d", parts, comps)
+	}
+}
+
+func TestCoverageSaysHowMuchWorkWasGivenUpOn(t *testing.T) {
+	ctx := context.Background()
+	r, run := coverageRig(t)
+	cov, _ := BuildCoverage(ctx, r, run.ID, nil, r.Now())
+	if len(cov.GivenUp) != 0 || strings.Contains(cov.Text(), "given up") {
+		t.Fatalf("nothing was given up yet: %v", cov.GivenUp)
+	}
+	if _, err := r.DB.Exec(`UPDATE bs_items SET state='rejected' WHERE run_id=? AND item_id IN (SELECT item_id FROM bs_items WHERE run_id=? LIMIT 1)`, run.ID, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	cov, _ = BuildCoverage(ctx, r, run.ID, nil, r.Now())
+	if cov.GivenUp["extract"] != 1 || !strings.Contains(cov.Text(), "given up after 3 attempts: 1 extract") {
+		t.Fatalf("an item that was dropped is a gap the report must show: %v\n%s", cov.GivenUp, cov.Text())
+	}
+}
+```
+
+`internal/bootstrap/verify_late_test.go`:
+
+```go
+package bootstrap
+
+import (
+	"context"
+	"testing"
+
+	"github.com/TerrysPOV/Wikory/internal/ids"
+)
+
+func verifyItems(t *testing.T, r *Runs, runID string) int {
+	t.Helper()
+	st, err := r.Status(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, c := range st.Items["verify"] {
+		n += c
+	}
+	return n
+}
+
+// A next call that read the run as running can reach EnqueueVerify after finish has moved the run
+// on. Once the run is finishing (or done) nothing may add work to it: those rows could never be
+// handed out or committed, and a later finish would refuse for ever because of them.
+func TestEnqueueVerifyInsertsNothingIntoARunThatIsNotRunning(t *testing.T) {
+	ctx := context.Background()
+	for _, state := range []string{StateFinishing, StateDone} {
+		r, _, run := extractedRig(t)
+		if state == StateDone {
+			if err := r.Transition(ctx, run.ID, StateFinishing, StateRunning); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := r.Transition(ctx, run.ID, state, StateRunning, StateFinishing); err != nil {
+			t.Fatal(err)
+		}
+		spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: ids.SHA256Hex([]byte("late"))}
+		if err := r.EnqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil {
+			t.Fatalf("%s: a late enqueue is not an error, it simply adds nothing: %v", state, err)
+		}
+		if n := verifyItems(t, r, run.ID); n != 0 {
+			t.Fatalf("%s: %d verify item(s) were added to a run that is no longer running", state, n)
+		}
+	}
+	// The same call on a running run still queues the item.
+	r, _, run := extractedRig(t)
+	spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: ids.SHA256Hex([]byte("on time"))}
+	if err := r.EnqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil || verifyItems(t, r, run.ID) != 1 {
+		t.Fatalf("a running run takes the item: %v", err)
+	}
+}
+
+// The count a caller is told is the number of rows that went in, not the number it asked for.
+func TestEnqueueVerifyReportsHowManyItemsItQueued(t *testing.T) {
+	ctx := context.Background()
+	r, _, run := extractedRig(t)
+	spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: ids.SHA256Hex([]byte("x"))}
+	if n, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil || n != 1 {
+		t.Fatalf("%d %v", n, err)
+	}
+	if n, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil || n != 0 {
+		t.Fatalf("a component that already has an item adds nothing: %d %v", n, err)
+	}
+	if err := r.Transition(ctx, run.ID, StateFinishing, StateRunning); err != nil {
+		t.Fatal(err)
+	}
+	other := ItemSpec{Stage: "verify", Ref: "comp:internal/other", InputHash: ids.SHA256Hex([]byte("y"))}
+	if n, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{other}); err != nil || n != 0 {
+		t.Fatalf("a finishing run takes nothing: %d %v", n, err)
+	}
+}
+
+// VerifyOwed is the condition PrepareVerify acts on, readable without acting and in any state:
+// no verify item exists yet and an inspected component has claims to judge.
+func TestVerifyOwedCountsInspectedComponentsWithClaimsWhenNoVerifyItemExists(t *testing.T) {
+	ctx := context.Background()
+	r, w, run := extractedRig(t)
+	if n, err := VerifyOwed(ctx, r, run.ID); err != nil || n != 1 {
+		t.Fatalf("one inspected component has claims and no verify item: %d %v", n, err)
+	}
+	if err := r.Transition(ctx, run.ID, StateFinishing, StateRunning); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := VerifyOwed(ctx, r, run.ID); err != nil || n != 1 {
+		t.Fatalf("the answer does not depend on the run state: %d %v", n, err)
+	}
+	if err := r.Transition(ctx, run.ID, StateRunning, StateFinishing); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrepareVerify(ctx, r, w, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := VerifyOwed(ctx, r, run.ID); err != nil || n != 0 {
+		t.Fatalf("once verify items exist nothing is owed: %d %v", n, err)
+	}
+}
+
+// A run with nothing to judge owes nothing.
+func TestVerifyOwedIsZeroWhenNoClaimNeedsJudging(t *testing.T) {
+	ctx := context.Background()
+	r, _, _, _ := newTestRuns(t)
+	run, err := r.Create(ctx, planWith(0), specsN(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := VerifyOwed(ctx, r, run.ID); err != nil || n != 0 {
+		t.Fatalf("a run with nothing to judge owes nothing: %d %v", n, err)
+	}
+}
+
+func TestEnterFinishingReportsWhetherThisCallMadeTheMove(t *testing.T) {
+	ctx := context.Background()
+	r, _, run := extractedRig(t)
+	if moved, err := r.EnterFinishing(ctx, run.ID); err != nil || !moved {
+		t.Fatalf("a running run is moved by this call: %v %v", moved, err)
+	}
+	if moved, err := r.EnterFinishing(ctx, run.ID); err != nil || moved {
+		t.Fatalf("a run that is already finishing was not moved by this call: %v %v", moved, err)
+	}
+	if err := r.LeaveFinishing(ctx, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := r.Get(ctx, run.ID); got.State != StateRunning {
+		t.Fatalf("%+v", got)
+	}
+	if err := r.Transition(ctx, run.ID, StateDone, StateRunning); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.EnterFinishing(ctx, run.ID); err == nil {
+		t.Fatal("a finished run cannot go back to finishing")
 	}
 }
 ```
@@ -12462,6 +12921,671 @@ func TestNextAndFinishShowProgressForTheirLongSteps(t *testing.T) {
 }
 ```
 
+`internal/app/bootstrap_finish_carry_test.go`:
+
+```go
+package app
+
+import (
+	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/TerrysPOV/Wikory/internal/bootstrap"
+	"github.com/TerrysPOV/Wikory/internal/ids"
+	"github.com/TerrysPOV/Wikory/internal/publish"
+)
+
+// pagesRecorded counts the rows of bs_pages: what earlier bootstraps recorded as their own.
+func pagesRecorded(t *testing.T, c *cli) int {
+	t.Helper()
+	db := openTestDB(t, c)
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM bs_pages`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+type finishReport struct {
+	Pages []struct {
+		Path    string `json:"path"`
+		Outcome string `json:"outcome"`
+	} `json:"pages"`
+	StalePages []string       `json:"stale_pages"`
+	Unindexed  []string       `json:"unindexed_claims"`
+	EndMarker  string         `json:"end_marker"`
+	Claims     map[string]int `json:"claims"`
+	Proposals  struct {
+		Basis string `json:"basis"`
+	} `json:"proposals"`
+	TokensNote string `json:"tokens_note"`
+}
+
+// plantClaimOn stores a claim as if the item with this ref had produced it.
+func plantClaimOn(t *testing.T, c *cli, runID, ref, text string) {
+	t.Helper()
+	db := openTestDB(t, c)
+	defer db.Close()
+	var checkout, item string
+	if err := db.QueryRow(`SELECT checkout_id,item_id FROM bs_items WHERE run_id=? AND stage='extract' AND ref=?`, runID, ref).Scan(&checkout, &item); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO bs_claims(run_id,checkout_id,item_id,ordinal,claim_id,text,kind,status,meta,tier) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		runID, checkout, item, 9998, "clm_planted_comp", text, "current-impl", "unverified", "", "implementation"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFinishRefusalNamesAComponentPageOnlyByItsHashAndWritesNothing(t *testing.T) {
+	dir, c, run := finishedRunInputs(t)
+	forceItemsClosed(t, c, run)
+	secret := "hunter2hunter2"
+	// internal/queue is an inspected component, so a claim naming it lands on its own page.
+	plantClaimOn(t, c, run, "comp:internal/queue", "The internal/queue deploy script sets pass"+"word="+secret+" first.")
+	e, code, errOut := runBootstrapJSON(t, c, dir, "finish", "--run", run)
+	b, _ := json.Marshal(e)
+	if code == ExitOK || e.OK {
+		t.Fatalf("finish must refuse: %d %s", code, b)
+	}
+	all := string(b) + errOut
+	if strings.Contains(all, secret) {
+		t.Fatalf("the value is never repeated:\n%s", all)
+	}
+	hash := ids.SHA256Hex([]byte("internal/queue"))[:6]
+	if !strings.Contains(e.Error.Message, hash) || !strings.Contains(e.Error.Message, "nothing was published") {
+		t.Fatalf("a component page is named by its hash suffix: %q", e.Error.Message)
+	}
+	for _, leak := range []string{"queue", "component-", "internal"} {
+		if strings.Contains(all, leak) {
+			t.Fatalf("the refusal must not repeat what the page was named after (%q):\n%s", leak, all)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "project-memory", "wiki", "bootstrap")); err == nil {
+		t.Fatal("nothing may have been written to the repository")
+	}
+	if n := pagesRecorded(t, c); n != 0 {
+		t.Fatalf("nothing may be recorded as published: %d rows", n)
+	}
+	run2, _, _ := runBootstrapJSON(t, c, dir, "status", "--run", run)
+	if st := decodeData[struct {
+		Run struct {
+			State string `json:"state"`
+		} `json:"run"`
+	}](t, run2); st.Run.State == "done" {
+		t.Fatal("a refused finish must not mark the run done")
+	}
+}
+
+func TestFinishWithASecretOnAFixedPageRecordsAndWritesNothing(t *testing.T) {
+	dir, c, run := finishedRunInputs(t)
+	forceItemsClosed(t, c, run)
+	plantClaimRow(t, c, run, "The deploy script sets pass"+"word=hunter2hunter2 before the queue starts.")
+	if _, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run); code == ExitOK {
+		t.Fatal("finish must refuse")
+	}
+	if n := pagesRecorded(t, c); n != 0 {
+		t.Fatalf("nothing may be recorded: %d", n)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "project-memory", "wiki", "bootstrap")); err == nil {
+		t.Fatal("nothing may be written")
+	}
+}
+
+func TestFinishReportsAClaimThePageHoldsButTheIndexCannotRead(t *testing.T) {
+	dir, c, run := finishedRunInputs(t)
+	forceItemsClosed(t, c, run)
+	plantClaimRow(t, c, run, strings.Repeat("`a`", 1100))
+	e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
+	if code != ExitOK || !e.OK {
+		t.Fatalf("%d %+v", code, e)
+	}
+	rep := decodeData[finishReport](t, e)
+	if len(rep.Unindexed) != 1 || rep.Unindexed[0] != "clm_planted" {
+		t.Fatalf("the claim the index cannot read is named, not silently published: %+v", rep.Unindexed)
+	}
+	noticed := false
+	for _, n := range e.Notices {
+		noticed = noticed || (strings.Contains(n, "clm_planted") && strings.Contains(n, "cannot read"))
+	}
+	if !noticed {
+		t.Fatalf("finish says so as a notice: %v", e.Notices)
+	}
+}
+
+// pagesOf reads every recorded page's hash and the bytes now on disk.
+func recordedPages(t *testing.T, c *cli) map[string]string {
+	t.Helper()
+	db := openTestDB(t, c)
+	defer db.Close()
+	rows, err := db.Query(`SELECT path,hash FROM bs_pages`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var p, h string
+		if err := rows.Scan(&p, &h); err != nil {
+			t.Fatal(err)
+		}
+		out[p] = h
+	}
+	return out
+}
+
+func TestFinishRecordsTheHashOfTheBytesOnDiskAndRerunsAsUnchanged(t *testing.T) {
+	dir, c, run := finishedRunInputs(t)
+	forceItemsClosed(t, c, run)
+	e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
+	if code != ExitOK {
+		t.Fatalf("%d %+v", code, e)
+	}
+	rep := decodeData[finishReport](t, e)
+	rec := recordedPages(t, c)
+	if len(rec) != len(rep.Pages) || len(rec) == 0 {
+		t.Fatalf("every page is recorded: %d recorded, %d reported", len(rec), len(rep.Pages))
+	}
+	for p, h := range rec {
+		data, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(p)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if publish.HashContent(data) != h {
+			t.Fatalf("%s: the recorded hash is not the hash of the bytes on disk, so a later bootstrap would call its own page an edit", p)
+		}
+		if bytes.Contains(data, []byte("\r")) {
+			t.Fatalf("%s: pages are written with the line endings they were rendered with", p)
+		}
+	}
+	// A second bootstrap of the same commit with nothing extracted renders a different overview and
+	// component page (they hold or count the claim) but byte-identical claim-free pages. Our own
+	// earlier output is never a conflict: the identical pages are reported unchanged, and the
+	// others are written over because the bytes on disk are the bytes we recorded.
+	pe, _, _ := runBootstrapJSON(t, c, dir, "plan")
+	run2 := decodeData[planData](t, pe).RunID
+	forceState(t, c, run2, "running")
+	forceItemsClosed(t, c, run2)
+	e2, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run2)
+	if code != ExitOK {
+		t.Fatalf("%d %+v", code, e2)
+	}
+	got := map[string]string{}
+	for _, p := range decodeData[finishReport](t, e2).Pages {
+		got[strings.TrimPrefix(p.Path, "project-memory/wiki/bootstrap/")] = p.Outcome
+	}
+	for _, name := range []string{"architecture.md", "constraints.md", "known-issues.md", "unfinished-work.md"} {
+		if got[name] != "unchanged" {
+			t.Fatalf("%s renders the same, so the rerun reports it unchanged, not %q (%v)", name, got[name], got)
+		}
+	}
+	if got["overview.md"] != "written" {
+		t.Fatalf("the overview counts claims, so it was rendered again and written over our own earlier version: %v", got)
+	}
+	for name, outcome := range got {
+		if outcome == "conflict" {
+			t.Fatalf("%s: our own earlier output is not a conflict (%v)", name, got)
+		}
+	}
+}
+
+func TestFinishListsPagesAnEarlierBootstrapWroteThatItDidNotRenderThisTime(t *testing.T) {
+	dir, c, run := finishedRunInputs(t)
+	forceItemsClosed(t, c, run)
+	db := openTestDB(t, c)
+	var checkout string
+	if err := db.QueryRow(`SELECT checkout_id FROM bs_runs WHERE run_id=?`, run).Scan(&checkout); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO bs_pages(checkout_id,path,hash,run_id) VALUES(?,?,?,?)`, checkout, "project-memory/wiki/bootstrap/component-internal-gone-abcdef.md", "h", run); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
+	if code != ExitOK {
+		t.Fatalf("%d %+v", code, e)
+	}
+	rep := decodeData[finishReport](t, e)
+	if len(rep.StalePages) != 1 || !strings.HasSuffix(rep.StalePages[0], "component-internal-gone-abcdef.md") {
+		t.Fatalf("a page that shrank away or a component that dropped out is named: %+v", rep.StalePages)
+	}
+}
+
+// lateSubmitBody is an extract submission for the doc item, as finishedRunInputs sent it.
+func lateSubmitBody(t *testing.T, c *cli, runID string) (body, batch string) {
+	t.Helper()
+	db := openTestDB(t, c)
+	defer db.Close()
+	var item, bat string
+	var epoch int
+	if err := db.QueryRow(`SELECT item_id,epoch,batch FROM bs_items WHERE run_id=? AND stage='extract' AND ref='src:repo:docs/design.md'`, runID).Scan(&item, &epoch, &bat); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(map[string]any{"stage": "extract", "results": []map[string]any{{"item": item, "epoch": epoch,
+		"claims": []map[string]any{{"text": "The internal/queue package acknowledges after the handler returns.", "kind": "current-impl",
+			"excerpt": "acknowledges after the handler returns", "locator": "L1-L1"}}}}})
+	return string(b), bat
+}
+
+func claimCount(t *testing.T, c *cli, runID string) int {
+	t.Helper()
+	db := openTestDB(t, c)
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM bs_claims WHERE run_id=?`, runID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestASubmissionAfterFinishIsRefusedAndStoresNothing(t *testing.T) {
+	dir, c, run := finishedRunInputs(t)
+	forceItemsClosed(t, c, run)
+	if _, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run); code != ExitOK {
+		t.Fatal("finish")
+	}
+	before := claimCount(t, c, run)
+	body, batch := lateSubmitBody(t, c, run)
+	// 1. The item is done: the old lease is refused.
+	c.stdin = body
+	e, _, _ := runBootstrapJSON(t, c, dir, "submit", "--run", run, "--batch", batch)
+	if got := decodeData[submitReport](t, e); len(got.Results) != 1 || got.Results[0].Error == "" {
+		t.Fatalf("a late submission is refused: %+v", got)
+	}
+	// 2. Even an item that is still leased, as if finish had run while it was out: the run is
+	// not working any more, so nothing it sends is stored.
+	db := openTestDB(t, c)
+	if _, err := db.Exec(`UPDATE bs_items SET state='leased' WHERE run_id=? AND stage='extract' AND ref='src:repo:docs/design.md'`, run); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	c.stdin = body
+	e, _, _ = runBootstrapJSON(t, c, dir, "submit", "--run", run, "--batch", batch)
+	got := decodeData[submitReport](t, e)
+	if len(got.Results) != 1 || got.Results[0].Error == "" || !strings.Contains(got.Results[0].Error, "done") {
+		t.Fatalf("a leased item of a finished run is refused on the run's state: %+v", got)
+	}
+	if after := claimCount(t, c, run); after != before {
+		t.Fatalf("a late submission stored claims: %d -> %d", before, after)
+	}
+}
+
+func TestFinishPublishesInSeveralJobsWhenThePagesDoNotFitOne(t *testing.T) {
+	old, oldKill := maxOpsPerJob, killPoint
+	maxOpsPerJob = 2
+	jobs := 0
+	killPoint = func(step string) {
+		if strings.HasPrefix(step, "after-job-") {
+			jobs++
+		}
+	}
+	t.Cleanup(func() { maxOpsPerJob, killPoint = old, oldKill })
+	dir, c, run := finishedRunInputs(t)
+	forceItemsClosed(t, c, run)
+	e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
+	if code != ExitOK {
+		t.Fatalf("%d %+v", code, e)
+	}
+	rep := decodeData[finishReport](t, e)
+	for _, p := range rep.Pages {
+		if p.Outcome != "written" {
+			t.Fatalf("%s: %s", p.Path, p.Outcome)
+		}
+		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(p.Path))); err != nil {
+			t.Fatalf("%s was not written: %v", p.Path, err)
+		}
+	}
+	if want := (len(rep.Pages) + 1) / 2; jobs != want {
+		t.Fatalf("%d pages at 2 per job make %d jobs, got %d", len(rep.Pages), want, jobs)
+	}
+	if got := recordedPages(t, c); len(got) != len(rep.Pages) {
+		t.Fatalf("every page of every job is recorded: %d of %d", len(got), len(rep.Pages))
+	}
+}
+
+func TestStatusAndFinishSayThatAcceptedAndRejectedCountExtractSubmissionsOnly(t *testing.T) {
+	dir, c, run := finishedRunInputs(t)
+	out, _, code := c.run(dir, "bootstrap", "status", "--run", run)
+	if code != ExitOK || !strings.Contains(out, "extract admissions") {
+		t.Fatalf("status text:\n%s", out)
+	}
+	e, _, _ := runBootstrapJSON(t, c, dir, "status", "--run", run)
+	st := decodeData[struct {
+		Note       string `json:"admissions_note"`
+		TokensNote string `json:"tokens_note"`
+	}](t, e)
+	if !strings.Contains(st.Note, "extract submissions only") {
+		t.Fatalf("status JSON carries the note: %q", st.Note)
+	}
+	forceItemsClosed(t, c, run)
+	e, code, _ = runBootstrapJSON(t, c, dir, "finish", "--run", run)
+	if code != ExitOK {
+		t.Fatalf("%d %+v", code, e)
+	}
+	rep := decodeData[finishReport](t, e)
+	if !strings.Contains(rep.Proposals.Basis, "extract") || !strings.Contains(rep.TokensNote, "asserted") {
+		t.Fatalf("finish labels the counts: %+v", rep)
+	}
+	if st.TokensNote != rep.TokensNote || st.TokensNote != bootstrap.TokensNote {
+		t.Fatalf("status and the coverage report label the token counts with one shared note: %q / %q", st.TokensNote, rep.TokensNote)
+	}
+}
+
+func TestProgressEventsOnStderrAreOneJSONObjectPerLineAndStdoutStaysOneEnvelope(t *testing.T) {
+	old := progressNow
+	progressNow = steppingClock(3 * 1e9)
+	t.Cleanup(func() { progressNow = old })
+	dir, c, run := finishedRunInputs(t)
+	forceItemsClosed(t, c, run)
+	out, errOut, code := c.run(dir, "--json", "bootstrap", "finish", "--run", run)
+	if code != ExitOK {
+		t.Fatalf("%d %s", code, errOut)
+	}
+	var env map[string]any
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("stdout must stay one envelope: %v\n%s", err, out)
+	}
+	events := 0
+	for _, line := range strings.Split(strings.TrimSpace(errOut), "\n") {
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("every stderr line is a JSON event: %q", line)
+		}
+		if ev["event"] != nil {
+			events++
+		}
+	}
+	if events == 0 {
+		t.Fatalf("expected progress events:\n%s", errOut)
+	}
+}
+```
+
+`internal/app/bootstrap_finish_race_test.go`:
+
+```go
+package app
+
+import (
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/TerrysPOV/Wikory/internal/publish"
+)
+
+// runStateOf reads a run's state straight from the store.
+func runStateOf(t *testing.T, c *cli, runID string) string {
+	t.Helper()
+	db := openTestDB(t, c)
+	defer db.Close()
+	var s string
+	if err := db.QueryRow(`SELECT state FROM bs_runs WHERE run_id=?`, runID).Scan(&s); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// plantPendingVerifyItem adds a pending verify item to a run, as a next call that read the run
+// as running would have done a moment before finish moved it on.
+func plantPendingVerifyItem(t *testing.T, c *cli, runID string) {
+	t.Helper()
+	db := openTestDB(t, c)
+	defer db.Close()
+	var checkout string
+	if err := db.QueryRow(`SELECT checkout_id FROM bs_runs WHERE run_id=?`, runID).Scan(&checkout); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO bs_items(item_id,run_id,checkout_id,stage,ref,input_hash,state) VALUES('itm_late',?,?,'verify','comp:internal/late','h','pending')`, runID, checkout); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// withKillPoint installs a hook for the duration of the test and reports how often it fired.
+func withKillPoint(t *testing.T, step string, fn func()) *int {
+	t.Helper()
+	old := killPoint
+	fired := 0
+	killPoint = func(s string) {
+		if s == step {
+			fired++
+			fn()
+		}
+	}
+	t.Cleanup(func() { killPoint = old })
+	return &fired
+}
+
+// The last extract submit can land after finish's PrepareVerify returned 0 (extract still open at
+// that moment) and before its next look at the items. Finish then sees extraction closed and no
+// verify items, and without a second look it would publish a baseline nobody verified.
+func TestFinishDoesNotPublishWhenTheLastExtractLandsAfterThePrepareCheck(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	pe, _, _ := runBootstrapJSON(t, c, dir, "plan")
+	run := decodeData[planData](t, pe).RunID
+	forceState(t, c, run, "running")
+	if _, code, _ := runBootstrapJSON(t, c, dir, "next", "--run", run, "--max", "50"); code != ExitOK {
+		t.Fatal("next")
+	}
+	fired := withKillPoint(t, "prepared", func() {
+		// The last extract submit commits here: the items close and a claim for a checked component appears.
+		forceItemsClosed(t, c, run)
+		plantClaimRow(t, c, run, "The internal/queue package acknowledges after the handler returns.")
+	})
+	e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
+	if *fired != 1 {
+		t.Fatalf("the interleaving was not reproduced: the hook fired %d times", *fired)
+	}
+	if code == ExitOK || e.OK || !strings.Contains(e.Error.Message, "verify") {
+		t.Fatalf("finish must not publish a baseline that was never verified: %d %+v", code, e)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "project-memory", "wiki", "bootstrap")); err == nil {
+		t.Fatal("nothing may have been published")
+	}
+	if got := runStateOf(t, c, run); got != "running" {
+		t.Fatalf("a refused finish leaves the run running so that next can still hand out the verify work, got %s", got)
+	}
+	// With the hook gone the work can proceed: next prepares and hands out the verify item.
+	*fired = 0
+	killPoint = func(string) {}
+	ne, _, _ := runBootstrapJSON(t, c, dir, "next", "--run", run)
+	if d := decodeData[struct {
+		Items []struct{} `json:"items"`
+	}](t, ne); len(d.Items) != 1 {
+		t.Fatalf("one verify item for the checked component: %+v", ne)
+	}
+	forceItemsClosed(t, c, run)
+	if e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run); code != ExitOK || !e.OK {
+		t.Fatalf("a later finish after the items close succeeds: %d %+v", code, e)
+	}
+}
+
+// A verify row inserted after finish looked at the items is caught by the look after the move to
+// finishing, and the refusal puts the run back to running: nothing else could close those items
+// from finishing, so a run left there would refuse every later finish for ever.
+func TestARefusalAfterEnteringFinishingLeavesTheRunRunning(t *testing.T) {
+	dir, c, run := finishedRunInputs(t)
+	forceItemsClosed(t, c, run)
+	fired := withKillPoint(t, "checked", func() { plantPendingVerifyItem(t, c, run) })
+	e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
+	if *fired != 1 {
+		t.Fatalf("the hook fired %d times", *fired)
+	}
+	if code == ExitOK || e.OK || !strings.Contains(e.Error.Message, "verify item(s) are still open") {
+		t.Fatalf("finish refuses with the usual message: %d %+v", code, e)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "project-memory", "wiki", "bootstrap")); err == nil {
+		t.Fatal("nothing may have been published")
+	}
+	if got := runStateOf(t, c, run); got != "running" {
+		t.Fatalf("the refusal must leave the run running, got %s", got)
+	}
+	killPoint = func(string) {}
+	forceItemsClosed(t, c, run)
+	if e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run); code != ExitOK || !e.OK {
+		t.Fatalf("finish after the items close: %d %+v", code, e)
+	}
+}
+
+// A run that was already finishing when this call began (an earlier finish failed after the
+// move) is not this call's to put back: only a call that made the move undoes it.
+func TestARefusalLeavesAFinishingRunFinishingWhenThisCallDidNotMoveIt(t *testing.T) {
+	dir, c, run := finishedRunInputs(t)
+	forceItemsClosed(t, c, run)
+	forceState(t, c, run, "finishing")
+	fired := withKillPoint(t, "checked", func() { plantPendingVerifyItem(t, c, run) })
+	e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
+	if *fired != 1 || code == ExitOK || e.OK {
+		t.Fatalf("fired %d: %d %+v", *fired, code, e)
+	}
+	if got := runStateOf(t, c, run); got != "finishing" {
+		t.Fatalf("this call did not make the move, so it must not undo it, got %s", got)
+	}
+}
+
+func TestFinishRefusalNamesBothStatesThatCanBeFinished(t *testing.T) {
+	dir, c, run := finishedRunInputs(t)
+	forceState(t, c, run, "done")
+	e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
+	if code == ExitOK || e.OK || !strings.Contains(e.Error.Message, "running or finishing") {
+		t.Fatalf("the refusal names both states that can be finished: %d %+v", code, e)
+	}
+}
+
+// A page created between the plan and the write is refused by the publisher before anything is
+// applied. The message says so (without the publisher's own sentence about earlier operations
+// being applied, which would be untrue here) and says what to do.
+func TestFinishExplainsAPageEditedAfterPlanningAndAFreshFinishReportsItAsAConflict(t *testing.T) {
+	dir, c, run := finishedRunInputs(t)
+	forceItemsClosed(t, c, run)
+	overview := filepath.Join(dir, "project-memory", "wiki", "bootstrap", "overview.md")
+	fired := withKillPoint(t, "planned", func() {
+		if err := os.MkdirAll(filepath.Dir(overview), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(overview, []byte("A person wrote this first.\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	})
+	e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
+	if *fired != 1 || code == ExitOK || e.OK {
+		t.Fatalf("fired %d: %d %+v", *fired, code, e)
+	}
+	msg := e.Error.Message
+	if !strings.Contains(msg, "nothing was applied") || !strings.Contains(msg, "wikory bootstrap finish") || !strings.Contains(msg, "conflict") {
+		t.Fatalf("the message says nothing was applied and to run finish again, which reports the edit as a conflict: %q", msg)
+	}
+	if strings.Contains(msg, "may already be applied") {
+		t.Fatalf("a revalidation refusal applied nothing, so it must not say operations may be applied: %q", msg)
+	}
+	killPoint = func(string) {}
+	e2, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
+	if code != ExitOK {
+		t.Fatalf("%d %+v", code, e2)
+	}
+	conflicts := 0
+	for _, p := range decodeData[finishReport](t, e2).Pages {
+		if strings.HasSuffix(p.Path, "overview.md") && p.Outcome == "conflict" {
+			conflicts++
+		}
+	}
+	if conflicts != 1 || readFile(t, overview) != "A person wrote this first.\n" {
+		t.Fatalf("the second finish reports the page as a conflict and leaves it alone (%d)", conflicts)
+	}
+}
+
+func TestDescribePublishConflictTellsARefusedJobFromAnAppliedOne(t *testing.T) {
+	cause := publish.ErrConflict
+	refused := describePublishConflict(cause, "refused", 0).Error()
+	if !strings.Contains(refused, "nothing was applied") || strings.Contains(refused, "may already be applied") || strings.Contains(refused, "earlier") {
+		t.Fatalf("a refused job applied nothing: %q", refused)
+	}
+	later := describePublishConflict(cause, "refused", 1).Error()
+	if !strings.Contains(later, "earlier") || !strings.Contains(later, "already written") {
+		t.Fatalf("a refusal after an earlier job says that job's pages are already written: %q", later)
+	}
+	applied := describePublishConflict(cause, "conflict", 0).Error()
+	if !strings.Contains(applied, "may already be applied") || strings.Contains(applied, "nothing was applied") {
+		t.Fatalf("a conflict found while applying may have applied earlier operations: %q", applied)
+	}
+	for _, m := range []string{refused, later, applied} {
+		if !strings.Contains(m, "wikory bootstrap finish") {
+			t.Fatalf("every message says to run finish again: %q", m)
+		}
+	}
+	if !errors.Is(describePublishConflict(cause, "refused", 0), publish.ErrConflict) {
+		t.Fatal("the cause stays reachable with errors.Is")
+	}
+}
+
+// A page that has grown past the read limit is not ours; it is a conflict, not a reason to abort.
+func TestFinishTreatsAnOversizePageAsAConflictNotAnAbort(t *testing.T) {
+	dir, c, run := finishedRunInputs(t)
+	forceItemsClosed(t, c, run)
+	overview := filepath.Join(dir, "project-memory", "wiki", "bootstrap", "overview.md")
+	if err := os.MkdirAll(filepath.Dir(overview), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	big := []byte(strings.Repeat("a long line of notes\n", 5<<20/21+10))
+	if len(big) <= 4<<20 {
+		t.Fatalf("the page must exceed the read limit: %d", len(big))
+	}
+	if err := os.WriteFile(overview, big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e, code, _ := runBootstrapJSON(t, c, dir, "finish", "--run", run)
+	if code != ExitOK || !e.OK {
+		t.Fatalf("an oversize page must not abort finish: %d %+v", code, e)
+	}
+	conflicts := 0
+	for _, p := range decodeData[finishReport](t, e).Pages {
+		if strings.HasSuffix(p.Path, "overview.md") && p.Outcome == "conflict" {
+			conflicts++
+		}
+	}
+	after, _ := os.ReadFile(overview)
+	if conflicts != 1 || len(after) != len(big) {
+		t.Fatalf("the oversize page is reported as a conflict and left as it was (%d conflicts, %d bytes)", conflicts, len(after))
+	}
+}
+
+// A failure after some progress was shown must end the progress line, or the next thing written
+// to a terminal starts in the middle of it.
+func TestAFailedFinishEndsTheProgressLineOnATerminal(t *testing.T) {
+	oldNow, oldTTY, oldMax := progressNow, progressTTY, maxOpsPerJob
+	progressNow = steppingClock(3 * time.Second)
+	progressTTY = func(io.Writer) bool { return true }
+	maxOpsPerJob = 2
+	t.Cleanup(func() { progressNow, progressTTY, maxOpsPerJob = oldNow, oldTTY, oldMax })
+	dir, c, run := finishedRunInputs(t)
+	forceItemsClosed(t, c, run)
+	fired := withKillPoint(t, "after-job-0", func() {
+		// A person creates every fixed page, so the next job's pages are no longer free to write.
+		for _, n := range []string{"overview", "architecture", "constraints", "known-issues", "unfinished-work"} {
+			if err := os.WriteFile(filepath.Join(dir, "project-memory", "wiki", "bootstrap", n+".md"), []byte("mine\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	_, errOut, code := c.run(dir, "bootstrap", "finish", "--run", run)
+	if *fired != 1 || code == ExitOK {
+		t.Fatalf("the second job should have been refused (fired %d, code %d):\n%s", *fired, code, errOut)
+	}
+	at := strings.Index(errOut, "wikory bootstrap:")
+	if !strings.Contains(errOut, "wikory: stage 2 of 2: publish") || at < 1 || errOut[at-1] != '\n' {
+		t.Fatalf("the error must start on a fresh line, not on the end of the progress line:\n%q", errOut)
+	}
+}
+```
+
 with the helper (append to `bootstrap_plan_test.go`):
 
 ```go
@@ -12504,11 +13628,21 @@ package bootstrap
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+
+	"github.com/TerrysPOV/Wikory/internal/ids"
+	"github.com/TerrysPOV/Wikory/internal/redact"
 )
+
+// TokensNote is the label every report of token counts carries: status and the coverage report
+// print whole-run totals the driver asserted, and the binary measures nothing itself.
+const TokensNote = "token counts are whole-run totals asserted by the driver; the binary cannot measure them"
 
 // PageOutcome is what happened to one page at finish.
 type PageOutcome struct {
@@ -12528,7 +13662,8 @@ type NotRead struct {
 	Date   string `json:"date,omitempty"`
 }
 
-// SecretSkip names a skipped file and the lines a secret was on. It never holds the secret.
+// SecretSkip names a skipped file and the lines a secret was on. It never holds the secret, and
+// when the file's own name is secret-shaped the name is withheld too (see safeLabel).
 type SecretSkip struct {
 	Path  string `json:"path"`
 	Lines []int  `json:"lines"`
@@ -12565,6 +13700,8 @@ type Coverage struct {
 	Proposals    struct {
 		Accepted int `json:"accepted"`
 		Rejected int `json:"rejected"`
+		// Basis says what the two counts cover: extract submissions only.
+		Basis string `json:"basis"`
 	} `json:"proposals"`
 	TokensIn     int           `json:"tokens_in"`
 	TokensOut    int           `json:"tokens_out"`
@@ -12573,6 +13710,101 @@ type Coverage struct {
 	Pages        []PageOutcome `json:"pages"`
 	Retirement   []string      `json:"retirement"`
 	EndMarker    string        `json:"end_marker"`
+	// StalePages are pages an earlier bootstrap wrote that this run did not render (a page that
+	// shrank, a component that dropped out). They are still in the repository and may be out of
+	// date; Wikory never deletes them.
+	StalePages []string `json:"stale_pages"`
+	// GivenUp counts items per stage that were tried MaxAttempts times and dropped: the source
+	// or component behind each contributes no claims (extract) or stays unchecked (verify).
+	GivenUp map[string]int `json:"items_given_up"`
+	// Unindexed are claims a page holds that the indexer's parser cannot read even alone.
+	Unindexed []string `json:"unindexed_claims"`
+}
+
+// maxLabelRunes bounds one printed name, so a hostile path cannot flood the report.
+const maxLabelRunes = 200
+
+// safeLabel makes a name taken from the project (a file, a branch, a directory) fit to print. A
+// name that is itself secret-shaped is withheld and shown only as a hash prefix. Otherwise each
+// control or invisible character, and each line or paragraph separator, shows as "?", so a name
+// cannot forge a line of the report, and the length is bounded.
+func safeLabel(p string) string {
+	if len(redact.Scan(p)) > 0 {
+		return "(name withheld: it looks like a secret; hash " + ids.SHA256Hex([]byte(p))[:12] + ")"
+	}
+	var b strings.Builder
+	n := 0
+	for _, r := range p {
+		if n++; n > maxLabelRunes {
+			b.WriteString("...")
+			break
+		}
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+			r = '?'
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// componentPageRe matches the file name of a component page: the readable slug, the six-digit
+// hash of the prefix, and for a later part of a split page its number.
+var componentPageRe = regexp.MustCompile(`^component-.*-([0-9a-f]{6})(?:-[0-9]+)?\.md$`)
+
+// PageLabel names a rendered page for a message that must not repeat what the page was built
+// from. A fixed page (overview, architecture and the like) is named by its path. A component
+// page's name carries a slug of the component's directory, which comes from the project and may
+// hold anything, so it is named only by the hash suffix that tells two component pages apart.
+// A name that is neither is not printed.
+func PageLabel(path string) string {
+	base := path[strings.LastIndex(path, "/")+1:]
+	if strings.HasPrefix(base, "component-") {
+		if m := componentPageRe.FindStringSubmatch(base); m != nil {
+			return "a component page (name ends -" + m[1] + ")"
+		}
+		return "a component page"
+	}
+	name, isMD := strings.CutSuffix(base, ".md")
+	for _, fixed := range fixedPages {
+		if rest, ok := strings.CutPrefix(name, fixed); isMD && ok && (rest == "" || (rest[0] == '-' && isPartSuffix(rest[1:]))) {
+			return WikiDir + "/" + base
+		}
+	}
+	return "a page with an unexpected name"
+}
+
+// fixedPages are the base names of the pages every bootstrap writes, whatever the project holds.
+var fixedPages = []string{"overview", "architecture", "constraints", "known-issues", "unfinished-work"}
+
+// isPartSuffix reports whether s is the number of a later part of a split page.
+func isPartSuffix(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// PublishedPaths lists the pages an earlier bootstrap recorded as its own in this checkout.
+func (r *Runs) PublishedPaths(ctx context.Context) ([]string, error) {
+	rows, err := r.DB.QueryContext(ctx, `SELECT path FROM bs_pages WHERE checkout_id=? ORDER BY path`, r.CheckoutID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // BuildCoverage assembles the report from the stored run. It reads no file text.
@@ -12599,6 +13831,16 @@ func BuildCoverage(ctx context.Context, runs *Runs, runID string, pages []PageOu
 		return cov, err
 	}
 	cov.RunID, cov.Head, cov.Scope, cov.EndMarker = run.ID, run.Head, run.Scope, run.EndMarker
+	st, err := runs.Status(ctx, runID)
+	if err != nil {
+		return cov, err
+	}
+	cov.GivenUp = map[string]int{}
+	for stage, states := range st.Items {
+		if n := states["rejected"]; n > 0 {
+			cov.GivenUp[stage] = n
+		}
+	}
 	cov.Sources.Skipped = map[string]int{}
 	cov.Claims = map[string]int{}
 	cov.ClaimsByKind = map[string]map[string]int{}
@@ -12621,12 +13863,12 @@ func BuildCoverage(ctx context.Context, runs *Runs, runID string, pages []PageOu
 			c[1]++
 			if notReadReasons[s.Disposition] {
 				c[2]++
-				cov.NotRead = append(cov.NotRead, NotRead{Source: s.Name, Path: s.Path, Reason: s.Disposition, Date: s.Date})
+				cov.NotRead = append(cov.NotRead, NotRead{Source: s.Name, Path: safeLabel(s.Path), Reason: s.Disposition, Date: s.Date})
 			}
 		}
 		perSource[s.Name] = c
 		if s.SecretSpans > 0 {
-			cov.SecretSkips = append(cov.SecretSkips, SecretSkip{Path: s.Path, Lines: s.SecretLines})
+			cov.SecretSkips = append(cov.SecretSkips, SecretSkip{Path: safeLabel(s.Path), Lines: s.SecretLines})
 		}
 	}
 	for _, c := range claims {
@@ -12648,7 +13890,7 @@ func BuildCoverage(ctx context.Context, runs *Runs, runID string, pages []PageOu
 	cov.Components.Total = len(comps)
 	for _, c := range comps {
 		if !c.Inspected {
-			cov.Components.NotInspected = append(cov.Components.NotInspected, c.Prefix)
+			cov.Components.NotInspected = append(cov.Components.NotInspected, safeLabel(c.Prefix))
 			continue
 		}
 		cov.Components.Inspected++
@@ -12662,20 +13904,36 @@ func BuildCoverage(ctx context.Context, runs *Runs, runID string, pages []PageOu
 		}
 		switch {
 		case conflicting:
-			cov.Components.Conflicting = append(cov.Components.Conflicting, c.Prefix)
+			cov.Components.Conflicting = append(cov.Components.Conflicting, safeLabel(c.Prefix))
 		case verified:
-			cov.Components.Verified = append(cov.Components.Verified, c.Prefix)
+			cov.Components.Verified = append(cov.Components.Verified, safeLabel(c.Prefix))
 		default:
-			cov.Components.Unknown = append(cov.Components.Unknown, c.Prefix)
+			cov.Components.Unknown = append(cov.Components.Unknown, safeLabel(c.Prefix))
 		}
 	}
 	cov.Proposals.Accepted, cov.Proposals.Rejected = run.Accepted, run.Rejected
+	cov.Proposals.Basis = "extract submissions only: claims admitted or rejected when they were first proposed, not verify verdicts (see claims by status for the outcome of verification)"
 	cov.TokensIn, cov.TokensOut = run.TokensIn, run.TokensOut
-	cov.TokensNote = "token counts are asserted by the driver; the binary cannot measure them"
+	cov.TokensNote = TokensNote
 	if created, err := time.Parse(tsLayout, run.CreatedAt); err == nil {
 		cov.DurationSecs = now.Sub(created).Seconds()
 	}
-	cov.Pages = pages
+	cov.Pages = make([]PageOutcome, len(pages))
+	rendered := map[string]bool{}
+	for i, pg := range pages {
+		cov.Pages[i] = PageOutcome{Path: safeLabel(pg.Path), Outcome: pg.Outcome}
+		rendered[pg.Path] = true
+	}
+	recorded, err := runs.PublishedPaths(ctx)
+	if err != nil {
+		return cov, err
+	}
+	for _, p := range recorded {
+		if !rendered[p] {
+			cov.StalePages = append(cov.StalePages, safeLabel(p))
+		}
+	}
+	sort.Strings(cov.StalePages)
 	var names []string
 	for n := range perSource {
 		if n != "repo" {
@@ -12689,6 +13947,7 @@ func BuildCoverage(ctx context.Context, runs *Runs, runID string, pages []PageOu
 		if dir == "" {
 			dir = "(directory not recorded)"
 		}
+		dir = safeLabel(dir)
 		note := ""
 		if c[2] > 0 {
 			note = fmt.Sprintf(" %d of the skipped were never opened (too deep, unreadable or links) and are listed under not read; look at them before you delete anything.", c[2])
@@ -12726,11 +13985,28 @@ func (c Coverage) Text() string {
 		for i, l := range s.Lines {
 			nums[i] = fmt.Sprint(l)
 		}
-		fmt.Fprintf(&b, "  skipped for a secret: %s (line %s)\n", s.Path, strings.Join(nums, ", "))
+		where := "line " + strings.Join(nums, ", ")
+		if len(nums) == 0 {
+			where = "in the file name"
+		}
+		fmt.Fprintf(&b, "  skipped for a secret: %s (%s)\n", s.Path, where)
+	}
+	if len(c.GivenUp) > 0 {
+		stages := make([]string, 0, len(c.GivenUp))
+		for k := range c.GivenUp {
+			stages = append(stages, k)
+		}
+		sort.Strings(stages)
+		parts := make([]string, len(stages))
+		for i, k := range stages {
+			parts[i] = fmt.Sprintf("%d %s", c.GivenUp[k], k)
+		}
+		fmt.Fprintf(&b, "Work given up after %d attempts: %s item(s). Their sources contribute no claims and their components stay unchecked.\n", MaxAttempts, strings.Join(parts, ", "))
 	}
 	fmt.Fprintf(&b, "Components: %d found, %d checked: %d verified, %d conflicting, %d unknown; %d not checked\n",
 		c.Components.Total, c.Components.Inspected, len(c.Components.Verified), len(c.Components.Conflicting), len(c.Components.Unknown), len(c.Components.NotInspected))
-	fmt.Fprintf(&b, "Claims: %v. Proposals: %d accepted, %d rejected.\n", c.Claims, c.Proposals.Accepted, c.Proposals.Rejected)
+	fmt.Fprintf(&b, "Claims: %v.\n", c.Claims)
+	fmt.Fprintf(&b, "Extract admissions: %d accepted, %d rejected (extract stage only; verify verdicts are not counted here).\n", c.Proposals.Accepted, c.Proposals.Rejected)
 	kinds := make([]string, 0, len(c.ClaimsByKind))
 	for k := range c.ClaimsByKind {
 		kinds = append(kinds, k)
@@ -12752,6 +14028,19 @@ func (c Coverage) Text() string {
 	fmt.Fprintf(&b, "Tokens (asserted): %d in, %d out. Duration: %.0fs.\n", c.TokensIn, c.TokensOut, c.DurationSecs)
 	for _, p := range c.Pages {
 		fmt.Fprintf(&b, "  %-9s %s\n", p.Outcome, p.Path)
+	}
+	if len(c.StalePages) > 0 {
+		b.WriteString("Pages an earlier bootstrap wrote that this run did not render (not deleted; they may be out of date, review or remove them by hand):\n")
+		for _, p := range c.StalePages {
+			fmt.Fprintf(&b, "  stale     %s\n", p)
+		}
+	}
+	if len(c.Unindexed) > 0 {
+		shown := make([]string, len(c.Unindexed))
+		for i, id := range c.Unindexed {
+			shown[i] = safeLabel(id)
+		}
+		fmt.Fprintf(&b, "%d claim(s) are on a page but the index cannot read them, so search will not find them: %s\n", len(c.Unindexed), strings.Join(shown, ", "))
 	}
 	for _, r := range c.Retirement {
 		b.WriteString(r + "\n")
@@ -12776,9 +14065,46 @@ func (r *Runs) Finish(ctx context.Context, id, marker string) error {
 		return nil
 	})
 }
-```
 
-`BuildCoverage` is called after `Finish` in the command so `EndMarker` is filled; the tests above call it before `Finish` and expect the marker only where `Finish` ran.
+// EnterFinishing moves a running run to finishing, from where nothing new can be handed out or
+// committed. It reports whether this call made the move, so that a caller that has to back out
+// undoes only its own move: a run that was already finishing (an earlier finish failed after the
+// move) is left as it is. A run in any other state is refused.
+func (r *Runs) EnterFinishing(ctx context.Context, id string) (bool, error) {
+	moved := false
+	err := r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		moved = false
+		var state string
+		err := tx.QueryRowContext(ctx, `SELECT state FROM bs_runs WHERE run_id=? AND checkout_id=?`, id, r.CheckoutID).Scan(&state)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNoRun
+		}
+		if err != nil {
+			return err
+		}
+		switch state {
+		case StateFinishing:
+			return nil
+		case StateRunning:
+			if _, err := tx.ExecContext(ctx, `UPDATE bs_runs SET state=?, updated_at=? WHERE run_id=? AND checkout_id=? AND state=?`,
+				StateFinishing, r.ts(), id, r.CheckoutID, StateRunning); err != nil {
+				return err
+			}
+			moved = true
+			return nil
+		default:
+			return fmt.Errorf("%w: a %s run cannot move to finishing", ErrState, state)
+		}
+	})
+	return moved && err == nil, err
+}
+
+// LeaveFinishing puts a finishing run back to running, so that its open work can be handed out
+// and submitted again.
+func (r *Runs) LeaveFinishing(ctx context.Context, id string) error {
+	return r.Transition(ctx, id, StateRunning, StateFinishing)
+}
+```
 
 `internal/app/bootstrap_finish.go`:
 
@@ -12787,9 +14113,11 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
+	"sort"
 	"strings"
 	"time"
 
@@ -12822,7 +14150,7 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		return Result{}, err
 	}
 	if run.State != bootstrap.StateRunning && run.State != bootstrap.StateFinishing {
-		return Result{}, fmt.Errorf("the run is %s; only a running run can be finished", run.State)
+		return Result{}, fmt.Errorf("the run is %s; only a running or finishing run can be finished", run.State)
 	}
 	head, err := p.Repo.HeadCommit(ctx)
 	if err != nil {
@@ -12832,27 +14160,49 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		return Result{}, &UsageError{Msg: fmt.Sprintf("the repository moved from %.12s to %.12s since this run was planned; the baseline describes the planned commit, so plan again", run.Head, head)}
 	}
 	prog := newBootstrapProgress(env)
-	prog.BeginStage(1, 2, "prepare", 1, time.Second, "Checking and rendering the baseline pages. Safe to leave running; if it is interrupted, run finish again.")
+	// The progress line is ended on every way out of here, so an error never starts in the middle of it.
+	staged := false
+	beginStage := func(index, count int, name string, total int, expected time.Duration, notice string) {
+		prog.BeginStage(index, count, name, total, expected, notice)
+		staged = true
+	}
+	endStage := func() {
+		if staged {
+			staged = false
+			prog.End()
+		}
+	}
+	defer endStage()
+	beginStage(1, 2, "prepare", 1, time.Second, "Checking and rendering the baseline pages. Safe to leave running; if it is interrupted, run finish again.")
 	wf := bootstrap.WorkFiles{Root: p.Store.Root, CheckoutID: p.Checkout.ID}
 	if n, err := bootstrap.PrepareVerify(ctx, runs, wf, id); err != nil {
 		return Result{}, err
 	} else if n > 0 {
 		return Result{}, fmt.Errorf("%d verify item(s) were just created; run wikory bootstrap next to hand them out, submit the verdicts, then finish", n)
 	}
-	st, err := runs.Status(ctx, id)
-	if err != nil {
+	killPoint("prepared")
+	if err := openItemsRefusal(ctx, runs, id); err != nil {
 		return Result{}, err
 	}
-	for _, stage := range []string{"extract", "verify"} {
-		if open := st.Items[stage]["pending"] + st.Items[stage]["leased"]; open > 0 {
-			return Result{}, fmt.Errorf("%d %s item(s) are still open; hand them out with wikory bootstrap next and submit them first", open, stage)
-		}
-	}
+	killPoint("checked")
 	pub := p.publisher()
 	if _, err := pub.Recover(ctx); err != nil {
 		return Result{}, err
 	}
-	if err := runs.Transition(ctx, id, bootstrap.StateFinishing, bootstrap.StateRunning, bootstrap.StateFinishing); err != nil {
+	entered, err := runs.EnterFinishing(ctx, id)
+	if err != nil {
+		return Result{}, err
+	}
+	// Nothing new can be handed out or committed from here, so this look is the authoritative one:
+	// the checks above ran in separate transactions, and a submit or a next call can have landed
+	// between any of them and the move. A refusal here undoes the move if this call made it, or
+	// the run would sit in finishing with open work that nothing can close.
+	if err := finishBlockers(ctx, runs, id); err != nil {
+		if entered {
+			if lerr := runs.LeaveFinishing(ctx, id); lerr != nil {
+				err = errors.Join(err, fmt.Errorf("the run could not be put back to running: %w", lerr))
+			}
+		}
 		return Result{}, err
 	}
 	comps, err := runs.Components(ctx, id)
@@ -12868,17 +14218,26 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		return Result{}, err
 	}
 	pages := bootstrap.RenderPages(bootstrap.RenderModel{Run: run, Date: run.CreatedAt[:10], Components: comps, Sources: srcs, Claims: claims})
-	// Nothing is written until every rendered page has been scanned. The refusal names the page
-	// and the kind of value, never the value, so it cannot leak what it is refusing to publish.
+	// Nothing is written until every rendered page has been scanned: this slice, exactly as
+	// RenderPages returned it, is what PlanOps and the publisher go on to use. The refusal names
+	// the page and the kind of value, never the value, and a component page only by its hash
+	// suffix (its file name carries a slug of a directory name from the project), so the refusal
+	// cannot leak what it is refusing to publish.
 	if bad := bootstrap.ScanPages(pages); len(bad) > 0 {
-		return Result{}, fmt.Errorf("%s would hold text that looks like a secret (%s); nothing was published. The text is not shown here: find it in the sources the page was built from, remove or redact it there, and plan again", bad[0].Path, strings.Join(bad[0].Kinds, ", "))
+		return Result{}, refuseSecretPages(bad)
 	}
+	unindexed := bootstrap.Unrenderable(pages)
 	prog.Step(1)
-	prog.End()
+	endStage()
 	current := func(path string) ([]byte, bool, error) {
 		data, err := p.RepoRoot.ReadFile(path, 4<<20)
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, false, nil
+		}
+		if errors.Is(err, confine.ErrTooLarge) {
+			// A page that has grown past the read limit is not ours: PlanOps must see content that
+			// matches neither the new render nor anything recorded, and so file it as a conflict.
+			return notOursContent, true, nil
 		}
 		return data, err == nil, err
 	}
@@ -12897,6 +14256,7 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 	if err != nil {
 		return Result{}, describeConfineErr(err)
 	}
+	killPoint("planned")
 	outcomes := make([]bootstrap.PageOutcome, 0, len(pages))
 	isConflict, isSame := map[string]bool{}, map[string]bool{}
 	for _, c := range conflicts {
@@ -12906,7 +14266,7 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		isSame[u] = true
 	}
 	written := map[string]string{}
-	prog.BeginStage(2, 2, "publish", len(ops), time.Duration(len(ops))*100*time.Millisecond,
+	beginStage(2, 2, "publish", len(ops), time.Duration(len(ops))*100*time.Millisecond,
 		fmt.Sprintf("Publishing %d page(s). Safe to leave running; if it is interrupted, run finish again.", len(ops)))
 	jobNo := 0
 	for start := 0; start < len(ops); {
@@ -12923,6 +14283,9 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 			return Result{}, err
 		}
 		if err := pub.Publish(ctx, job, ops[start:end], fmt.Sprintf("bootstrap %s: %d page(s)", id, end-start)); err != nil {
+			if errors.Is(err, publish.ErrConflict) {
+				return Result{}, describePublishConflict(err, jobState(ctx, p.Store.DB, job.ID), jobNo)
+			}
 			return Result{}, err
 		}
 		for _, o := range ops[start:end] {
@@ -12933,7 +14296,7 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		killPoint(fmt.Sprintf("after-job-%d", jobNo))
 		jobNo++
 	}
-	prog.End()
+	endStage()
 	// A page that already equals the new render is our output too (for example after a killed
 	// finish that recovery completed), so its hash is recorded and the next bootstrap will not
 	// mistake it for a person's edit.
@@ -12961,16 +14324,23 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		}
 		outcomes = append(outcomes, bootstrap.PageOutcome{Path: pg.Path, Outcome: o})
 	}
-	marker := fmt.Sprintf("%.12s %s", head, time.Now().UTC().Format(time.RFC3339))
+	marker := fmt.Sprintf("%.12s %s", head, runs.Now().UTC().Format(time.RFC3339))
 	if err := runs.Finish(ctx, id, marker); err != nil {
 		return Result{}, err
 	}
 	killPoint("marked-done")
-	cov, err := bootstrap.BuildCoverage(ctx, runs, id, outcomes, time.Now())
+	cov, err := bootstrap.BuildCoverage(ctx, runs, id, outcomes, runs.Now())
 	if err != nil {
 		return Result{}, err
 	}
+	cov.Unindexed = unindexed
 	var notices []string
+	if len(unindexed) > 0 {
+		notices = append(notices, fmt.Sprintf("%d claim(s) are on a published page but the index cannot read them, so search will not find them: %s", len(unindexed), strings.Join(unindexed, ", ")))
+	}
+	if len(cov.StalePages) > 0 {
+		notices = append(notices, fmt.Sprintf("%d page(s) an earlier bootstrap wrote were not rendered this time and were left in place; the report lists them", len(cov.StalePages)))
+	}
 	if len(conflicts) > 0 {
 		notices = append(notices, fmt.Sprintf("%d page(s) were edited by a person and were left alone; see the report", len(conflicts)))
 	}
@@ -12980,12 +14350,112 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 	return Result{Data: cov, Text: cov.Text(), Notices: notices}, nil
 }
 
+// refuseSecretPages is the error for pages that would hold secret-shaped text. It names each
+// page by PageLabel and the kinds of value found, never the text or a component's name.
+func refuseSecretPages(bad []bootstrap.PageSecret) error {
+	const shown = 5
+	var names []string
+	kinds := map[string]bool{}
+	for i, b := range bad {
+		if i < shown {
+			names = append(names, bootstrap.PageLabel(b.Path))
+		}
+		for _, k := range b.Kinds {
+			kinds[k] = true
+		}
+	}
+	var ks []string
+	for k := range kinds {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	list := strings.Join(names, ", ")
+	if len(bad) > shown {
+		list += fmt.Sprintf(" and %d more", len(bad)-shown)
+	}
+	return fmt.Errorf("page(s) %s would hold text that looks like a secret (%s); nothing was published. The text is not shown here: find it in the sources the page was built from, remove or redact it there, and plan again", list, strings.Join(ks, ", "))
+}
+
 // describeConfineErr wraps a confinement failure with the plain-language explanation.
 func describeConfineErr(err error) error {
 	if errors.Is(err, confine.ErrSymlink) || errors.Is(err, confine.ErrNotRegular) {
 		return describeConfine(err)
 	}
 	return err
+}
+
+// notOursContent stands for an existing page too large to read. It is not the new render and not
+// anything a bootstrap recorded, so PlanOps files the page as a conflict.
+var notOursContent = []byte("wikory: an existing page larger than the read limit; it is not ours\n")
+
+// openItemsRefusal is the error for extract or verify work that is still pending or leased, or nil.
+func openItemsRefusal(ctx context.Context, runs *bootstrap.Runs, id string) error {
+	st, err := runs.Status(ctx, id)
+	if err != nil {
+		return err
+	}
+	for _, stage := range []string{"extract", "verify"} {
+		if open := st.Items[stage]["pending"] + st.Items[stage]["leased"]; open > 0 {
+			return fmt.Errorf("%d %s item(s) are still open; hand them out with wikory bootstrap next and submit them first", open, stage)
+		}
+	}
+	return nil
+}
+
+// finishBlockers is the look finish takes once the run is finishing: no extract or verify item is
+// open, and no verify work is owed that nothing has queued yet (a baseline must not be published
+// unverified because the last extract submit landed after finish last looked).
+func finishBlockers(ctx context.Context, runs *bootstrap.Runs, id string) error {
+	if err := openItemsRefusal(ctx, runs, id); err != nil {
+		return err
+	}
+	owed, err := bootstrap.VerifyOwed(ctx, runs, id)
+	if err != nil {
+		return err
+	}
+	if owed > 0 {
+		return fmt.Errorf("%d component(s) have claims to verify but no verify item has been queued; run wikory bootstrap next to queue and hand them out, submit the verdicts, then finish", owed)
+	}
+	return nil
+}
+
+// finishConflict is a publish conflict with the explanation finish gives for it. It prints its
+// own message, not the publisher's, whose sentence about earlier operations may not be true of
+// this case, and keeps the cause for errors.Is.
+type finishConflict struct {
+	msg   string
+	cause error
+}
+
+func (e *finishConflict) Error() string { return e.msg }
+func (e *finishConflict) Unwrap() error { return e.cause }
+
+// describePublishConflict explains a conflict from the publisher. jobState is the job's state in
+// the store: "refused" means the publisher found the page changed before it applied anything;
+// anything else, "conflict" included, means it was found while applying, when earlier operations
+// of the same job may already be on disk. jobNo counts the publish jobs of this finish that
+// completed before this one.
+func describePublishConflict(err error, jobState string, jobNo int) error {
+	const again = "Run wikory bootstrap finish again: it reads the pages afresh, reports a page a person created or edited as a conflict and leaves it alone."
+	var msg string
+	switch {
+	case jobState == "refused" && jobNo == 0:
+		msg = "a baseline page was created or edited after finish planned its writes; nothing was applied. " + again
+	case jobState == "refused":
+		msg = fmt.Sprintf("a baseline page was created or edited after finish planned its writes; nothing was applied from the job that found it, but the pages of the %d earlier job(s) of this finish are already written. %s", jobNo, again)
+	default:
+		msg = "a baseline page changed while finish was writing it, so earlier operations of this job may already be applied. " + again
+	}
+	return &finishConflict{msg: msg, cause: err}
+}
+
+// jobState reads a publish job's state, or "" when it cannot be read.
+func jobState(ctx context.Context, db *sql.DB, jobID string) string {
+	var state string
+	if err := db.QueryRowContext(ctx, `SELECT state FROM jobs WHERE job_id = ?`, jobID).Scan(&state); err != nil {
+		return ""
+	}
+	return state
 }
 ```
 
@@ -13005,10 +14475,13 @@ import (
 // progressNow is the clock progress reporting uses; a test replaces it to make quick work look slow.
 var progressNow = time.Now
 
+// progressTTY decides whether stderr is a terminal; a test replaces it to see the terminal form.
+var progressTTY = IsTTY
+
 // newBootstrapProgress is the reporter for next and finish. It writes to stderr (JSON events in
 // --json mode), so stdout stays one envelope.
 func newBootstrapProgress(env *Env) *Progress {
-	return NewProgress(env.IO.Err, env.JSON, IsTTY(env.IO.Err), progressNow)
+	return NewProgress(env.IO.Err, env.JSON, progressTTY(env.IO.Err), progressNow)
 }
 
 // verifyPrepDue reports whether the next PrepareVerify will do real work, and for how many
@@ -13060,6 +14533,8 @@ In `bootstrapNext` (`internal/app/bootstrap_next.go`), replace the `PrepareVerif
 	}
 ```
 
+and give `bootstrapStatus` the labels shown in Task 8 (`bootstrap.TokensNote`, `admissionsNote`). `requireWorking` is in Task 8's `runs.go` code, and `EnqueueVerify`, `verifyTargets` and `VerifyOwed` are in Task 11's `verify.go` code.
+
 Add to the dispatcher in `runBootstrap`:
 
 ```go
@@ -13087,7 +14562,53 @@ Run: `scripts/inject.sh internal/bootstrap/coverage.go 'if notReadReasons[s.Disp
 Run: `scripts/inject.sh internal/bootstrap/coverage.go 'cov.ClaimsByKind[c.Kind][c.Status]++' '_ = c.Kind' ./internal/bootstrap/ 'TestCoverageCountsClaimsByKindAndStatus' 'claims by kind and status'`
 Run: `scripts/inject.sh internal/bootstrap/coverage.go 'if s.Date > cov.Sources.Newest {' 'if false {' ./internal/bootstrap/ 'TestCoverageNamesWhatWasNeverOpenedAndWhenSourcesLastChanged' 'oldest and newest'`
 Run: `scripts/inject.sh internal/bootstrap/coverage.go 'if !inspected[prefix] {' 'if !inspected[prefix] && prefix == "never" {' ./internal/bootstrap/ 'TestCoverageCountsImplementationFilesThatWereScannedButNeverSummarised' 'component that was not checked'`
-Expected: each exits 0 (RED).
+
+The carry-over assertions (items 1 to 8 above):
+
+Run: `scripts/inject.sh internal/bootstrap/coverage.go $'\t\t\tr = \'?\'' $'\t\t\t_ = r' ./internal/bootstrap/ TestCoverageNeverPrintsAPath 'must not forge a line'`
+Run: `scripts/inject.sh internal/bootstrap/coverage.go 'if len(redact.Scan(p)) > 0 {' 'if len(redact.Scan(p)) < 0 {' ./internal/bootstrap/ TestCoverageNeverPrintsAPath 'never printed whole'`
+Run: `scripts/inject.sh internal/bootstrap/coverage.go 'if n++; n > maxLabelRunes {' 'if n++; n > 1<<30 {' ./internal/bootstrap/ TestCoverageNeverPrintsAPath 'flood the report'`
+Run: `scripts/inject.sh internal/bootstrap/coverage.go 'cov.Proposals.Basis = "extract' 'cov.Proposals.Basis = "' ./internal/bootstrap/ TestCoverageLabelsProposals 'the JSON says what the counts cover'`
+Run: `scripts/inject.sh internal/bootstrap/coverage.go 'Extract admissions: %d' 'Proposals: %d' ./internal/bootstrap/ TestCoverageLabelsProposals 'the text report says what'`
+Run: `scripts/inject.sh internal/bootstrap/coverage.go 'if !rendered[p] {' 'if false {' ./internal/bootstrap/ TestCoverageListsPagesAnEarlier 'a recorded page that was not rendered is listed'`
+Run: `scripts/inject.sh internal/bootstrap/coverage.go 'if n := states["rejected"]; n > 0 {' 'if n := states["nope"]; n > 0 {' ./internal/bootstrap/ TestCoverageSaysHowMuchWorkWasGivenUpOn 'an item that was dropped is a gap'`
+Run: `scripts/inject.sh internal/bootstrap/coverage.go 'return "a component page (name ends -" + m[1] + ")"' 'return base' ./internal/bootstrap/ TestPageLabelNames 'named by the hash suffix'`
+Run: `scripts/inject.sh internal/bootstrap/coverage.go 'if len(c.Unindexed) > 0 {' 'if false {' ./internal/bootstrap/ TestCoverageNamesClaimsThePageHolds 'claim ids the index cannot read are named'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'if state != StateSampling && state != StateRunning {' 'if false {' ./internal/bootstrap/ TestAnItemLeasedBeforeTheRunLeftRunningCannotCommitLater 'a late commit into a'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go $'\t\tif err := requireWorking(ctx, tx, it.RunID, r.CheckoutID); err != nil {\n\t\t\treturn err\n\t\t}\n\t\tif fn != nil {' $'\t\tif fn != nil {' ./internal/bootstrap/ TestAnItemLeasedBeforeTheRunLeftRunningCannotCommitLater 'a late commit into a'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go $'\t\tif err := requireWorking(ctx, tx, it.RunID, r.CheckoutID); err != nil {\n\t\t\treturn err\n\t\t}\n\t\tif _, err := tx.ExecContext(ctx, `UPDATE bs_runs SET accepted=accepted+?' $'\t\tif _, err := tx.ExecContext(ctx, `UPDATE bs_runs SET accepted=accepted+?' ./internal/bootstrap/ TestAnItemLeasedBeforeTheRunLeftRunningCannotCommitLater 'a late failure into a'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'if state != StateSampling && state != StateRunning {' 'if false {' ./internal/app/ TestASubmissionAfterFinishIsRefusedAndStoresNothing 'refused on the run'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'names = append(names, bootstrap.PageLabel(b.Path))' 'names = append(names, b.Path)' ./internal/app/ TestFinishRefusalNamesAComponentPage 'must not repeat what the page was named after'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'bootstrap.ScanPages(pages)' 'bootstrap.ScanPages(pages[:1])' ./internal/app/ TestFinishWithASecretOnAFixedPage 'finish must refuse'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'unindexed := bootstrap.Unrenderable(pages)' 'unindexed := []string(nil)' ./internal/app/ TestFinishReportsAClaimThePageHolds 'the claim the index cannot read is named'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'cov.Unindexed = unindexed' '_ = unindexed' ./internal/app/ TestFinishReportsAClaimThePageHolds 'the claim the index cannot read is named'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'written[o.Target] = publish.HashContent(o.Content)' 'written[o.Target] = "x"' ./internal/app/ TestFinishRecordsTheHashOfTheBytesOnDisk 'recorded hash is not the hash'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'end-start < maxOpsPerJob' 'end-start < 1000' ./internal/app/ TestFinishPublishesInSeveralJobs make`
+Run: `scripts/inject.sh internal/app/bootstrap_next.go 'AdmissionsNote: admissionsNote}' 'AdmissionsNote: ""}' ./internal/app/ TestStatusAndFinishSay 'status JSON carries the note'`
+
+Fix round 1:
+
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'if err := finishBlockers(ctx, runs, id); err != nil {' 'if err := error(nil); err != nil {' ./internal/app/ TestFinishDoesNotPublishWhenTheLastExtractLandsAfterThePrepareCheck 'never verified'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'if owed > 0 {' 'if owed > 1000 {' ./internal/app/ TestFinishDoesNotPublishWhenTheLastExtractLandsAfterThePrepareCheck 'never verified'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go $'if err := openItemsRefusal(ctx, runs, id); err != nil {\n\t\treturn err\n\t}\n\towed' $'if false {\n\t\treturn nil\n\t}\n\towed' ./internal/app/ TestARefusalAfterEnteringFinishingLeavesTheRunRunning 'usual message'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'if entered {' 'if entered && false {' ./internal/app/ TestARefusalAfterEnteringFinishingLeavesTheRunRunning 'must leave the run running'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'if entered {' 'if entered || true {' ./internal/app/ TestARefusalLeavesAFinishingRunFinishingWhenThisCallDidNotMoveIt 'must not undo it'`
+Run: `scripts/inject.sh internal/bootstrap/verify.go 'if state != StateRunning {' 'if state == "never" {' ./internal/bootstrap/ TestEnqueueVerifyInsertsNothingIntoARunThatIsNotRunning 'no longer running'`
+Run: `scripts/inject.sh internal/bootstrap/verify.go 'inserted += int(n)' $'_ = n\n\t\t\tinserted++' ./internal/bootstrap/ TestEnqueueVerifyReportsHowManyItemsItQueued 'adds nothing'`
+Run: `scripts/inject.sh internal/bootstrap/verify.go 'if c.Inspected && len(assigned[c.Prefix]) > 0 {' 'if c.Inspected {' ./internal/bootstrap/ TestVerifyOwedIsZeroWhenNoClaimNeedsJudging 'owes nothing'`
+Run: `scripts/inject.sh internal/bootstrap/verify.go $'if len(st.Items["verify"]) > 0 {\n\t\treturn 0, nil\n\t}\n\tcomps, err := runs.Components(ctx, runID)\n\tif err != nil {\n\t\treturn 0, err\n\t}\n\tclaims, err := runs.Claims(ctx, runID)\n\tif err != nil {\n\t\treturn 0, err\n\t}\n\treturn len(verifyTargets' $'if len(st.Items["verify"]) > 1000 {\n\t\treturn 0, nil\n\t}\n\tcomps, err := runs.Components(ctx, runID)\n\tif err != nil {\n\t\treturn 0, err\n\t}\n\tclaims, err := runs.Claims(ctx, runID)\n\tif err != nil {\n\t\treturn 0, err\n\t}\n\treturn len(verifyTargets' ./internal/bootstrap/ TestVerifyOwedCountsInspectedComponentsWithClaimsWhenNoVerifyItemExists 'nothing is owed'`
+Run: `scripts/inject.sh internal/bootstrap/coverage.go $'case StateFinishing:\n\t\t\treturn nil' $'case StateFinishing:\n\t\t\tmoved = true\n\t\t\treturn nil' ./internal/bootstrap/ TestEnterFinishingReportsWhetherThisCallMadeTheMove 'not moved by this call'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'if errors.Is(err, confine.ErrTooLarge) {' 'if false && errors.Is(err, confine.ErrTooLarge) {' ./internal/app/ TestFinishTreatsAnOversizePageAsAConflictNotAnAbort 'must not abort finish'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'only a running or finishing run can be finished' 'only a running run can be finished' ./internal/app/ TestFinishRefusalNamesBothStatesThatCanBeFinished 'names both states'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'case jobState == "refused" && jobNo == 0:' 'case false:' ./internal/app/ TestDescribePublishConflictTellsARefusedJobFromAnAppliedOne 'a refused job applied nothing'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'case jobState == "refused":' 'case false:' ./internal/app/ TestDescribePublishConflictTellsARefusedJobFromAnAppliedOne 'a refusal after an earlier job'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'so earlier operations of this job may already be applied.' 'so the job was applied in full.' ./internal/app/ TestDescribePublishConflictTellsARefusedJobFromAnAppliedOne 'a conflict found while applying'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'jobState(ctx, p.Store.DB, job.ID)' '""' ./internal/app/ TestFinishExplainsAPageEditedAfterPlanning 'nothing was applied'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'if errors.Is(err, publish.ErrConflict) {' 'if false {' ./internal/app/ TestFinishExplainsAPageEditedAfterPlanning 'nothing was applied'`
+Run: `scripts/inject.sh internal/app/bootstrap_finish.go 'defer endStage()' '_ = endStage' ./internal/app/ TestAFailedFinishEndsTheProgressLineOnATerminal 'fresh line'`
+Run: `scripts/inject.sh internal/app/bootstrap_next.go 'TokensNote: bootstrap.TokensNote' 'TokensNote: "token counts are asserted"' ./internal/app/ TestStatusAndFinishSayThatAcceptedAndRejectedCountExtractSubmissionsOnly 'one shared note'`
+Run: `scripts/inject.sh internal/bootstrap/pages.go 'if cur == publish.HashContent(pg.Content) {' 'if false {' ./internal/app/ TestFinishRecordsTheHashOfTheBytesOnDiskAndRerunsAsUnchanged 'reports it unchanged'`
+Expected: each exits 0 (RED). Two mutations of fix round 1 first exited 2 (INCONCLUSIVE) because `if entered {` became `if false {` and left `entered` unused, and `inserted += int(n)` left `n` unused; both were rewritten as shown so that they compile.
 
 - [ ] **Step 6: Commit**
 
