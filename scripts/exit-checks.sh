@@ -152,4 +152,20 @@ check "plan: trusted checkout, new run per plan" 'TestBootstrapNeedsATrustedRegi
 check "git inventory: churn and default branch" 'TestChurnCountsCommitsPerPathIncludingAwkwardNames|TestDefaultBranchFallsBackToMainThenMaster' ./internal/gitx/
 check "scan: spans are exact and ordered" 'TestScanReportsOffsetsOfTheSecretOnly|TestScanReportsEachPlaceOnce|TestScanSpansAreOrderedAndInRange|TestScanUnionsAPartiallyOverlappingTail' ./internal/redact/
 check "cost gate: the estimates shown are right"  'TestEstimateStagesCountsItemsAndTokens|TestEstimateStagesVerifyTokensScaleWithInspectedComponents|TestBatchCountRoundsUpAtTheBatchBoundary' ./internal/bootstrap/
+# Final whole-branch review fixes.
+check "git log never runs the repository's programs" 'TestLogReadersNeverRunTheRepositorysGpgProgram|TestGitEnvSwitchesOffLazyFetchAndReplaceObjects|TestChurnKeepsALeadingNewlineInAFileName' ./internal/gitx/
+check "hash-rocket secrets are redacted and scanned" 'TestHashRocketAssignmentsAreRedactedAndScanned|TestArrowFunctionsAndExpressionsAfterARocketStayClean' ./internal/redact/
+check "plan hash: no clock, no clone-local data (bootstrap)" 'TestPlanHashDoesNotDependOnWhereAWorktreeLives|TestUnreadRecordsCannotCollideWithARepositoryFile' ./internal/bootstrap/
+check "plan hash: no clock, no clone-local data (app)" 'TestBootstrapPlanHashIsTheSameInAnotherCloneAndOnAnotherDay|TestChurnWindowIsAnchoredOnHeadNotTheClock|TestBootstrapPlanListsUnmergedBranchesAndOtherWorktreesAsNotRead' ./internal/app/
+check "a digest always reads back" 'TestADigestOfThousandsOfFilesStaysWithinItsBoundAndReadsBack|TestBuildDigestNeverExceedsItsBudget|TestDigestEstimateCountsHeaderLines' ./internal/bootstrap/
+check "an unknown projection is never zero" 'TestMeasureOfASampleWithNoCompletedItemHasNoProjection' ./internal/bootstrap/
+check "an unknown projection says so (app)" 'TestSampleTextSaysAnUnknownProjectionIsUnknown|TestConfirmSampleNeedsTheExactPlanHash' ./internal/app/
+check "no paid work on an empty component" 'TestRankPassesTheBudgetOverAComponentWithNoFiles|TestInventorySpendsNoPaidWorkOnAComponentWhoseFilesWereAllSkipped|TestAnInspectedComponentWithNoFilesGetsNoExtractItemAndNoVerifyTarget' ./internal/bootstrap/
+check "one owner for a claim everywhere" 'TestTheVerifierThePageAndTheCoverageAgreeOnAClaimsComponent|TestPrepareVerifyQueuesOnlyUndecidedWork|TestAClaimNamingTwoComponentsGoesToExactlyOneVerifier' ./internal/bootstrap/
+check "a killed finish's pages stay ours; abandon" 'TestPagesAKilledFinishWroteAreStillOursAfterTheRepositoryMoves|TestAbandonLeavesRecordedPagesAloneAndTheRunCannotBeUsed' ./internal/app/
+check "the report is stored with the done move" 'TestTheFinishReportIsStoredWithTheRunAndReprinted|TestAFinishWhoseReportCannotBeBuiltLeavesTheRunFinishing|TestFinishedComponentPageShowsItsFileCountAndEntryPoint' ./internal/app/
+check "the command can resume a run" 'TestStatusJSONGivesTheCommandWhatItNeedsToResume' ./internal/app/
+check "claim text and names render inert" 'TestCheckTextRefusesLinkAndImageMarkup|TestAComponentNameShapedLikeALinkRendersInert|TestSeparatorsAndBidiOverridesInANameMakeItABadName|TestInventoryRecordsUnconfinableNamesAsBadNames|TestNextRefusalSaysWhatToDoInEachState' ./internal/bootstrap/
+check "contradiction keeps the original's meta" 'TestAContradictionChangesOnlyTheOriginalsStatusAndLink' ./internal/bootstrap/
+check "sources, branch and HEAD at plan and after" 'TestPlanRefusesASourceInsideProjectMemoryAndWarnsForOneInsideTheRepository|TestPlanShowsEverySourceDirectory|TestFinishRefusesAnotherBranchAtTheSameCommit|TestSubmitRefusesARunWhoseRepositoryMoved|TestTheUnindexedNoticeIsSanitisedAndBounded' ./internal/app/
 exit $fail
