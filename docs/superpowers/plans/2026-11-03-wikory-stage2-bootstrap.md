@@ -4140,12 +4140,125 @@ func TestProgressGivesNoEstimateBeforeAnyStep(t *testing.T) {
 }
 ```
 
-Add `"os"` to the test file's imports.
+Add `"os"` and `"encoding/json"` to the test file's imports, then append these tests, which cover the progress line shrinking on a terminal, the stage fields being cleared by `Begin`, and JSON staying parseable when stderr is a terminal:
+
+```go
+// terminalRow plays writes onto one terminal row: "\r" returns to column 0, "\n" starts a fresh
+// row, and every other byte overwrites the cell under the cursor. It returns the last row.
+func terminalRow(s string) string {
+	var row []byte
+	col := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\r':
+			col = 0
+		case '\n':
+			row, col = nil, 0
+		default:
+			if col < len(row) {
+				row[col] = s[i]
+			} else {
+				row = append(row, s[i])
+			}
+			col++
+		}
+	}
+	return string(row)
+}
+
+func TestProgressTTYLineLeavesNoStaleTextWhenTheEstimateShrinks(t *testing.T) {
+	var b bytes.Buffer
+	clk := &fakeClock{t: time.Unix(0, 0)}
+	p := NewProgress(&b, false, true, clk.now)
+	p.Begin("scan", 100, 10*time.Second, "Scanning.")
+	for _, s := range []struct {
+		at   time.Duration
+		done int
+	}{{time.Second, 1}, {2 * time.Second, 10}, {11 * time.Second, 99}, {12 * time.Second, 100}} {
+		clk.t = time.Unix(0, 0).Add(s.at)
+		p.Step(s.done)
+	}
+	got := strings.TrimRight(terminalRow(b.String()), " ")
+	if want := "wikory: scan 100/100, 12.0s elapsed"; got != want {
+		t.Fatalf("terminal row %q, want %q", got, want)
+	}
+}
+
+func TestProgressGivesNoEstimateOnceEverythingIsDone(t *testing.T) {
+	var b bytes.Buffer
+	clk := &fakeClock{t: time.Unix(0, 0)}
+	p := NewProgress(&b, false, false, clk.now)
+	p.Begin("scan", 10, 10*time.Second, "Scanning.")
+	clk.t = clk.t.Add(5 * time.Second)
+	p.Step(10)
+	if out := b.String(); !strings.Contains(out, "10/10") || strings.Contains(out, "about") {
+		t.Fatalf("done == total must carry no estimate: %q", out)
+	}
+}
+
+func TestProgressBeginResetsTheRememberedLineWidth(t *testing.T) {
+	var b bytes.Buffer
+	clk := &fakeClock{t: time.Unix(0, 0)}
+	p := NewProgress(&b, false, true, clk.now)
+	p.Begin("a very long stage label indeed", 10, 10*time.Second, "One.")
+	clk.t = clk.t.Add(time.Second)
+	p.Step(1)
+	p.End()
+	b.Reset()
+	p.Begin("b", 10, 10*time.Second, "Two.")
+	p.Step(5)
+	if got := terminalRow(b.String()); got != strings.TrimRight(got, " ") {
+		t.Fatalf("the new operation padded to the old line width: %q", got)
+	}
+}
+
+func TestProgressBeginClearsTheStageFields(t *testing.T) {
+	var b bytes.Buffer
+	clk := &fakeClock{t: time.Unix(0, 0)}
+	p := NewProgress(&b, true, false, clk.now)
+	p.BeginStage(1, 3, "scan", 10, 10*time.Second, "Scanning.")
+	p.Begin("plain", 10, 10*time.Second, "Plain.")
+	lines := strings.Split(strings.TrimSpace(b.String()), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], `"stage_name":"scan"`) {
+		t.Fatalf("unexpected notices: %q", b.String())
+	}
+	for _, key := range []string{"stage_name", "stage_index", "stage_count"} {
+		if strings.Contains(lines[1], key) {
+			t.Fatalf("second notice carries %s: %s", key, lines[1])
+		}
+	}
+}
+
+func TestProgressJSONLinesStayParseableOnATerminal(t *testing.T) {
+	var b bytes.Buffer
+	clk := &fakeClock{t: time.Unix(0, 0)}
+	p := NewProgress(&b, true, true, clk.now)
+	p.BeginStage(1, 2, "scan", 10, 10*time.Second, "Scanning.")
+	for i, done := range []int{1, 5, 10} {
+		clk.t = time.Unix(0, 0).Add(time.Duration(i+1) * time.Second)
+		p.Step(done)
+	}
+	p.End()
+	if strings.Contains(b.String(), "\r") {
+		t.Fatalf("carriage return in JSON output: %q", b.String())
+	}
+	lines := strings.Split(strings.TrimSpace(b.String()), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("want a notice and three events, got %q", b.String())
+	}
+	for _, l := range lines {
+		var v map[string]any
+		if err := json.Unmarshal([]byte(l), &v); err != nil {
+			t.Fatalf("line %q does not parse: %v", l, err)
+		}
+	}
+}
+```
 
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `go test ./internal/app/ -run 'TestIsTTY|TestProgress' -count=1`
-Expected: FAIL to compile: `undefined: IsTTY`, `p.BeginStage undefined`.
+Expected: FAIL to compile: `undefined: IsTTY`, `p.BeginStage undefined`. Once `IsTTY` and `BeginStage` exist but before the two fixes below, `TestProgressTTYLineLeavesNoStaleTextWhenTheEstimateShrinks` and `TestProgressBeginClearsTheStageFields` fail, the first with a terminal row that still ends in `about 0s left (estimate)` text and the second with `second notice carries stage_name`.
 
 - [ ] **Step 3: Implement**
 
@@ -4173,10 +4286,32 @@ func IsTTY(w io.Writer) bool {
 // "stage 2 of 5: inventory" and JSON events carry the stage fields.
 func (p *Progress) BeginStage(index, count int, name string, total int, expected time.Duration, notice string) {
 	p.stageIndex, p.stageCount, p.stageName = index, count, name
-	p.Begin(fmt.Sprintf("stage %d of %d: %s", index, count, name), total, expected, notice)
+	p.begin(fmt.Sprintf("stage %d of %d: %s", index, count, name), total, expected, notice)
 }
 ```
 
+`Begin` clears the stage fields and then calls a private `begin`; `BeginStage` sets them and calls `begin` directly, because the notice `begin` emits needs them. Replace the existing `Begin` with:
+
+```go
+// Begin starts an operation outside any stage, clearing the stage fields of an earlier BeginStage.
+// expected is the estimate; above the threshold the notice prints now.
+func (p *Progress) Begin(label string, total int, expected time.Duration, notice string) {
+	p.stageName, p.stageIndex, p.stageCount = "", 0, 0
+	p.begin(label, total, expected, notice)
+}
+
+// begin leaves the stage fields alone: BeginStage sets them first and the notice carries them.
+func (p *Progress) begin(label string, total int, expected time.Duration, notice string) {
+	p.lineWidth = 0
+	p.label, p.total, p.notice, p.start, p.noticed, p.lastTick = label, total, notice, p.now(), false, -1
+	if expected > progressThreshold {
+		p.noticed = true
+		p.emit("notice", map[string]any{"notice": notice, "estimate_s": expected.Seconds(), "estimate_is_measured": false})
+	}
+}
+```
+
+Add a field `lineWidth int` to `Progress` (the width of the last terminal line written) and the import `strings`.
 In `emit`, for the JSON branch add after `fields["stage"] = p.label`:
 
 ```go
@@ -4205,6 +4340,18 @@ and in the text branch of `emit` for `"progress"`, extend the line:
 		}
 ```
 
+and in the same `emit`, the terminal branch pads a shorter line over the tail of a longer previous one (the line can now shrink, and on the last step the estimate segment disappears), using spaces only and no escape sequences:
+
+```go
+		if p.tty {
+			pad := strings.Repeat(" ", max(0, p.lineWidth-len(line)))
+			p.lineWidth = len(line)
+			fmt.Fprint(p.w, "\r"+line+pad)
+		} else {
+			fmt.Fprintln(p.w, line)
+		}
+```
+
 In `internal/app/search_cmd.go:49` change the `false` to `IsTTY(env.IO.Err)`.
 
 Note the JSON test expects `"eta_s":16`: 4 s elapsed for 2 of 10 steps is 2 s per step, 8 steps left, 16 s. `encoding/json` renders a whole float as `16`.
@@ -4214,10 +4361,16 @@ Note the JSON test expects `"eta_s":16`: 4 s elapsed for 2 of 10 steps is 2 s pe
 Run: `go test ./internal/app/ -run 'TestIsTTY|TestProgress|TestSearch' -count=1`
 Expected: PASS.
 
-- [ ] **Step 5: Prove the null-device and the estimate-label assertions can fail**
+- [ ] **Step 5: Prove the null-device, estimate-label, padding, stage-clearing and done-guard assertions can fail**
 
 Run: `scripts/inject.sh internal/app/progress.go 'os.SameFile(fi, null)' 'os.SameFile(fi, null) && false' ./internal/app/ 'TestIsTTYIsFalseForBuffersAndTheNullDevice' 'null device'`
 Run: `scripts/inject.sh internal/app/progress.go 'fields["eta_s"], fields["eta_is_measured"] = eta, false' 'fields["eta_s"], fields["eta_is_measured"] = eta, true' ./internal/app/ 'TestProgressJSONCarriesStageAndLabelsTheEstimate' 'eta_is_measured'`
+Run: `scripts/inject.sh internal/app/progress.go 'fmt.Fprint(p.w, "\r"+line+pad)' 'fmt.Fprint(p.w, "\r"+line+pad[:0])' ./internal/app/ 'TestProgressTTYLineLeavesNoStaleTextWhenTheEstimateShrinks' 'terminal row'`
+Run: `scripts/inject.sh internal/app/progress.go '	p.stageName, p.stageIndex, p.stageCount = "", 0, 0
+' '' ./internal/app/ 'TestProgressBeginClearsTheStageFields' 'second notice carries'`
+Run: `scripts/inject.sh internal/app/progress.go 'if done > 0 && done < p.total {' 'if done > 0 {' ./internal/app/ 'TestProgressGivesNoEstimateOnceEverythingIsDone' 'must carry no estimate'`
+Run: `scripts/inject.sh internal/app/progress.go '	p.lineWidth = 0
+' '' ./internal/app/ 'TestProgressBeginResetsTheRememberedLineWidth' 'padded to the old line width'`
 Expected: each exits 0 (RED).
 
 - [ ] **Step 6: Commit**
