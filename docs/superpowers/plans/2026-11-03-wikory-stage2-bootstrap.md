@@ -3375,8 +3375,8 @@ func bootstrapRepo(t *testing.T) (string, *cli) {
 	t.Helper()
 	dir := newGitRepo(t)
 	files := map[string]string{
-		"internal/queue/queue.go":                  "package queue\n\n// Ack acknowledges after the handler returns.\nfunc Ack() {}\n",
-		"docs/design.md":                           "The internal/queue package acknowledges after the handler returns.\n",
+		"internal/queue/queue.go":                 "package queue\n\n// Ack acknowledges after the handler returns.\nfunc Ack() {}\n",
+		"docs/design.md":                          "The internal/queue package acknowledges after the handler returns.\n",
 		".claude/handoffs/PRIOR_SESSION_STATE.md": "Open item: internal/queue retry.\n",
 	}
 	for rel, content := range files {
@@ -3586,6 +3586,35 @@ func TestBootstrapUsage(t *testing.T) {
 		if _, code, _ := runBootstrapJSON(t, c, dir, args...); code != ExitUsage {
 			t.Errorf("bootstrap %v: code %d, want %d", args, code, ExitUsage)
 		}
+	}
+}
+
+// The scope is part of the plan hash, so the order the --source flags were typed in must not be.
+func TestBootstrapPlanScopeAndHashDoNotDependOnSourceFlagOrder(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	mk := func(name, text string) string {
+		d, _ := filepath.EvalSymlinks(t.TempDir())
+		if err := os.WriteFile(filepath.Join(d, name+".md"), []byte(text+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	a, b := mk("a", "internal/queue notes"), mk("b", "internal/queue ADRs")
+	first, code, _ := runBootstrapJSON(t, c, dir, "plan", "--source", "alpha="+a, "--source", "beta="+b)
+	second, code2, _ := runBootstrapJSON(t, c, dir, "plan", "--source", "beta="+b, "--source", "alpha="+a)
+	d1, d2 := decodeData[planData](t, first), decodeData[planData](t, second)
+	if code != ExitOK || code2 != ExitOK || d1.Scope != d2.Scope || d1.PlanHash != d2.PlanHash {
+		t.Fatalf("the same sources in another flag order are the same plan: %+v %+v", d1, d2)
+	}
+}
+
+func TestBootstrapPlanRefusesTheSameSourceNameTwice(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	one, _ := filepath.EvalSymlinks(t.TempDir())
+	two, _ := filepath.EvalSymlinks(t.TempDir())
+	e, code, _ := runBootstrapJSON(t, c, dir, "plan", "--source", "notes="+one, "--source", "notes="+two)
+	if code != ExitUsage || e.OK || !strings.Contains(e.Error.Message, "twice") {
+		t.Fatalf("two directories under one name would collide in the run: code=%d %+v", code, e)
 	}
 }
 ```
@@ -3872,17 +3901,17 @@ import (
 var sourceName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
 
 type planReport struct {
-	RunID      string                `json:"run_id"`
-	PlanHash   string                `json:"plan_hash"`
-	Scope      string                `json:"scope"`
-	Head       string                `json:"head"`
-	Sample     int                   `json:"sample"`
-	Sources    map[string]int        `json:"sources"`
-	Components int                   `json:"components"`
-	Inspected  int                   `json:"inspected"`
-	Batches    int                   `json:"batches"`
-	Estimates  []bootstrap.Estimate  `json:"estimates"`
-	Next       string                `json:"next"`
+	RunID      string               `json:"run_id"`
+	PlanHash   string               `json:"plan_hash"`
+	Scope      string               `json:"scope"`
+	Head       string               `json:"head"`
+	Sample     int                  `json:"sample"`
+	Sources    map[string]int       `json:"sources"`
+	Components int                  `json:"components"`
+	Inspected  int                  `json:"inspected"`
+	Batches    int                  `json:"batches"`
+	Estimates  []bootstrap.Estimate `json:"estimates"`
+	Next       string               `json:"next"`
 }
 
 func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error) {
@@ -3919,6 +3948,9 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 		if !ok || !sourceName.MatchString(name) || name == "repo" || dir == "" {
 			return Result{}, &UsageError{Msg: fmt.Sprintf("--source %q: want NAME=DIR with NAME like notes (lower case, not \"repo\")", spec)}
 		}
+		if _, dup := roots[name]; dup {
+			return Result{}, &UsageError{Msg: fmt.Sprintf("--source %s was given twice; each source needs its own name", name)}
+		}
 		if strings.ContainsAny(dir, "\n\r") {
 			return Result{}, &UsageError{Msg: fmt.Sprintf("--source %s: the directory name has a line break in it", name)}
 		}
@@ -3934,6 +3966,7 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 		readers = append(readers, bootstrap.NewDirReader(name, root))
 		scope = append(scope, name)
 	}
+	sort.Strings(scope[1:]) // the plan hash covers the scope: the order the flags were typed in must not
 	churn, err := p.Repo.Churn(ctx, time.Now().AddDate(0, 0, -90))
 	if err != nil {
 		return Result{}, err
@@ -4042,6 +4075,8 @@ func planText(r planReport) string {
 ```
 
 The app half uses `IsTTY` (Task 7) and `Runs.Create` (Task 8), so it is added to the tree in Task 8, after both exist. Task order is therefore 6, 7, 8; this task commits only the `internal/bootstrap` half.
+
+Two behaviours of `bootstrap_plan.go` were added while it went into the tree in Task 8, each with a test that failed first: the scope string sorts the `--source` names (`sort.Strings(scope[1:])`), because the scope is in the plan hash and the order the flags were typed in must not change it; and a `--source NAME` given twice is a usage error, because the run stores one directory per name and the second would silently replace the first. Both tests are in `bootstrap_plan_test.go`.
 
 - [ ] **Step 5: Run the bootstrap package tests**
 
@@ -4412,9 +4447,12 @@ func (r *Runs) FailCounted(ctx, itemID string, epoch, accepted, rejected int) er
 func (r *Runs) Status(ctx, id string) (RunStatus, error)
 func (r *Runs) Sources(ctx, id string) ([]Source, error)
 func (r *Runs) Components(ctx, id string) ([]Component, error)
+func (r *Runs) Roots(ctx, id string) (map[string]string, error) // the --source directories the run was planned with
 ```
 
 Sampling is hash-gated like the full run (plan-level decision 4 extended): `confirm --sample` moves `planned` to `sampling`; `confirm` moves `planned` or `awaiting-confirm` to `running`. `confirm` itself is Task 14; here `Next` simply refuses any state other than `sampling` and `running`.
+
+`Transition` into `sampling` is refused with `ErrState` for a run whose stored `Sample` is 0: a sample of nothing would settle at once with zero measured cost, a hollow figure for the go-ahead to rest on. A run with `Sample > 0` but no sampled item (an empty extract list) still settles at once. `FailCounted` adds the submission's accepted and rejected counts to the run in the same transaction as the item's failure, before the sample settles, so a sample that closes on a failure freezes the final counts; the tests read `sample_in`, `sample_out`, `sample_acc` and `sample_rej` straight from `bs_runs`.
 
 - [ ] **Step 1: Write the failing tests for the run store**
 
@@ -4500,6 +4538,50 @@ func TestCreatePersistsTheRunItsSourcesComponentsAndItems(t *testing.T) {
 	st, _ := r.Status(ctx, run.ID)
 	if st.Items["extract"]["pending"] != 4 {
 		t.Fatalf("%+v", st.Items)
+	}
+}
+
+// The sample size is not part of the plan hash, so the hash cannot be what binds a run to the
+// sample it was planned with: the run must store it, and its sampled items are fixed at Create.
+func TestTheRunStoresTheSampleSizeAndFixesItsSampledItemsAtCreate(t *testing.T) {
+	ctx := context.Background()
+	r, s, _, _ := newTestRuns(t)
+	if planWith(0).Hash != planWith(3).Hash {
+		t.Fatal("precondition: the sample size is outside the plan hash, which is why the run must store it")
+	}
+	for _, want := range []int{0, 3} {
+		run, err := r.Create(ctx, planWith(want), specsN(9))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := r.Get(ctx, run.ID)
+		if err != nil || got.Sample != want || run.Sample != want {
+			t.Fatalf("the run must keep the sample size it was planned with: want %d, stored %d, returned %d (%v)", want, got.Sample, run.Sample, err)
+		}
+		var n int
+		if err := s.DB.QueryRow(`SELECT count(*) FROM bs_items WHERE run_id=? AND sampled=1`, run.ID).Scan(&n); err != nil || n != want {
+			t.Fatalf("sample %d must flag %d items at Create, flagged %d (%v)", want, want, n, err)
+		}
+	}
+}
+
+func TestTheSourceDirectoriesARunWasPlannedWithAreStored(t *testing.T) {
+	ctx := context.Background()
+	r, _, _, _ := newTestRuns(t)
+	p := planWith(0)
+	p.Roots = map[string]string{"notes": "/work/notes", "adr": "/work/adr"}
+	run, err := r.Create(ctx, p, specsN(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.Roots(ctx, run.ID)
+	if err != nil || len(got) != 2 || got["notes"] != "/work/notes" || got["adr"] != "/work/adr" {
+		t.Fatalf("%v %v", got, err)
+	}
+	other := *r
+	other.CheckoutID = "someone-else"
+	if _, err := other.Roots(ctx, run.ID); !errors.Is(err, ErrNoRun) {
+		t.Fatalf("roots are bound to the checkout too: %v", err)
 	}
 }
 
@@ -4761,11 +4843,127 @@ func TestEveryMutationTakesTheWriteLock(t *testing.T) {
 		}
 	}
 }
+
+type figures struct{ sampleIn, sampleOut, sampleAcc, sampleRej, in, out, acc, rej int }
+
+func readFigures(t *testing.T, s *store.Store, runID string) figures {
+	t.Helper()
+	var f figures
+	err := s.DB.QueryRow(`SELECT sample_in,sample_out,sample_acc,sample_rej,tokens_in,tokens_out,accepted,rejected FROM bs_runs WHERE run_id=?`, runID).
+		Scan(&f.sampleIn, &f.sampleOut, &f.sampleAcc, &f.sampleRej, &f.in, &f.out, &f.acc, &f.rej)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// The sample's cost is what Terry's go-ahead rests on, so it is read straight from the table.
+// The sample here has two items: one completes with usage, the other fails its way to rejection
+// on a FailCounted that carries the final counts. The frozen figures must include every count,
+// the settling call's too, and must not move once the full run adds to the run's own counters.
+func TestTheFrozenSampleFiguresIncludeTheSettlingFailureAndStayFrozen(t *testing.T) {
+	ctx := context.Background()
+	r, s, _, _ := newTestRuns(t)
+	run := mustRun(t, r, 2, 4)
+	if err := r.Transition(ctx, run.ID, StateSampling, StatePlanned); err != nil {
+		t.Fatal(err)
+	}
+	first, err := r.Next(ctx, run.ID, 50)
+	if err != nil || len(first.Items) != 2 {
+		t.Fatalf("a sample of 2 leases 2 items: %+v %v", first, err)
+	}
+	if err := r.Complete(ctx, first.Items[0].ID, first.Items[0].Epoch, Usage{InputTokens: 100, OutputTokens: 10}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if f := readFigures(t, s, run.ID); f.sampleIn != 0 || f.sampleOut != 0 {
+		t.Fatalf("nothing is frozen while a sampled item is still open: %+v", f)
+	}
+	bad := first.Items[1]
+	if err := r.FailCounted(ctx, bad.ID, bad.Epoch, 4, 0); err != nil {
+		t.Fatal(err)
+	}
+	for i, counts := range [][2]int{{0, 0}, {2, 1}} {
+		b, err := r.Next(ctx, run.ID, 50)
+		if err != nil || len(b.Items) != 1 || b.Items[0].ID != bad.ID {
+			t.Fatalf("retry %d: %+v %v", i, b, err)
+		}
+		if err := r.FailCounted(ctx, b.Items[0].ID, b.Items[0].Epoch, counts[0], counts[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _ := r.Get(ctx, run.ID)
+	if got.State != StateAwaiting {
+		t.Fatalf("the settling failure must move the run to awaiting-confirm, got %s", got.State)
+	}
+	want := figures{sampleIn: 100, sampleOut: 10, sampleAcc: 6, sampleRej: 1, in: 100, out: 10, acc: 6, rej: 1}
+	if f := readFigures(t, s, run.ID); f != want {
+		t.Fatalf("the sample figures must hold the usage and every count including the settling failure's: got %+v want %+v", f, want)
+	}
+
+	if err := r.Transition(ctx, run.ID, StateRunning, StateAwaiting); err != nil {
+		t.Fatal(err)
+	}
+	rest, err := r.Next(ctx, run.ID, 50)
+	if err != nil || len(rest.Items) != 2 {
+		t.Fatalf("the full run leases the two unsampled items: %+v %v", rest, err)
+	}
+	if err := r.Complete(ctx, rest.Items[0].ID, rest.Items[0].Epoch, Usage{InputTokens: 7, OutputTokens: 3}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.FailCounted(ctx, rest.Items[1].ID, rest.Items[1].Epoch, 5, 2); err != nil {
+		t.Fatal(err)
+	}
+	want.in, want.out, want.acc, want.rej = 107, 13, 11, 3
+	if f := readFigures(t, s, run.ID); f != want {
+		t.Fatalf("the run's counters keep growing but the frozen sample figures do not move: got %+v want %+v", f, want)
+	}
+}
+
+func TestFailCountedAddsAcceptedAndRejectedToTheirOwnColumns(t *testing.T) {
+	ctx := context.Background()
+	r, s, _, _ := newTestRuns(t)
+	run := mustRun(t, r, 0, 2)
+	_ = r.Transition(ctx, run.ID, StateRunning, StatePlanned)
+	b, _ := r.Next(ctx, run.ID, 2)
+	if len(b.Items) != 2 {
+		t.Fatalf("%+v", b)
+	}
+	if err := r.FailCounted(ctx, b.Items[0].ID, b.Items[0].Epoch, 3, 5); err != nil {
+		t.Fatal(err)
+	}
+	if f := readFigures(t, s, run.ID); f.acc != 3 || f.rej != 5 {
+		t.Fatalf("accepted and rejected must land in their own columns, got accepted=%d rejected=%d", f.acc, f.rej)
+	}
+	if err := r.FailCounted(ctx, b.Items[1].ID, b.Items[1].Epoch, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if f := readFigures(t, s, run.ID); f.acc != 4 || f.rej != 5 {
+		t.Fatalf("counts add up across calls, got accepted=%d rejected=%d", f.acc, f.rej)
+	}
+}
+
+// A run planned without a sample has nothing to measure. Starting its sample would settle at
+// once with zero cost, a hollow figure for the go-ahead to rest on, so it is refused.
+func TestARunPlannedWithoutASampleRefusesToStartOne(t *testing.T) {
+	ctx := context.Background()
+	r, _, _, _ := newTestRuns(t)
+	run := mustRun(t, r, 0, 4)
+	err := r.Transition(ctx, run.ID, StateSampling, StatePlanned)
+	if !errors.Is(err, ErrState) {
+		t.Fatalf("a run with a stored sample of 0 must not enter sampling: %v", err)
+	}
+	if got, _ := r.Get(ctx, run.ID); got.State != StatePlanned {
+		t.Fatalf("a refused transition leaves the run planned, got %s", got.State)
+	}
+	if err := r.Transition(ctx, run.ID, StateRunning, StatePlanned); err != nil {
+		t.Fatalf("a run planned without a sample can still run in full: %v", err)
+	}
+}
 ```
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `go test ./internal/bootstrap/ -run 'TestCreatePersists|TestARunOf|TestNext|TestSampling|TestASample|TestAnEmpty|TestAnExpired|TestAnItemThat|TestComplete|TestEveryMutation' -count=1`
+Run: `go test ./internal/bootstrap/ -run 'TestCreatePersists|TestARunOf|TestNext|TestSampling|TestASample|TestAnEmpty|TestAnExpired|TestAnItemThat|TestComplete|TestEveryMutation|TestTheRunStores|TestTheSourceDirectories|TestTheFrozen|TestFailCounted|TestARunPlannedWithout' -count=1`
 Expected: FAIL to compile: `undefined: NewRuns`, `Run`, `StatePlanned`, `LeaseTTL`.
 
 - [ ] **Step 3: Implement `internal/bootstrap/runs.go`**
@@ -4795,17 +4993,17 @@ var (
 
 // Run states.
 const (
-	StatePlanned    = "planned"
-	StateSampling   = "sampling"
-	StateAwaiting   = "awaiting-confirm"
-	StateRunning    = "running"
-	StateFinishing  = "finishing"
-	StateDone       = "done"
-	StateAbandoned  = "abandoned"
-	LeaseTTL        = 30 * time.Minute
-	MaxAttempts     = 3
-	maxBatch        = 50
-	tsLayout        = "2006-01-02T15:04:05.000000000Z"
+	StatePlanned   = "planned"
+	StateSampling  = "sampling"
+	StateAwaiting  = "awaiting-confirm"
+	StateRunning   = "running"
+	StateFinishing = "finishing"
+	StateDone      = "done"
+	StateAbandoned = "abandoned"
+	LeaseTTL       = 30 * time.Minute
+	MaxAttempts    = 3
+	maxBatch       = 50
+	tsLayout       = "2006-01-02T15:04:05.000000000Z"
 )
 
 // Item is one leased or stored unit of model work.
@@ -4977,6 +5175,19 @@ func (r *Runs) Transition(ctx context.Context, id, to string, from ...string) er
 		return fmt.Errorf("%w: no source state given", ErrState)
 	}
 	return r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		if to == StateSampling {
+			var sample int
+			err := tx.QueryRowContext(ctx, `SELECT sample FROM bs_runs WHERE run_id=? AND checkout_id=?`, id, r.CheckoutID).Scan(&sample)
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNoRun
+			}
+			if err != nil {
+				return err
+			}
+			if sample == 0 {
+				return fmt.Errorf("%w: the run was planned without a sample, so there is nothing to measure; plan it with a sample size above 0", ErrState)
+			}
+		}
 		args := []any{to, r.ts(), id, r.CheckoutID}
 		for _, f := range from {
 			args = append(args, f)
@@ -5253,7 +5464,7 @@ Expected: PASS. A failure of `TestEveryMutationTakesTheWriteLock` for `Next` or 
 
 - [ ] **Step 5: Now add the app half (Task 6's command files) and the `next`/`status` commands**
 
-Create `internal/app/bootstrap_cmd.go`, `bootstrap_plan.go` and `bootstrap_plan_test.go` exactly as in Task 6 steps 1 and 4, then add the dispatcher cases and `internal/app/bootstrap_next.go`:
+Create `internal/app/bootstrap_cmd.go`, `bootstrap_plan.go` and `bootstrap_plan_test.go` exactly as in Task 6 steps 1 and 4 (the plan command canonicalises the scope by sorting the `--source` names, refuses a `--source NAME` given twice, and stores the source directories in the run so they can be read back with `Runs.Roots`), then add the dispatcher cases and `internal/app/bootstrap_next.go`:
 
 In `runBootstrap`'s switch add:
 
@@ -5435,8 +5646,10 @@ func TestBootstrapNextRefusesAnUnconfirmedRunAndStatusReportsIt(t *testing.T) {
 		t.Fatalf("%+v", st)
 	}
 	got := decodeData[struct {
-		Run   struct{ State string `json:"state"` } `json:"run"`
-		Items map[string]map[string]int            `json:"items"`
+		Run struct {
+			State string `json:"state"`
+		} `json:"run"`
+		Items map[string]map[string]int `json:"items"`
 	}](t, st)
 	if got.Run.State != "planned" || got.Items["extract"]["pending"] < 2 {
 		t.Fatalf("a planned run holds its extract items as pending: %+v", got.Items)
@@ -5454,6 +5667,35 @@ func TestBootstrapStatusWithoutARunNamesTheLatestAndNextNeedsRun(t *testing.T) {
 	}
 	if _, code, _ := runBootstrapJSON(t, c, dir, "next"); code != ExitUsage {
 		t.Fatalf("next without --run is a usage error, got %d", code)
+	}
+}
+
+// The sample size is not in the plan hash, so the run itself must carry it: two plans of the same
+// repository that differ only in --sample have the same hash and different runs.
+func TestBootstrapPlanBindsTheSampleSizeToTheRun(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	type statusRun struct {
+		Run struct {
+			State    string `json:"state"`
+			Sample   int    `json:"sample"`
+			PlanHash string `json:"plan_hash"`
+		} `json:"run"`
+	}
+	full, _, _ := runBootstrapJSON(t, c, dir, "plan")
+	sampled, _, _ := runBootstrapJSON(t, c, dir, "plan", "--sample", "2")
+	df, ds := decodeData[planData](t, full), decodeData[planData](t, sampled)
+	if df.PlanHash != ds.PlanHash {
+		t.Fatalf("precondition: --sample is outside the plan hash: %s %s", df.PlanHash, ds.PlanHash)
+	}
+	for _, tc := range []struct {
+		d    planData
+		want int
+	}{{df, 0}, {ds, 2}} {
+		st, code, _ := runBootstrapJSON(t, c, dir, "status", "--run", tc.d.RunID)
+		got := decodeData[statusRun](t, st)
+		if code != ExitOK || got.Run.Sample != tc.want || tc.d.Sample != tc.want || got.Run.PlanHash != tc.d.PlanHash {
+			t.Fatalf("the run must be bound to the sample it was planned with: want %d, run %+v, report %d", tc.want, got.Run, tc.d.Sample)
+		}
 	}
 }
 ```
@@ -5488,6 +5730,29 @@ Run: `scripts/inject.sh internal/app/bootstrap_plan.go 'Unread: bootstrap.Unread
 Run: `scripts/inject.sh internal/bootstrap/runs.go 'return settleSample(ctx, tx, it.RunID, r.ts())' 'return nil' ./internal/bootstrap/ 'TestASampleWhoseLastItemIsRejectedStillSettles' 'only item was rejected'`
 Run: `scripts/inject.sh internal/bootstrap/runs.go 'return settleSample(ctx, tx, id, r.ts()) // no sampled item left to lease' 'return nil' ./internal/bootstrap/ 'TestASampleWhoseLastLeaseExpiresStillSettles' 'last lease expired'`
 Run: `scripts/inject.sh internal/bootstrap/runs.go 'return settleSample(ctx, tx, id, r.ts()) // an empty sample has nothing to run' 'return nil' ./internal/bootstrap/ 'TestAnEmptySampleSettlesAtOnce' 'nothing to wait for'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'sample_in=tokens_in, ' '' ./internal/bootstrap/ TestTheFrozenSampleFigures 'the sample figures must hold'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'sample_out=tokens_out, ' '' ./internal/bootstrap/ TestTheFrozenSampleFigures 'the sample figures must hold'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'sample_acc=accepted, ' '' ./internal/bootstrap/ TestTheFrozenSampleFigures 'the sample figures must hold'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'sample_rej=rejected, ' '' ./internal/bootstrap/ TestTheFrozenSampleFigures 'the sample figures must hold'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go '`, accepted, rejected, it.RunID); err != nil {' '`, rejected, accepted, it.RunID); err != nil {' ./internal/bootstrap/ TestFailCountedAddsAcceptedAndRejectedToTheirOwnColumns 'their own columns'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go '`, accepted, rejected, it.RunID); err != nil {' '`, rejected, accepted, it.RunID); err != nil {' ./internal/bootstrap/ TestTheFrozenSampleFigures 'the sample figures must hold'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go '		if _, err := tx.ExecContext(ctx, `UPDATE bs_runs SET accepted=accepted+?, rejected=rejected+? WHERE run_id=?`, accepted, rejected, it.RunID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE bs_items SET attempts=attempts+1, state=CASE WHEN attempts+1 >= ? THEN '"'"'rejected'"'"' ELSE '"'"'pending'"'"' END WHERE item_id=?`, MaxAttempts, itemID); err != nil {
+			return err
+		}
+		return settleSample(ctx, tx, it.RunID, r.ts())' '		if _, err := tx.ExecContext(ctx, `UPDATE bs_items SET attempts=attempts+1, state=CASE WHEN attempts+1 >= ? THEN '"'"'rejected'"'"' ELSE '"'"'pending'"'"' END WHERE item_id=?`, MaxAttempts, itemID); err != nil {
+			return err
+		}
+		if err := settleSample(ctx, tx, it.RunID, r.ts()); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE bs_runs SET accepted=accepted+?, rejected=rejected+? WHERE run_id=?`, accepted, rejected, it.RunID)
+		return err' ./internal/bootstrap/ TestTheFrozenSampleFigures 'the sample figures must hold'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'if sample == 0 {' 'if sample == 0 && false {' ./internal/bootstrap/ TestARunPlannedWithoutASampleRefusesToStartOne 'must not enter sampling'`
+Run: `scripts/inject.sh internal/app/bootstrap_plan.go 'sort.Strings(scope[1:]) // the plan hash covers the scope: the order the flags were typed in must not' '// sort.Strings(scope[1:])' ./internal/app/ TestBootstrapPlanScopeAndHashDoNotDependOnSourceFlagOrder 'the same sources in another flag order are the same plan'`
+Run: `scripts/inject.sh internal/app/bootstrap_plan.go 'if _, dup := roots[name]; dup {' 'if _, dup := roots[name]; false && dup {' ./internal/app/ TestBootstrapPlanRefusesTheSameSourceNameTwice 'would collide in the run'`
 Expected: each exits 0 (RED). `inject.sh` takes multi-line OLD/NEW text; if a replacement does not match exactly it exits 2 (inconclusive): fix the OLD text from the file, never the test.
 
 - [ ] **Step 8: Commit**
