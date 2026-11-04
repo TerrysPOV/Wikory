@@ -31,6 +31,16 @@ const (
 	DispBadName        = "skipped:bad-name"
 )
 
+// UnreadSourceName names the records UnreadSources makes for other branches and worktrees. No
+// --source may take it.
+const UnreadSourceName = "git"
+
+// unread reports whether a source record stands for work outside this checkout (another branch
+// or worktree) rather than a file.
+func unread(s Source) bool {
+	return s.Disposition == DispUnmergedBranch || s.Disposition == DispOtherWorktree
+}
+
 // Entry is one listed file before it is read.
 type Entry struct {
 	Source string

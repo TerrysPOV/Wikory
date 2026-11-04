@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/TerrysPOV/Wikory/internal/confine"
 )
@@ -393,6 +394,21 @@ func (r *Repo) headRev(ctx context.Context, rev string) (string, error) {
 // HeadCommit is the full HEAD commit id, or "" with a nil error before the first commit.
 func (r *Repo) HeadCommit(ctx context.Context) (string, error) {
 	return r.headRev(ctx, "HEAD^{commit}")
+}
+
+// HeadTime is the committer time of HEAD. It anchors windows such as churn's on the
+// repository's own history rather than the clock, so the same commit gives the same answer on
+// any day and any machine.
+func (r *Repo) HeadTime(ctx context.Context) (time.Time, error) {
+	out, err := r.output(ctx, nil, "log", "--no-show-signature", "-1", "--format=%ct", "HEAD")
+	if err != nil {
+		return time.Time{}, err
+	}
+	secs, err := strconv.ParseInt(out, 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("gitx: unreadable commit time %q", out)
+	}
+	return time.Unix(secs, 0).UTC(), nil
 }
 
 // HeadTree is the HEAD tree id, or "" with a nil error before the first commit.

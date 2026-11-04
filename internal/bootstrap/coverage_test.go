@@ -104,7 +104,7 @@ func TestCoverageNamesWhatWasNeverOpenedAndWhenSourcesLastChanged(t *testing.T) 
 		Source{Name: "nimbalyst", Path: "locked.md", Tier: TierAttributed, Disposition: DispUnreadable},
 		Source{Name: "nimbalyst", Path: "old.md", Tier: TierAttributed, Disposition: DispQueued, Hash: "h5", Size: 3, Date: "2025-01-02T00:00:00Z"},
 		Source{Name: "nimbalyst", Path: "new.md", Tier: TierAttributed, Disposition: DispQueued, Hash: "h6", Size: 3, Date: "2026-03-04T00:00:00Z"},
-		Source{Name: "repo", Path: "branch:feature/x (3 commit(s) not on main)", Tier: TierAttributed, Disposition: DispUnmergedBranch, Date: "2026-02-03T00:00:00Z"})
+		Source{Name: UnreadSourceName, Path: "branch:feature/x (3 commit(s) not on main)", Tier: TierAttributed, Disposition: DispUnmergedBranch, Date: "2026-02-03T00:00:00Z"})
 	cov, err := BuildCoverage(ctx, r, run.ID, nil, r.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -115,7 +115,7 @@ func TestCoverageNamesWhatWasNeverOpenedAndWhenSourcesLastChanged(t *testing.T) 
 	}
 	want := map[string]string{
 		"nimbalyst deep/er/": DispTooDeep, "nimbalyst locked.md": DispUnreadable,
-		"repo branch:feature/x (3 commit(s) not on main)": DispUnmergedBranch}
+		"git branch:feature/x (3 commit(s) not on main)": DispUnmergedBranch}
 	if len(got) != len(want) {
 		t.Fatalf("everything that was never opened is named, and nothing else: %v", got)
 	}
@@ -128,7 +128,7 @@ func TestCoverageNamesWhatWasNeverOpenedAndWhenSourcesLastChanged(t *testing.T) 
 		t.Fatalf("the oldest and newest source dates come from the files that were read: %+v", cov.Sources)
 	}
 	text := cov.Text()
-	for _, w := range []string{"not read (too-deep): nimbalyst deep/er/", "not read (unreadable): nimbalyst locked.md", "not read (unmerged-branch): repo branch:feature/x"} {
+	for _, w := range []string{"not read (too-deep): nimbalyst deep/er/", "not read (unreadable): nimbalyst locked.md", "not read (unmerged-branch): git branch:feature/x"} {
 		if !strings.Contains(text, w) {
 			t.Fatalf("the text report must say %q:\n%s", w, text)
 		}

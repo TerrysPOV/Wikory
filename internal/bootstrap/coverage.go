@@ -311,7 +311,7 @@ func BuildCoverage(ctx context.Context, runs *Runs, runID string, pages []PageOu
 	sort.Strings(cov.StalePages)
 	var names []string
 	for n := range perSource {
-		if n != "repo" {
+		if n != "repo" && n != UnreadSourceName {
 			names = append(names, n)
 		}
 	}

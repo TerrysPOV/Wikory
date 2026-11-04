@@ -133,6 +133,10 @@ func BuildPlan(res Result, scope, head string, sample int) Plan {
 // tier and disposition, the component ranking) together with what they produce: the ordered
 // extract work list and the estimates and batch count Terry sees. A changed estimate constant
 // or tier classifier therefore changes the hash even when the inputs do not.
+//
+// Only what is identical for the same repository state on another machine is hashed: the
+// records of other branches and worktrees (local branch names, how far ahead they are, the
+// branch the default is taken from) are left out. They are still stored and reported.
 func planHash(p Plan) string {
 	h := struct {
 		V          int
@@ -145,11 +149,14 @@ func planHash(p Plan) string {
 		Work       []ItemSpec
 		Estimates  []Estimate
 		Batches    int
-	}{V: 2, Scope: p.Scope, Head: p.Head,
+	}{V: 3, Scope: p.Scope, Head: p.Head,
 		Weights:   [4]float64{WeightChurn, WeightDocRef, WeightHandoff, WeightEntry},
 		Constants: [4]int{BatchSize, DigestMaxBytes, InspectBudget, CapChurn},
 		Work:      ExtractSpecs(p.Result), Estimates: p.Estimates, Batches: p.Batches}
 	for _, s := range p.Sources {
+		if unread(s) {
+			continue
+		}
 		h.Sources = append(h.Sources, hashSource{s.Name, s.Path, s.Hash, s.Tier, s.Disposition})
 	}
 	for _, c := range p.Components {

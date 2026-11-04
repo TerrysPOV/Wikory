@@ -117,13 +117,31 @@ func TestPlanHashDoesNotDependOnWhereAWorktreeLives(t *testing.T) {
 	if here.Hash != there.Hash {
 		t.Fatalf("the same repository state must hash the same in another directory or on another machine: %s vs %s", here.Hash, there.Hash)
 	}
+	// Which branches and worktrees exist is local to one clone: another clone of the same commit
+	// has others, or none. None of it may move the hash (final review A3).
 	other := BuildPlan(withWorktrees(gitx.Worktree{Path: "/Users/a/repo-side", Branch: "other", Head: head}), "repo", "abc123", 0)
-	if other.Hash == here.Hash {
-		t.Fatal("a different branch checked out elsewhere is a different repository state, so it must change the hash")
+	if other.Hash != here.Hash {
+		t.Fatal("a worktree on another branch is local to this clone and must not change the hash")
 	}
 	none := BuildPlan(sampleResult(), "repo", "abc123", 0)
-	if none.Hash == here.Hash {
-		t.Fatal("having another worktree at all must change the hash")
+	if none.Hash != here.Hash {
+		t.Fatal("a clone with no other worktree must plan the same hash")
+	}
+	branched := sampleResult()
+	branched.Sources = append(branched.Sources, UnreadSources("trunk", []gitx.Branch{{Name: "wip", Ahead: 4}}, nil)...)
+	if BuildPlan(branched, "repo", "abc123", 0).Hash != here.Hash {
+		t.Fatal("local branches, how far ahead they are and the default branch's name must not change the hash")
+	}
+}
+
+// Unread records have a source name of their own, so a tracked root file literally named
+// "worktree:main" is a different (name, path) from the record for a worktree on main.
+func TestUnreadRecordsCannotCollideWithARepositoryFile(t *testing.T) {
+	un := UnreadSources("main", []gitx.Branch{{Name: "x", Ahead: 1}}, []gitx.Worktree{{Path: "/w", Branch: "main"}})
+	for _, s := range un {
+		if s.Name != UnreadSourceName || s.Name == "repo" {
+			t.Fatalf("an unread record is named %q, want %q", s.Name, UnreadSourceName)
+		}
 	}
 }
 

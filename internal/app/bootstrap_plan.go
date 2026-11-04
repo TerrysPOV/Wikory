@@ -12,6 +12,7 @@ import (
 
 	"github.com/TerrysPOV/Wikory/internal/bootstrap"
 	"github.com/TerrysPOV/Wikory/internal/confine"
+	"github.com/TerrysPOV/Wikory/internal/gitx"
 )
 
 var sourceName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
@@ -61,8 +62,8 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 	roots := map[string]string{}
 	for _, spec := range fl["source"] {
 		name, dir, ok := strings.Cut(spec, "=")
-		if !ok || !sourceName.MatchString(name) || name == "repo" || dir == "" {
-			return Result{}, &UsageError{Msg: fmt.Sprintf("--source %q: want NAME=DIR with NAME like notes (lower case, not \"repo\")", spec)}
+		if !ok || !sourceName.MatchString(name) || name == "repo" || name == bootstrap.UnreadSourceName || dir == "" {
+			return Result{}, &UsageError{Msg: fmt.Sprintf("--source %q: want NAME=DIR with NAME like notes (lower case, not \"repo\" or \"git\")", spec)}
 		}
 		if _, dup := roots[name]; dup {
 			return Result{}, &UsageError{Msg: fmt.Sprintf("--source %s was given twice; each source needs its own name", name)}
@@ -83,7 +84,11 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 		scope = append(scope, name)
 	}
 	sort.Strings(scope[1:]) // the plan hash covers the scope: the order the flags were typed in must not
-	churn, err := p.Repo.Churn(ctx, time.Now().AddDate(0, 0, -90))
+	since, err := churnSince(ctx, p.Repo)
+	if err != nil {
+		return Result{}, err
+	}
+	churn, err := p.Repo.Churn(ctx, since)
 	if err != nil {
 		return Result{}, err
 	}
@@ -144,6 +149,19 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 		rep.Next += " --sample" // a run planned with a sample cannot start in full until its sample has run
 	}
 	return Result{Data: rep, Text: planText(rep), Notices: notices}, nil
+}
+
+// churnWindow is how far back from HEAD's commit time churn counts commits.
+const churnWindow = 90 * 24 * time.Hour
+
+// churnSince anchors the churn window on HEAD's committer time, not the clock: churn feeds the
+// ranking, the ranking is in the plan hash, and the same commit must plan the same on any day.
+func churnSince(ctx context.Context, repo *gitx.Repo) (time.Time, error) {
+	t, err := repo.HeadTime(ctx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return t.Add(-churnWindow), nil
 }
 
 // requireCleanDefaultBranch is the baseline precondition: bootstrap describes the default

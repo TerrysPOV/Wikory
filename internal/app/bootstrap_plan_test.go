@@ -1,13 +1,19 @@
 package app
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/TerrysPOV/Wikory/internal/gitx"
+	"github.com/TerrysPOV/Wikory/internal/store"
 )
 
 // bootstrapRepo is an initialised, trusted repository whose HEAD holds some code, a doc and a
@@ -171,10 +177,77 @@ func TestBootstrapPlanListsUnmergedBranchesAndOtherWorktreesAsNotRead(t *testing
 	if decodeData[planData](t, again).PlanHash != d.PlanHash {
 		t.Fatal("the same repository state gives the same plan hash")
 	}
+	// Local branches and worktrees are listed but not hashed: another clone of the same commit
+	// has others (final review A3).
 	gitIn(t, dir, "branch", "feature/y", "feature/x")
 	moved, _, _ := runBootstrapJSON(t, c, dir, "plan")
-	if decodeData[planData](t, moved).PlanHash == d.PlanHash {
-		t.Fatal("a new branch with unmerged work changes what the plan describes, so it changes the plan hash")
+	if m := decodeData[planData](t, moved); m.PlanHash != d.PlanHash || m.Sources["skipped:unmerged-branch"] != 2 {
+		t.Fatalf("a new local branch is listed but must not change the plan hash: %+v", m)
+	}
+}
+
+// The same commit must give the same plan hash in another clone, whatever local branches and
+// worktrees that clone has, and on any day: the churn window is anchored on HEAD's commit time.
+func TestBootstrapPlanHashIsTheSameInAnotherCloneAndOnAnotherDay(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	first, code, _ := runBootstrapJSON(t, c, dir, "plan")
+	if code != ExitOK {
+		t.Fatalf("plan: %+v", first)
+	}
+	parent, _ := filepath.EvalSymlinks(t.TempDir())
+	clone := filepath.Join(parent, "clone")
+	gitIn(t, parent, "clone", "-q", dir, clone)
+	gitIn(t, clone, "branch", "local-only")
+	gitIn(t, clone, "checkout", "-q", "-b", "wip")
+	if err := os.WriteFile(filepath.Join(clone, "wip.go"), []byte("package wip\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, clone, "add", "-A")
+	gitIn(t, clone, "commit", "-qm", "local work")
+	gitIn(t, clone, "checkout", "-q", "main")
+	c2 := newCLI(t)
+	if _, e, code := c2.run(clone, "init"); code != ExitOK {
+		t.Fatalf("init in the clone: %s", e)
+	}
+	// project-memory/ came with the clone, so init leaves it untrusted; there is no trust command
+	// yet, so the test records the decision a person would make.
+	cp, err := openProject(context.Background(), &Env{Getenv: c2.getenv(), Cwd: clone}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cp.Store.RecordTrust(context.Background(), cp.Repo.CommonDir, store.TrustTrusted, "test"); err != nil {
+		t.Fatal(err)
+	}
+	cp.Close()
+	second, code, _ := runBootstrapJSON(t, c2, clone, "plan")
+	d1, d2 := decodeData[planData](t, first), decodeData[planData](t, second)
+	if code != ExitOK || d2.Sources["skipped:unmerged-branch"] != 1 || d1.PlanHash != d2.PlanHash {
+		t.Fatalf("another clone of the same commit with other local branches must plan the same hash: code=%d %+v\n%+v\n%+v", code, second.Error, d1, d2)
+	}
+}
+
+// The churn window ends at HEAD's committer time: a repository whose history is years old still
+// has churn, and the window does not move with the clock.
+func TestChurnWindowIsAnchoredOnHeadNotTheClock(t *testing.T) {
+	dir := newGitRepo(t)
+	old := "2001-02-03T04:05:06Z"
+	c := exec.Command("git", "-C", dir, "commit", "-q", "--allow-empty", "-m", "old")
+	c.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@invalid", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@invalid",
+		"GIT_COMMITTER_DATE="+old, "GIT_AUTHOR_DATE="+old)
+	if out, err := c.CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	repo, err := gitx.Discover(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := churnSince(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC).Add(-90 * 24 * time.Hour)
+	if !got.Equal(want) {
+		t.Fatalf("churn window starts at %s, want %s (90 days before HEAD's commit time)", got, want)
 	}
 }
 
@@ -205,7 +278,7 @@ func TestBootstrapPlanSourceFlag(t *testing.T) {
 	if code != ExitOK || !strings.Contains(d.Scope, "notes") {
 		t.Fatalf("code=%d %+v", code, d)
 	}
-	for _, bad := range []string{"Bad=" + outside, "repo=" + outside, "noequals", "n=" + filepath.Join(outside, "missing")} {
+	for _, bad := range []string{"Bad=" + outside, "repo=" + outside, "git=" + outside, "noequals", "n=" + filepath.Join(outside, "missing")} {
 		if _, code, _ := runBootstrapJSON(t, c, dir, "plan", "--source", bad); code == ExitOK {
 			t.Errorf("--source %q should be refused", bad)
 		}

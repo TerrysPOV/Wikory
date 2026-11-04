@@ -69,6 +69,12 @@ func TestLogReadersNeverRunTheRepositorysGpgProgram(t *testing.T) {
 	if _, err := os.Stat(marker); err == nil {
 		t.Fatal("LastChanged ran the repository's gpg.program")
 	}
+	if _, err := r.HeadTime(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("HeadTime ran the repository's gpg.program")
+	}
 	// The safety arguments cover every log, not only the two readers that also pass
 	// --no-show-signature themselves.
 	if _, err := r.git(ctx, nil, "log", "-1", "--format=%H"); err != nil {
