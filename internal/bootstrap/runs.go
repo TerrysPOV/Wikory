@@ -204,6 +204,19 @@ func (r *Runs) Transition(ctx context.Context, id, to string, from ...string) er
 		return fmt.Errorf("%w: no source state given", ErrState)
 	}
 	return r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		if to == StateSampling {
+			var sample int
+			err := tx.QueryRowContext(ctx, `SELECT sample FROM bs_runs WHERE run_id=? AND checkout_id=?`, id, r.CheckoutID).Scan(&sample)
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNoRun
+			}
+			if err != nil {
+				return err
+			}
+			if sample == 0 {
+				return fmt.Errorf("%w: the run was planned without a sample, so there is nothing to measure; plan it with a sample size above 0", ErrState)
+			}
+		}
 		args := []any{to, r.ts(), id, r.CheckoutID}
 		for _, f := range from {
 			args = append(args, f)

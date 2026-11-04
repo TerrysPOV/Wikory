@@ -382,3 +382,119 @@ func TestEveryMutationTakesTheWriteLock(t *testing.T) {
 		}
 	}
 }
+
+type figures struct{ sampleIn, sampleOut, sampleAcc, sampleRej, in, out, acc, rej int }
+
+func readFigures(t *testing.T, s *store.Store, runID string) figures {
+	t.Helper()
+	var f figures
+	err := s.DB.QueryRow(`SELECT sample_in,sample_out,sample_acc,sample_rej,tokens_in,tokens_out,accepted,rejected FROM bs_runs WHERE run_id=?`, runID).
+		Scan(&f.sampleIn, &f.sampleOut, &f.sampleAcc, &f.sampleRej, &f.in, &f.out, &f.acc, &f.rej)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// The sample's cost is what Terry's go-ahead rests on, so it is read straight from the table.
+// The sample here has two items: one completes with usage, the other fails its way to rejection
+// on a FailCounted that carries the final counts. The frozen figures must include every count,
+// the settling call's too, and must not move once the full run adds to the run's own counters.
+func TestTheFrozenSampleFiguresIncludeTheSettlingFailureAndStayFrozen(t *testing.T) {
+	ctx := context.Background()
+	r, s, _, _ := newTestRuns(t)
+	run := mustRun(t, r, 2, 4)
+	if err := r.Transition(ctx, run.ID, StateSampling, StatePlanned); err != nil {
+		t.Fatal(err)
+	}
+	first, err := r.Next(ctx, run.ID, 50)
+	if err != nil || len(first.Items) != 2 {
+		t.Fatalf("a sample of 2 leases 2 items: %+v %v", first, err)
+	}
+	if err := r.Complete(ctx, first.Items[0].ID, first.Items[0].Epoch, Usage{InputTokens: 100, OutputTokens: 10}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if f := readFigures(t, s, run.ID); f.sampleIn != 0 || f.sampleOut != 0 {
+		t.Fatalf("nothing is frozen while a sampled item is still open: %+v", f)
+	}
+	bad := first.Items[1]
+	if err := r.FailCounted(ctx, bad.ID, bad.Epoch, 4, 0); err != nil {
+		t.Fatal(err)
+	}
+	for i, counts := range [][2]int{{0, 0}, {2, 1}} {
+		b, err := r.Next(ctx, run.ID, 50)
+		if err != nil || len(b.Items) != 1 || b.Items[0].ID != bad.ID {
+			t.Fatalf("retry %d: %+v %v", i, b, err)
+		}
+		if err := r.FailCounted(ctx, b.Items[0].ID, b.Items[0].Epoch, counts[0], counts[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _ := r.Get(ctx, run.ID)
+	if got.State != StateAwaiting {
+		t.Fatalf("the settling failure must move the run to awaiting-confirm, got %s", got.State)
+	}
+	want := figures{sampleIn: 100, sampleOut: 10, sampleAcc: 6, sampleRej: 1, in: 100, out: 10, acc: 6, rej: 1}
+	if f := readFigures(t, s, run.ID); f != want {
+		t.Fatalf("the sample figures must hold the usage and every count including the settling failure's: got %+v want %+v", f, want)
+	}
+
+	if err := r.Transition(ctx, run.ID, StateRunning, StateAwaiting); err != nil {
+		t.Fatal(err)
+	}
+	rest, err := r.Next(ctx, run.ID, 50)
+	if err != nil || len(rest.Items) != 2 {
+		t.Fatalf("the full run leases the two unsampled items: %+v %v", rest, err)
+	}
+	if err := r.Complete(ctx, rest.Items[0].ID, rest.Items[0].Epoch, Usage{InputTokens: 7, OutputTokens: 3}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.FailCounted(ctx, rest.Items[1].ID, rest.Items[1].Epoch, 5, 2); err != nil {
+		t.Fatal(err)
+	}
+	want.in, want.out, want.acc, want.rej = 107, 13, 11, 3
+	if f := readFigures(t, s, run.ID); f != want {
+		t.Fatalf("the run's counters keep growing but the frozen sample figures do not move: got %+v want %+v", f, want)
+	}
+}
+
+func TestFailCountedAddsAcceptedAndRejectedToTheirOwnColumns(t *testing.T) {
+	ctx := context.Background()
+	r, s, _, _ := newTestRuns(t)
+	run := mustRun(t, r, 0, 2)
+	_ = r.Transition(ctx, run.ID, StateRunning, StatePlanned)
+	b, _ := r.Next(ctx, run.ID, 2)
+	if len(b.Items) != 2 {
+		t.Fatalf("%+v", b)
+	}
+	if err := r.FailCounted(ctx, b.Items[0].ID, b.Items[0].Epoch, 3, 5); err != nil {
+		t.Fatal(err)
+	}
+	if f := readFigures(t, s, run.ID); f.acc != 3 || f.rej != 5 {
+		t.Fatalf("accepted and rejected must land in their own columns, got accepted=%d rejected=%d", f.acc, f.rej)
+	}
+	if err := r.FailCounted(ctx, b.Items[1].ID, b.Items[1].Epoch, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if f := readFigures(t, s, run.ID); f.acc != 4 || f.rej != 5 {
+		t.Fatalf("counts add up across calls, got accepted=%d rejected=%d", f.acc, f.rej)
+	}
+}
+
+// A run planned without a sample has nothing to measure. Starting its sample would settle at
+// once with zero cost, a hollow figure for the go-ahead to rest on, so it is refused.
+func TestARunPlannedWithoutASampleRefusesToStartOne(t *testing.T) {
+	ctx := context.Background()
+	r, _, _, _ := newTestRuns(t)
+	run := mustRun(t, r, 0, 4)
+	err := r.Transition(ctx, run.ID, StateSampling, StatePlanned)
+	if !errors.Is(err, ErrState) {
+		t.Fatalf("a run with a stored sample of 0 must not enter sampling: %v", err)
+	}
+	if got, _ := r.Get(ctx, run.ID); got.State != StatePlanned {
+		t.Fatalf("a refused transition leaves the run planned, got %s", got.State)
+	}
+	if err := r.Transition(ctx, run.ID, StateRunning, StatePlanned); err != nil {
+		t.Fatalf("a run planned without a sample can still run in full: %v", err)
+	}
+}
