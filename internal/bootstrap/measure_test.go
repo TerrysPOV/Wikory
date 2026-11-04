@@ -2,9 +2,46 @@ package bootstrap
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
+
+// When every sampled item failed there is nothing to project from: the projection is unknown
+// (null in JSON), never a zero that reads as free, and the tokens the failures spent still count.
+func TestMeasureOfASampleWithNoCompletedItemHasNoProjection(t *testing.T) {
+	ctx := context.Background()
+	r, _, _, _ := newTestRuns(t)
+	run := mustRun(t, r, 2, 8)
+	_ = r.Transition(ctx, run.ID, StateSampling, StatePlanned)
+	for attempt := 0; attempt < MaxAttempts; attempt++ {
+		b, err := r.Next(ctx, run.ID, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, it := range b.Items {
+			if err := r.FailCounted(ctx, it.ID, it.Epoch, 0, 2, Usage{InputTokens: 500, OutputTokens: 50}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	m, err := r.Measure(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.SampleDone != 0 || m.TokensIn == 0 {
+		t.Fatalf("every sampled item failed, and what they spent is still shown: %+v", m)
+	}
+	if m.ProjectedTokens != nil {
+		t.Fatalf("no sampled item completed, so the projection must be unknown, got %d", *m.ProjectedTokens)
+	}
+	b, _ := json.Marshal(m)
+	if !strings.Contains(string(b), `"projected_tokens":null`) {
+		t.Fatalf("an unknown projection is null in JSON: %s", b)
+	}
+}
 
 func TestMeasureReportsDurationTokensAcceptanceAndAProjection(t *testing.T) {
 	ctx := context.Background()
@@ -35,8 +72,8 @@ func TestMeasureReportsDurationTokensAcceptanceAndAProjection(t *testing.T) {
 		t.Fatalf("%+v", m)
 	}
 	// 4400 tokens over 2 items is 2200 per item; 6 items remain.
-	if m.ProjectedTokens != 6*2200 {
-		t.Fatalf("projection = %d, want %d", m.ProjectedTokens, 6*2200)
+	if m.ProjectedTokens == nil || *m.ProjectedTokens != 6*2200 {
+		t.Fatalf("projection = %v, want %d", m.ProjectedTokens, 6*2200)
 	}
 }
 
@@ -79,7 +116,7 @@ func TestMeasureStaysTheSampleAfterTheFullRunStarts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after != before || after.TokensIn != 4000 || after.TokensOut != 400 || after.AcceptanceRate != 0.75 {
+	if !reflect.DeepEqual(after, before) || after.TokensIn != 4000 || after.TokensOut != 400 || after.AcceptanceRate != 0.75 {
 		t.Fatalf("the sample's figures must not move once the full run adds its own: before %+v after %+v", before, after)
 	}
 }
@@ -88,7 +125,7 @@ func TestMeasureOfARunWithoutASampleIsZero(t *testing.T) {
 	r, _, _, _ := newTestRuns(t)
 	run := mustRun(t, r, 0, 3)
 	m, err := r.Measure(context.Background(), run.ID)
-	if err != nil || m.SampleItems != 0 || m.ProjectedTokens != 0 {
+	if err != nil || m.SampleItems != 0 || m.ProjectedTokens != nil {
 		t.Fatalf("%+v %v", m, err)
 	}
 }
@@ -110,7 +147,7 @@ func TestMeasureIsLiveWhileTheSampleRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.SampleItems != 2 || m.SampleDone != 1 || m.TokensIn != 700 || m.TokensOut != 70 || m.AcceptanceRate != 0.5 || m.ProjectedTokens != 770*6 {
+	if m.SampleItems != 2 || m.SampleDone != 1 || m.TokensIn != 700 || m.TokensOut != 70 || m.AcceptanceRate != 0.5 || m.ProjectedTokens == nil || *m.ProjectedTokens != 770*6 {
 		t.Fatalf("the live figures of a running sample: %+v", m)
 	}
 }

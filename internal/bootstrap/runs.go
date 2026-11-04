@@ -574,16 +574,23 @@ func (r *Runs) AddCounts(ctx context.Context, runID string, accepted, rejected i
 // The sample covers extraction only: verification starts only in a running run, so its cost is
 // still the plan's estimate, and ProjectedTokens is the extraction projection alone.
 type Measure struct {
-	SampleItems     int     `json:"sample_items"`
-	SampleDone      int     `json:"sample_done"`
-	DurationSecs    float64 `json:"duration_secs"`
-	TokensIn        int     `json:"tokens_in"`
-	TokensOut       int     `json:"tokens_out"`
-	AcceptanceRate  float64 `json:"acceptance_rate"`  // accepted / (accepted + rejected); 0 when nothing was proposed
-	ProjectedTokens int     `json:"projected_tokens"` // for the extract items not yet run, from the sample; asserted
+	SampleItems    int     `json:"sample_items"`
+	SampleDone     int     `json:"sample_done"`
+	DurationSecs   float64 `json:"duration_secs"`
+	TokensIn       int     `json:"tokens_in"`
+	TokensOut      int     `json:"tokens_out"`
+	AcceptanceRate float64 `json:"acceptance_rate"` // accepted / (accepted + rejected); 0 when nothing was proposed
+	// ProjectedTokens is for the extract items not yet run, from the sample; asserted. It is nil
+	// (null in JSON) when it is unknown: extract items remain but no sampled item completed, so
+	// there is nothing to project from. A zero is never shown in place of an unknown cost.
+	ProjectedTokens *int `json:"projected_tokens"`
 }
 
-// Measure reports a run's sample. A run planned without a sample reports zeros. Duration is
+// ProjectionUnknown is how an unknown projection is described to a person.
+const ProjectionUnknown = "unknown: no sampled item completed"
+
+// Measure reports a run's sample. A run planned without a sample reports zeros and no
+// projection. Duration is
 // from the first lease to the last completion of a sampled item. Tokens and the acceptance rate
 // are the sample's own: live while it runs, frozen when it settles, so the full run cannot move
 // them. The projection covers extraction only. Everything is read in one snapshot, so a sample
@@ -629,13 +636,18 @@ func (r *Runs) Measure(ctx context.Context, id string) (Measure, error) {
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM bs_items WHERE run_id=? AND checkout_id=? AND stage='extract'`, id, r.CheckoutID).Scan(&total); err != nil {
 		return m, err
 	}
-	if m.SampleDone > 0 && total > m.SampleItems {
+	switch {
+	case total <= m.SampleItems:
+		zero := 0 // the sample was every extract item: nothing is left to project
+		m.ProjectedTokens = &zero
+	case m.SampleDone > 0:
 		// int64 so the product cannot wrap where int is 32 bits wide; it is clamped, not wrapped.
 		p := (int64(m.TokensIn) + int64(m.TokensOut)) / int64(m.SampleDone) * int64(total-m.SampleItems)
 		if p > math.MaxInt {
 			p = math.MaxInt
 		}
-		m.ProjectedTokens = int(p)
+		n := int(p)
+		m.ProjectedTokens = &n
 	}
 	return m, nil
 }

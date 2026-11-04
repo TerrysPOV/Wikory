@@ -162,8 +162,18 @@ func bootstrapStatus(ctx context.Context, env *Env, args []string) (Result, erro
 			return Result{}, err
 		}
 		rep.Sample = &m
-		text += fmt.Sprintf("sample (extraction only): %d/%d items, %.0fs, tokens (asserted) %d in %d out, excerpt acceptance %.0f%%, projected extraction for the rest about %d tokens (asserted); verification is not sampled, see the plan's estimate\n",
-			m.SampleDone, m.SampleItems, m.DurationSecs, m.TokensIn, m.TokensOut, m.AcceptanceRate*100, m.ProjectedTokens)
+		text += sampleText(m)
 	}
 	return Result{Data: rep, Text: text}, nil
+}
+
+// sampleText is the status line for a run's sample. The tokens already spent are always shown; a
+// projection that cannot be made says so rather than printing zero.
+func sampleText(m bootstrap.Measure) string {
+	proj := bootstrap.ProjectionUnknown
+	if m.ProjectedTokens != nil {
+		proj = fmt.Sprintf("about %d tokens (asserted)", *m.ProjectedTokens)
+	}
+	return fmt.Sprintf("sample (extraction only): %d/%d items, %.0fs, tokens (asserted) %d in %d out, excerpt acceptance %.0f%%, projected extraction for the rest %s; verification is not sampled, see the plan's estimate\n",
+		m.SampleDone, m.SampleItems, m.DurationSecs, m.TokensIn, m.TokensOut, m.AcceptanceRate*100, proj)
 }
