@@ -140,6 +140,9 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 		}
 	}
 	rep.Next = fmt.Sprintf("wikory bootstrap confirm --run %s --plan-hash %s", run.ID, plan.Hash)
+	if sample > 0 {
+		rep.Next += " --sample" // a run planned with a sample cannot start in full until its sample has run
+	}
 	return Result{Data: rep, Text: planText(rep), Notices: notices}, nil
 }
 
@@ -194,6 +197,13 @@ func planText(r planReport) string {
 	fmt.Fprintf(&b, "Batches: %d\n", r.Batches)
 	b.WriteString("No per-token price is shown: none is configured, and on a subscription plan there is none.\n")
 	fmt.Fprintf(&b, "Plan hash: %s\n", r.PlanHash)
-	b.WriteString("Nothing has been sent to a model. To go ahead, a person must say yes, then run:\n  " + r.Next + "\n")
+	b.WriteString("Nothing has been sent to a model. A person must say yes before any paid step.\n")
+	if r.Sample > 0 {
+		b.WriteString("  To sample (extraction only):  " + r.Next + "\n")
+		b.WriteString("  To run in full:   once the sample's measurements are in, the same command without --sample\n")
+	} else {
+		b.WriteString("  To sample first:  wikory bootstrap plan --sample N, then confirm --run RUN --plan-hash HASH --sample\n")
+		b.WriteString("  To run in full:   " + r.Next + "\n")
+	}
 	return b.String()
 }

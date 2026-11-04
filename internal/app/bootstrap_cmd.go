@@ -25,6 +25,8 @@ func runBootstrap(ctx context.Context, env *Env, args []string) (Result, error) 
 		return bootstrapNext(ctx, env, args[1:])
 	case "submit":
 		return bootstrapSubmit(ctx, env, args[1:])
+	case "confirm":
+		return bootstrapConfirm(ctx, env, args[1:])
 	case "finish":
 		return bootstrapFinish(ctx, env, args[1:])
 	case "status":

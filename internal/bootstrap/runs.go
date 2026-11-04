@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -567,4 +568,74 @@ func (r *Runs) AddCounts(ctx context.Context, runID string, accepted, rejected i
 		_, err := tx.ExecContext(ctx, `UPDATE bs_runs SET accepted=accepted+?, rejected=rejected+? WHERE run_id=? AND checkout_id=?`, accepted, rejected, runID, r.CheckoutID)
 		return err
 	})
+}
+
+// Measure is what the sample showed, from the stored run. Tokens are asserted by the driver.
+// The sample covers extraction only: verification starts only in a running run, so its cost is
+// still the plan's estimate, and ProjectedTokens is the extraction projection alone.
+type Measure struct {
+	SampleItems     int     `json:"sample_items"`
+	SampleDone      int     `json:"sample_done"`
+	DurationSecs    float64 `json:"duration_secs"`
+	TokensIn        int     `json:"tokens_in"`
+	TokensOut       int     `json:"tokens_out"`
+	AcceptanceRate  float64 `json:"acceptance_rate"`  // accepted / (accepted + rejected); 0 when nothing was proposed
+	ProjectedTokens int     `json:"projected_tokens"` // for the extract items not yet run, from the sample; asserted
+}
+
+// Measure reports a run's sample. A run planned without a sample reports zeros. Duration is
+// from the first lease to the last completion of a sampled item. Tokens and the acceptance rate
+// are the sample's own: live while it runs, frozen when it settles, so the full run cannot move
+// them. The projection covers extraction only. Everything is read in one snapshot, so a sample
+// that settles mid-call cannot show live figures beside a settled state.
+func (r *Runs) Measure(ctx context.Context, id string) (Measure, error) {
+	var m Measure
+	tx, err := r.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return m, err
+	}
+	defer tx.Rollback()
+	var state string
+	var sample, tin, tout, acc, rej, sin, sout, sacc, srej int
+	err = tx.QueryRowContext(ctx, `SELECT state,sample,tokens_in,tokens_out,accepted,rejected,sample_in,sample_out,sample_acc,sample_rej
+		FROM bs_runs WHERE run_id=? AND checkout_id=?`, id, r.CheckoutID).Scan(&state, &sample, &tin, &tout, &acc, &rej, &sin, &sout, &sacc, &srej)
+	if errors.Is(err, sql.ErrNoRows) {
+		return m, ErrNoRun
+	}
+	if err != nil || sample == 0 {
+		return m, err
+	}
+	var first, last sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT count(*), coalesce(sum(CASE WHEN state='done' THEN 1 ELSE 0 END),0), min(NULLIF(leased_at,'')), max(NULLIF(done_at,''))
+		FROM bs_items WHERE run_id=? AND checkout_id=? AND stage='extract' AND sampled=1`, id, r.CheckoutID).Scan(&m.SampleItems, &m.SampleDone, &first, &last)
+	if err != nil {
+		return m, err
+	}
+	if first.Valid && last.Valid {
+		a, e1 := time.Parse(tsLayout, first.String)
+		b, e2 := time.Parse(tsLayout, last.String)
+		if e1 == nil && e2 == nil {
+			m.DurationSecs = b.Sub(a).Seconds()
+		}
+	}
+	if state != StateSampling {
+		tin, tout, acc, rej = sin, sout, sacc, srej
+	}
+	m.TokensIn, m.TokensOut = tin, tout
+	if n := acc + rej; n > 0 {
+		m.AcceptanceRate = float64(acc) / float64(n)
+	}
+	var total int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM bs_items WHERE run_id=? AND checkout_id=? AND stage='extract'`, id, r.CheckoutID).Scan(&total); err != nil {
+		return m, err
+	}
+	if m.SampleDone > 0 && total > m.SampleItems {
+		// int64 so the product cannot wrap where int is 32 bits wide; it is clamped, not wrapped.
+		p := (int64(m.TokensIn) + int64(m.TokensOut)) / int64(m.SampleDone) * int64(total-m.SampleItems)
+		if p > math.MaxInt {
+			p = math.MaxInt
+		}
+		m.ProjectedTokens = int(p)
+	}
+	return m, nil
 }

@@ -127,6 +127,8 @@ type statusReport struct {
 	TokensNote   string                    `json:"tokens_note"`
 	// AdmissionsNote says what run.claims_accepted and run.claims_rejected count.
 	AdmissionsNote string `json:"admissions_note"`
+	// Sample is what the sample showed, for a run planned with one. It covers extraction only.
+	Sample *bootstrap.Measure `json:"sample,omitempty"`
 }
 
 // admissionsNote is the plain meaning of a run's accepted and rejected counts.
@@ -154,5 +156,14 @@ func bootstrapStatus(ctx context.Context, env *Env, args []string) (Result, erro
 		TokensNote: bootstrap.TokensNote, AdmissionsNote: admissionsNote}
 	text := fmt.Sprintf("%s\nextract admissions: %d accepted, %d rejected (verify verdicts are not counted here)\ntokens (asserted): %d in, %d out\n",
 		rep.Summary, st.Run.Accepted, st.Run.Rejected, st.Run.TokensIn, st.Run.TokensOut)
+	if st.Run.Sample > 0 {
+		m, err := runs.Measure(ctx, id)
+		if err != nil {
+			return Result{}, err
+		}
+		rep.Sample = &m
+		text += fmt.Sprintf("sample (extraction only): %d/%d items, %.0fs, tokens (asserted) %d in %d out, excerpt acceptance %.0f%%, projected extraction for the rest about %d tokens (asserted); verification is not sampled, see the plan's estimate\n",
+			m.SampleDone, m.SampleItems, m.DurationSecs, m.TokensIn, m.TokensOut, m.AcceptanceRate*100, m.ProjectedTokens)
+	}
 	return Result{Data: rep, Text: text}, nil
 }
