@@ -61,6 +61,14 @@ func TestCheckProposalRejections(t *testing.T) {
 		{"text that would render as a list", mut(func(c *ProposedClaim) { c.Text = "- item" }), "bad-text"},
 		{"inline html", mut(func(c *ProposedClaim) { c.Text = "uses <b>bold</b> text" }), "bad-text"},
 		{"zero-width character", mut(func(c *ProposedClaim) { c.Text = "Jobs are​ acknowledged" }), "bad-text"},
+		{"leading space", mut(func(c *ProposedClaim) { c.Text = " Jobs are acknowledged late." }), "bad-text"},
+		{"trailing space", mut(func(c *ProposedClaim) { c.Text = "Jobs are acknowledged late. " }), "bad-text"},
+		{"underscore thematic break", mut(func(c *ProposedClaim) { c.Text = "___" }), "bad-text"},
+		{"spaced underscore thematic break", mut(func(c *ProposedClaim) { c.Text = "_ _ _" }), "bad-text"},
+		{"link reference definition", mut(func(c *ProposedClaim) { c.Text = "[ref]: https://example.com/page" }), "bad-text"},
+		{"link reference definition with spaces", mut(func(c *ProposedClaim) { c.Text = "[some ref]: /docs/page.md" }), "bad-text"},
+		{"line separator", mut(func(c *ProposedClaim) { c.Text = "Jobs are\u2028acknowledged late." }), "bad-text"},
+		{"paragraph separator", mut(func(c *ProposedClaim) { c.Text = "Jobs are\u2029acknowledged late." }), "bad-text"},
 		{"empty text", mut(func(c *ProposedClaim) { c.Text = "  " }), "bad-text"},
 		{"text over the cap", mut(func(c *ProposedClaim) { c.Text = strings.Repeat("a", MaxClaimBytes+1) }), "bad-text"},
 	}
@@ -93,5 +101,18 @@ func TestCheckProposalDuplicatesAndTheCountCap(t *testing.T) {
 	acc, rej := CheckProposal(Proposal{Claims: many}, []byte(workText))
 	if len(acc) != MaxClaimsPerItem || len(rej) != 3 || rej[0].Code != "too-many" {
 		t.Fatalf("accepted %d rejected %v", len(acc), codes(rej))
+	}
+}
+
+// The new shape rules must not refuse ordinary prose that merely starts like a marker.
+func TestCheckTextStillAcceptsProseThatOnlyLooksLikeAMarker(t *testing.T) {
+	for _, text := range []string{
+		"_internal helpers are private to the package.",
+		"[draft] is the status a new claim starts in.",
+		"Underscores such as ___ are not a rule when they sit inside a sentence.",
+	} {
+		if code, why := CheckText(text); code != "" {
+			t.Errorf("%q was refused (%s: %s)", text, code, why)
+		}
 	}
 }

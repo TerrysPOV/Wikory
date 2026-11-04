@@ -116,12 +116,20 @@ func (b claimBasis) forClaim(a Accepted) (status string, ev []claim.Evidence, de
 // Submit checks a proposal against its work file, admits what passes through validate.Authoring
 // and stores it with the item's completion in one transaction. A submission with claims but no
 // usable claim puts the item back for another try instead of completing it.
+//
+// The item id in a proposal is chosen by the subagent and Safe only redacts secret shapes, so
+// the report names an item only once the store has found it, by the store's own id. Until then
+// (and on any lookup error) Item stays empty. The verify path of Task 11 must follow the same rule.
 func Submit(ctx context.Context, in SubmitInput) (SubmitReport, error) {
-	rep := SubmitReport{Item: Safe(in.P.Item), Rejected: []Reject{}, Findings: []string{}}
+	rep := SubmitReport{Rejected: []Reject{}, Findings: []string{}}
+	if err := in.P.Usage.Check(); err != nil {
+		return rep, err
+	}
 	it, err := in.Runs.Item(ctx, in.P.Item)
 	if err != nil {
 		return rep, err
 	}
+	rep.Item = it.ID
 	if it.Stage != "extract" {
 		return rep, fmt.Errorf("%w: item %s is a %s item", ErrState, it.ID, it.Stage)
 	}
@@ -147,6 +155,11 @@ func Submit(ctx context.Context, in SubmitInput) (SubmitReport, error) {
 		}
 		ad, err := Admit(ctx, in.Env, a.ProposedClaim, status, ev, deps, tier, in.Mint)
 		if err != nil {
+			if !IsRefusal(err) {
+				// A git or environment failure says nothing about the claim: leave the item leased
+				// and untouched so the same submission can be retried.
+				return rep, err
+			}
 			rep.Rejected = append(rep.Rejected, Reject{Index: a.Index, Code: "validator", Why: Safe(err.Error())})
 			continue
 		}
@@ -157,7 +170,7 @@ func Submit(ctx context.Context, in SubmitInput) (SubmitReport, error) {
 	}
 	rep.Accepted = len(admitted)
 	if len(admitted) == 0 && len(in.P.Claims) > 0 {
-		if err := in.Runs.FailCounted(ctx, it.ID, it.Epoch, 0, len(rep.Rejected)); err != nil {
+		if err := in.Runs.FailCounted(ctx, it.ID, it.Epoch, 0, len(rep.Rejected), in.P.Usage); err != nil {
 			return rep, err
 		}
 		rep.Requeued = true

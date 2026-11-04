@@ -55,6 +55,10 @@ var (
 	// badLead matches text a renderer would not show as a plain paragraph.
 	badLead  = regexp.MustCompile("^\\s{0,3}([#>*+|-]|[0-9]+[.)]|```|~~~|<)")
 	inlineHT = regexp.MustCompile(`<[A-Za-z/!?]`)
+	// underscoreRule is a thematic break written with underscores, which badLead does not cover.
+	underscoreRule = regexp.MustCompile(`^ {0,3}(_[ \t]*){3,}$`)
+	// linkRefDef is a link reference definition, which a renderer swallows instead of showing.
+	linkRefDef = regexp.MustCompile(`^ {0,3}\[[^\]]*\]:`)
 )
 
 // CheckText is the shared rule for claim text, used for extracted claims and for the corrected
@@ -69,12 +73,14 @@ func CheckText(t string) (code, why string) {
 		return "bad-text", "the text is longer than " + strconv.Itoa(MaxClaimBytes) + " bytes"
 	case len(redact.Scan(t)) > 0:
 		return "secret", "the text looks like it contains a credential or key, so it was not stored"
-	case strings.ContainsAny(t, "\r\n"):
+	case strings.ContainsAny(t, "\r\n\u2028\u2029"):
 		return "bad-text", "a claim is one paragraph with no line breaks"
+	case t != strings.TrimSpace(t):
+		return "bad-text", "the text has leading or trailing whitespace"
 	case strings.Contains(t, "<!--") || strings.Contains(t, "-->"):
 		return "bad-text", "the text contains comment markers"
-	case badLead.MatchString(t):
-		return "bad-text", "the text would render as a heading, quote, list, table or code, not a paragraph"
+	case badLead.MatchString(t) || underscoreRule.MatchString(t) || linkRefDef.MatchString(t):
+		return "bad-text", "the text would render as a heading, quote, list, table, rule, link definition or code, not a paragraph"
 	case inlineHT.MatchString(t):
 		return "bad-text", "the text contains inline HTML, which the index would drop"
 	}

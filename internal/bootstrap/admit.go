@@ -9,6 +9,19 @@ import (
 	"github.com/TerrysPOV/Wikory/internal/validate"
 )
 
+// ErrRefused marks an Admit failure that judges the claim itself, as opposed to a git or
+// environment failure that says nothing about it.
+var ErrRefused = errors.New("bootstrap: claim refused")
+
+// IsRefusal reports whether err from Admit is a verdict on the claim: a typed refusal from
+// validate (a path outside the repository, an ambiguous object id) or one of Admit's own.
+// Anything else is an infrastructure failure and must not be counted against the claim.
+func IsRefusal(err error) bool {
+	return errors.Is(err, validate.ErrConfinement) ||
+		errors.Is(err, validate.ErrAmbiguousID) ||
+		errors.Is(err, ErrRefused)
+}
+
 // CapStatus is the highest status a claim extracted from s may carry. Handoffs, memory notes
 // and anything read from outside the repository describe the past: historical. Everything else
 // is unverified until code evidence says otherwise. Nothing extracted is ever verified.
@@ -47,11 +60,11 @@ func Admit(ctx context.Context, env validate.Env, pc ProposedClaim, status strin
 		return Admitted{}, err
 	}
 	if out.Status == "verified" {
-		return Admitted{}, errors.New("bootstrap: an extracted claim came out verified; only a code-evidenced verdict may do that")
+		return Admitted{}, fmt.Errorf("%w: an extracted claim came out verified; only a code-evidenced verdict may do that", ErrRefused)
 	}
 	meta := out.Render()
 	if _, err := claim.ParseComment(meta); err != nil {
-		return Admitted{}, fmt.Errorf("bootstrap: the rendered claim does not parse back: %w", err)
+		return Admitted{}, fmt.Errorf("%w: the rendered claim does not parse back: %v", ErrRefused, err)
 	}
 	return Admitted{Claim: out, Text: pc.Text, Meta: meta, Tier: tier, Findings: findings}, nil
 }

@@ -54,6 +54,24 @@ type Usage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
+// MaxUsageTokens bounds what one submission may claim to have cost. It is far above any real
+// item and far below anything that could overflow a counter.
+const MaxUsageTokens = 1 << 31
+
+// ErrBadUsage is what a usage figure outside 0..MaxUsageTokens is refused with.
+var ErrBadUsage = errors.New("bootstrap: usage figures must be between 0 and 2147483648 tokens")
+
+// Check refuses usage the driver asserts that cannot be real. The figures feed the cost the
+// go-ahead rests on, so a negative one must never lower them.
+func (u Usage) Check() error {
+	for _, n := range [...]int{u.InputTokens, u.OutputTokens} {
+		if n < 0 || n > MaxUsageTokens {
+			return ErrBadUsage
+		}
+	}
+	return nil
+}
+
 // Run is one bootstrap run.
 type Run struct {
 	ID        string `json:"id"`
@@ -358,12 +376,13 @@ func (r *Runs) Complete(ctx context.Context, itemID string, epoch int, u Usage, 
 // Fail returns a leased item to pending (or rejects it after MaxAttempts) when its submission
 // was unusable as a whole.
 func (r *Runs) Fail(ctx context.Context, itemID string, epoch int) error {
-	return r.FailCounted(ctx, itemID, epoch, 0, 0)
+	return r.FailCounted(ctx, itemID, epoch, 0, 0, Usage{})
 }
 
-// FailCounted is Fail that also adds the submission's accepted and rejected claim counts to the
-// run in the same transaction, so a sample that settles on this failure freezes the final counts.
-func (r *Runs) FailCounted(ctx context.Context, itemID string, epoch, accepted, rejected int) error {
+// FailCounted is Fail that also adds the submission's accepted and rejected claim counts and the
+// usage it cost to the run in the same transaction, so a sample that settles on this failure
+// freezes the final figures. An attempt that yields nothing usable still spends tokens.
+func (r *Runs) FailCounted(ctx context.Context, itemID string, epoch, accepted, rejected int, u Usage) error {
 	return r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		it, err := loadItem(ctx, tx, itemID, r.CheckoutID)
 		if err != nil {
@@ -372,7 +391,8 @@ func (r *Runs) FailCounted(ctx context.Context, itemID string, epoch, accepted, 
 		if it.State != "leased" || it.Epoch != epoch {
 			return ErrStaleLease
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE bs_runs SET accepted=accepted+?, rejected=rejected+? WHERE run_id=?`, accepted, rejected, it.RunID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE bs_runs SET accepted=accepted+?, rejected=rejected+?, tokens_in=tokens_in+?, tokens_out=tokens_out+? WHERE run_id=?`,
+			accepted, rejected, u.InputTokens, u.OutputTokens, it.RunID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE bs_items SET attempts=attempts+1, state=CASE WHEN attempts+1 >= ? THEN 'rejected' ELSE 'pending' END WHERE item_id=?`, MaxAttempts, itemID); err != nil {

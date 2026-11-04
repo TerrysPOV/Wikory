@@ -418,15 +418,15 @@ func TestTheFrozenSampleFiguresIncludeTheSettlingFailureAndStayFrozen(t *testing
 		t.Fatalf("nothing is frozen while a sampled item is still open: %+v", f)
 	}
 	bad := first.Items[1]
-	if err := r.FailCounted(ctx, bad.ID, bad.Epoch, 4, 0); err != nil {
+	if err := r.FailCounted(ctx, bad.ID, bad.Epoch, 4, 0, Usage{InputTokens: 40, OutputTokens: 4}); err != nil {
 		t.Fatal(err)
 	}
-	for i, counts := range [][2]int{{0, 0}, {2, 1}} {
+	for i, counts := range [][4]int{{0, 0, 20, 2}, {2, 1, 10, 1}} {
 		b, err := r.Next(ctx, run.ID, 50)
 		if err != nil || len(b.Items) != 1 || b.Items[0].ID != bad.ID {
 			t.Fatalf("retry %d: %+v %v", i, b, err)
 		}
-		if err := r.FailCounted(ctx, b.Items[0].ID, b.Items[0].Epoch, counts[0], counts[1]); err != nil {
+		if err := r.FailCounted(ctx, b.Items[0].ID, b.Items[0].Epoch, counts[0], counts[1], Usage{InputTokens: counts[2], OutputTokens: counts[3]}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -434,7 +434,7 @@ func TestTheFrozenSampleFiguresIncludeTheSettlingFailureAndStayFrozen(t *testing
 	if got.State != StateAwaiting {
 		t.Fatalf("the settling failure must move the run to awaiting-confirm, got %s", got.State)
 	}
-	want := figures{sampleIn: 100, sampleOut: 10, sampleAcc: 6, sampleRej: 1, in: 100, out: 10, acc: 6, rej: 1}
+	want := figures{sampleIn: 170, sampleOut: 17, sampleAcc: 6, sampleRej: 1, in: 170, out: 17, acc: 6, rej: 1}
 	if f := readFigures(t, s, run.ID); f != want {
 		t.Fatalf("the sample figures must hold the usage and every count including the settling failure's: got %+v want %+v", f, want)
 	}
@@ -449,16 +449,16 @@ func TestTheFrozenSampleFiguresIncludeTheSettlingFailureAndStayFrozen(t *testing
 	if err := r.Complete(ctx, rest.Items[0].ID, rest.Items[0].Epoch, Usage{InputTokens: 7, OutputTokens: 3}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.FailCounted(ctx, rest.Items[1].ID, rest.Items[1].Epoch, 5, 2); err != nil {
+	if err := r.FailCounted(ctx, rest.Items[1].ID, rest.Items[1].Epoch, 5, 2, Usage{InputTokens: 5, OutputTokens: 1}); err != nil {
 		t.Fatal(err)
 	}
-	want.in, want.out, want.acc, want.rej = 107, 13, 11, 3
+	want.in, want.out, want.acc, want.rej = 182, 21, 11, 3
 	if f := readFigures(t, s, run.ID); f != want {
 		t.Fatalf("the run's counters keep growing but the frozen sample figures do not move: got %+v want %+v", f, want)
 	}
 }
 
-func TestFailCountedAddsAcceptedAndRejectedToTheirOwnColumns(t *testing.T) {
+func TestFailCountedAddsUsageAndCountsToTheirOwnColumns(t *testing.T) {
 	ctx := context.Background()
 	r, s, _, _ := newTestRuns(t)
 	run := mustRun(t, r, 0, 2)
@@ -467,14 +467,20 @@ func TestFailCountedAddsAcceptedAndRejectedToTheirOwnColumns(t *testing.T) {
 	if len(b.Items) != 2 {
 		t.Fatalf("%+v", b)
 	}
-	if err := r.FailCounted(ctx, b.Items[0].ID, b.Items[0].Epoch, 3, 5); err != nil {
+	if err := r.FailCounted(ctx, b.Items[0].ID, b.Items[0].Epoch, 3, 5, Usage{InputTokens: 11, OutputTokens: 2}); err != nil {
 		t.Fatal(err)
+	}
+	if f := readFigures(t, s, run.ID); f.in != 11 || f.out != 2 {
+		t.Fatalf("a failed attempt still cost tokens, and they must be recorded: got in=%d out=%d", f.in, f.out)
 	}
 	if f := readFigures(t, s, run.ID); f.acc != 3 || f.rej != 5 {
 		t.Fatalf("accepted and rejected must land in their own columns, got accepted=%d rejected=%d", f.acc, f.rej)
 	}
-	if err := r.FailCounted(ctx, b.Items[1].ID, b.Items[1].Epoch, 1, 0); err != nil {
+	if err := r.FailCounted(ctx, b.Items[1].ID, b.Items[1].Epoch, 1, 0, Usage{InputTokens: 6, OutputTokens: 1}); err != nil {
 		t.Fatal(err)
+	}
+	if f := readFigures(t, s, run.ID); f.in != 17 || f.out != 3 {
+		t.Fatalf("usage adds up across failed attempts, got in=%d out=%d", f.in, f.out)
 	}
 	if f := readFigures(t, s, run.ID); f.acc != 4 || f.rej != 5 {
 		t.Fatalf("counts add up across calls, got accepted=%d rejected=%d", f.acc, f.rej)

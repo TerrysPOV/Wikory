@@ -58,6 +58,11 @@ func bootstrapSubmit(ctx context.Context, env *Env, args []string) (Result, erro
 	if err := dec.Decode(&in); err != nil {
 		return Result{}, &UsageError{Msg: "stdin is not the expected JSON: " + jsonProblem(err)}
 	}
+	// Anything after the object, a second object included, is refused and never repeated.
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return Result{}, &UsageError{Msg: "stdin has data after the JSON object"}
+	}
 	if in.Stage != "extract" && in.Stage != "verify" {
 		return Result{}, &UsageError{Msg: `stage must be "extract" or "verify"`}
 	}
@@ -70,17 +75,33 @@ func bootstrapSubmit(ctx context.Context, env *Env, args []string) (Result, erro
 		return Result{}, err
 	}
 	wf := bootstrap.WorkFiles{Root: p.Store.Root, CheckoutID: p.Checkout.ID}
-	rep := submitReport{RunID: runID, Results: []submitResult{}}
-	var notices []string
-	for _, rawRes := range in.Results {
-		var sr submitResult
-		switch in.Stage {
-		case "extract":
+	// Every result is read and checked before any is submitted, so a bad one later in the batch
+	// cannot leave earlier ones committed with no report.
+	var props []bootstrap.Proposal
+	if in.Stage == "extract" {
+		for _, rawRes := range in.Results {
 			var prop bootstrap.Proposal
 			if err := strictUnmarshal(rawRes, &prop); err != nil {
 				return Result{}, &UsageError{Msg: "an extract result is not the expected JSON: " + jsonProblem(err)}
 			}
-			r, err := bootstrap.Submit(ctx, bootstrap.SubmitInput{Runs: runs, Env: p.validateEnv(), Work: wf, Mint: ids.NewULID, Batch: batch, P: prop})
+			if err := prop.Usage.Check(); err != nil {
+				return Result{}, &UsageError{Msg: "an extract result has usage the driver cannot have spent: " + err.Error()}
+			}
+			if it, err := runs.Item(ctx, prop.Item); err == nil && it.RunID != runID {
+				return Result{}, &UsageError{Msg: "an item in the submission does not belong to the run given with --run"}
+			} else if err != nil && !errors.Is(err, bootstrap.ErrNoItem) {
+				return Result{}, err
+			}
+			props = append(props, prop)
+		}
+	}
+	rep := submitReport{RunID: runID, Results: []submitResult{}}
+	var notices []string
+	for i, rawRes := range in.Results {
+		var sr submitResult
+		switch in.Stage {
+		case "extract":
+			r, err := bootstrap.Submit(ctx, bootstrap.SubmitInput{Runs: runs, Env: p.validateEnv(), Work: wf, Mint: ids.NewULID, Batch: batch, P: props[i]})
 			sr = submitResult{Item: r.Item, Accepted: r.Accepted, Rejected: r.Rejected, Findings: r.Findings, Requeued: r.Requeued}
 			if err != nil {
 				sr.Error = describeSubmitError(err)
@@ -105,7 +126,7 @@ func bootstrapSubmit(ctx context.Context, env *Env, args []string) (Result, erro
 		rep.Accepted += sr.Accepted
 		rep.Rejected += len(sr.Rejected)
 		if sr.Error != "" {
-			notices = append(notices, fmt.Sprintf("item %s: %s", sr.Item, sr.Error))
+			notices = append(notices, noticeFor(sr))
 		}
 		rep.Results = append(rep.Results, sr)
 	}
@@ -113,6 +134,15 @@ func bootstrapSubmit(ctx context.Context, env *Env, args []string) (Result, erro
 		rep.Status = statusLine(st)
 	}
 	return Result{Data: rep, Notices: notices, Text: fmt.Sprintf("%d accepted, %d rejected. %s\n", rep.Accepted, rep.Rejected, rep.Status)}, nil
+}
+
+// noticeFor names the item only when the store found it; a submission naming an item that does
+// not exist has no item to name, and its id is never repeated.
+func noticeFor(sr submitResult) string {
+	if sr.Item == "" {
+		return "a submitted item: " + sr.Error
+	}
+	return fmt.Sprintf("item %s: %s", sr.Item, sr.Error)
 }
 
 func strictUnmarshal(raw []byte, v any) error {

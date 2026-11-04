@@ -2,11 +2,15 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 
 	"github.com/TerrysPOV/Wikory/internal/claim"
 	"github.com/TerrysPOV/Wikory/internal/ids"
+	"github.com/TerrysPOV/Wikory/internal/validate"
 )
 
 type fakeEnv struct{ head map[string]string }
@@ -80,8 +84,34 @@ func TestAdmitMintsRendersAndParsesBack(t *testing.T) {
 func TestAdmitNeverReturnsAVerifiedClaim(t *testing.T) {
 	ctx := context.Background()
 	pc := ProposedClaim{Text: "Jobs are acknowledged only after the handler returns.", Kind: "current-impl"}
-	if _, err := Admit(ctx, envWith("a.go"), pc, "verified", []claim.Evidence{{Kind: claim.EvBlob, Path: "a.go"}}, nil, TierImplementation, ids.NewULID); err == nil {
+	_, err := Admit(ctx, envWith("a.go"), pc, "verified", []claim.Evidence{{Kind: claim.EvBlob, Path: "a.go"}}, nil, TierImplementation, ids.NewULID)
+	if err == nil {
 		t.Fatal("extraction must refuse to produce a verified claim, even with committed code evidence")
+	}
+	if !IsRefusal(err) {
+		t.Fatalf("a verified result is a verdict on the claim, not an infrastructure failure: %v", err)
+	}
+}
+
+func TestIsRefusalSeparatesVerdictsFromInfrastructureFailures(t *testing.T) {
+	for name, err := range map[string]error{
+		"confinement": fmt.Errorf("%w: evidence %q", validate.ErrConfinement, "../x"),
+		"ambiguous":   fmt.Errorf("%w: abc", validate.ErrAmbiguousID),
+		"admit's own": fmt.Errorf("%w: it did not parse back", ErrRefused),
+		"bare":        ErrRefused,
+	} {
+		if !IsRefusal(err) {
+			t.Errorf("%s is a verdict on the claim and was not recognised as one", name)
+		}
+	}
+	for name, err := range map[string]error{
+		"git failure": errors.New("git: exit status 128"),
+		"wrapped io":  fmt.Errorf("evidence a.go@abc: %w", io.ErrUnexpectedEOF),
+		"context":     context.Canceled,
+	} {
+		if IsRefusal(err) {
+			t.Errorf("%s is not a verdict on the claim but was counted as one", name)
+		}
 	}
 }
 
