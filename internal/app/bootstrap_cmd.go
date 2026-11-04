@@ -9,10 +9,10 @@ import (
 )
 
 func init() {
-	register(Command{Name: "bootstrap", Summary: "bootstrap: build a baseline wiki (plan, next, submit, confirm, finish, status)", Run: runBootstrap})
+	register(Command{Name: "bootstrap", Summary: "bootstrap: build a baseline wiki (plan, next, submit, confirm, finish, status, abandon)", Run: runBootstrap})
 }
 
-const bootstrapUsage = "usage: wikory bootstrap plan|next|submit|confirm|finish|status [flags]"
+const bootstrapUsage = "usage: wikory bootstrap plan|next|submit|confirm|finish|status|abandon [flags]"
 
 func runBootstrap(ctx context.Context, env *Env, args []string) (Result, error) {
 	if len(args) == 0 {
@@ -31,6 +31,8 @@ func runBootstrap(ctx context.Context, env *Env, args []string) (Result, error) 
 		return bootstrapFinish(ctx, env, args[1:])
 	case "status":
 		return bootstrapStatus(ctx, env, args[1:])
+	case "abandon":
+		return bootstrapAbandon(ctx, env, args[1:])
 	}
 	return Result{}, &UsageError{Msg: fmt.Sprintf("unknown bootstrap subcommand %q; %s", args[0], bootstrapUsage)}
 }

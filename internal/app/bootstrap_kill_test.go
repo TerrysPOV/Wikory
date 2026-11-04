@@ -90,10 +90,10 @@ var finishBoundaries = []struct {
 	step  string
 	rerun bool
 }{
-	{"checked", true}, {"planned", true}, {"locked", true}, {"staged", true}, {"manifest", true},
+	{"checked", true}, {"planned", true}, {"pending-0", true}, {"locked", true}, {"staged", true}, {"manifest", true},
 	{"applied-0", true}, {"marked-0", true}, {"dbmarked-0", true}, {"applied-1", true},
 	{"appended", true}, {"logged", true}, {"committed", true},
-	{"after-job-0", true}, {"after-job-1", true}, {"before-record", true}, {"recorded", true}, {"marked-done", false},
+	{"after-job-0", true}, {"pending-1", true}, {"after-job-1", true}, {"before-record", true}, {"recorded", true}, {"marked-done", false},
 }
 
 type finishPages struct {

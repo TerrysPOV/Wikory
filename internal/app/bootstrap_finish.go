@@ -46,6 +46,11 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		return Result{}, err
 	}
 	if head != run.Head {
+		if run.State == bootstrap.StateFinishing {
+			// The run was already publishing when it stopped. It can never finish against another
+			// commit, so name the way out instead of refusing for ever.
+			return Result{}, &UsageError{Msg: fmt.Sprintf("the repository moved from %.12s to %.12s while this run was finishing, so it can never be finished; drop it with wikory bootstrap abandon --run %s, then plan again (pages it already wrote are still recognised as Wikory's own)", run.Head, head, run.ID)}
+		}
 		return Result{}, &UsageError{Msg: fmt.Sprintf("the repository moved from %.12s to %.12s since this run was planned; the baseline describes the planned commit, so plan again", run.Head, head)}
 	}
 	prog := newBootstrapProgress(env)
@@ -131,14 +136,14 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		return data, err == nil, err
 	}
 	var recErr error
-	recorded := func(path string) (string, bool) {
-		h, ok, err := runs.PublishedHash(ctx, path)
+	ours := func(path, hash string) bool {
+		ok, err := runs.IsOurs(ctx, path, hash)
 		if err != nil {
 			recErr = err
 		}
-		return h, ok
+		return ok
 	}
-	ops, conflicts, unchanged, err := bootstrap.PlanOps(pages, current, recorded)
+	ops, conflicts, unchanged, err := bootstrap.PlanOps(pages, current, ours)
 	if err == nil {
 		err = recErr
 	}
@@ -167,6 +172,17 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		if end == start {
 			end++
 		}
+		// The pages this job will write are recorded as pending first, in one transaction: if the
+		// process dies after the job and before the final record, they are still Wikory's own to
+		// this run's rerun and to any later bootstrap.
+		pending := make(map[string]string, end-start)
+		for _, o := range ops[start:end] {
+			pending[o.Target] = publish.HashContent(o.Content)
+		}
+		if err := runs.RecordPending(ctx, id, pending); err != nil {
+			return Result{}, err
+		}
+		killPoint(fmt.Sprintf("pending-%d", jobNo))
 		job, err := pub.Begin(ctx, "bootstrap")
 		if err != nil {
 			return Result{}, err

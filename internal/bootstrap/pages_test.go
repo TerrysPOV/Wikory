@@ -22,7 +22,7 @@ func TestPlanOpsCreatesUnchangedAndConflictRules(t *testing.T) {
 	rec := map[string]string{"p/mine.md": publish.HashContent([]byte("old bootstrap text")), "p/edited.md": publish.HashContent([]byte("old bootstrap text"))}
 	ops, conflicts, unchanged, err := PlanOps(pages,
 		func(p string) ([]byte, bool, error) { s, ok := files[p]; return []byte(s), ok, nil },
-		func(p string) (string, bool) { h, ok := rec[p]; return h, ok })
+		func(p, h string) bool { r, ok := rec[p]; return ok && r == h })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestPlanOpsCreatesUnchangedAndConflictRules(t *testing.T) {
 func TestPlanOpsPropagatesAReadError(t *testing.T) {
 	boom := errors.New("boom")
 	_, _, _, err := PlanOps([]PageOut{{Path: "p/a.md", Content: []byte("x")}},
-		func(string) ([]byte, bool, error) { return nil, false, boom }, func(string) (string, bool) { return "", false })
+		func(string) ([]byte, bool, error) { return nil, false, boom }, func(string, string) bool { return false })
 	if !errors.Is(err, boom) {
 		t.Fatalf("%v", err)
 	}

@@ -85,5 +85,6 @@ CREATE TABLE IF NOT EXISTS bs_claims(
   PRIMARY KEY(run_id, item_id, ordinal));
 CREATE TABLE IF NOT EXISTS bs_pages(
   checkout_id TEXT NOT NULL, path TEXT NOT NULL, hash TEXT NOT NULL, run_id TEXT NOT NULL,
+  pending TEXT NOT NULL DEFAULT '',
   PRIMARY KEY(checkout_id, path));
 `

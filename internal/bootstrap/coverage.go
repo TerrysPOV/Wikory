@@ -166,7 +166,7 @@ func isPartSuffix(s string) bool {
 
 // PublishedPaths lists the pages an earlier bootstrap recorded as its own in this checkout.
 func (r *Runs) PublishedPaths(ctx context.Context) ([]string, error) {
-	rows, err := r.DB.QueryContext(ctx, `SELECT path FROM bs_pages WHERE checkout_id=? ORDER BY path`, r.CheckoutID)
+	rows, err := r.DB.QueryContext(ctx, `SELECT path FROM bs_pages WHERE checkout_id=? AND hash != '' ORDER BY path`, r.CheckoutID)
 	if err != nil {
 		return nil, err
 	}
@@ -470,6 +470,14 @@ func (r *Runs) EnterFinishing(ctx context.Context, id string) (bool, error) {
 		}
 	})
 	return moved && err == nil, err
+}
+
+// Abandon drops a run that has not finished: planned, sampling, awaiting-confirm, running or
+// finishing become abandoned. Nothing is promoted or deleted: pages the run already published
+// keep their pending hashes, so a later bootstrap still recognises them as Wikory's own. An
+// abandoned run is never leased, confirmed, submitted to or finished.
+func (r *Runs) Abandon(ctx context.Context, id string) error {
+	return r.Transition(ctx, id, StateAbandoned, StatePlanned, StateSampling, StateAwaiting, StateRunning, StateFinishing)
 }
 
 // LeaveFinishing puts a finishing run back to running, so that its open work can be handed out
