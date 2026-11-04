@@ -35,6 +35,9 @@ func Scan(s string) []Span {
 			if end <= start || markerRe.MatchString(s[start:end]) {
 				continue
 			}
+			if r.accept != nil && !r.accept(s[start:end]) {
+				continue
+			}
 			spans = append(spans, Span{Kind: r.kind, Start: start, End: end})
 		}
 	}
