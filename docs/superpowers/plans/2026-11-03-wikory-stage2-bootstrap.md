@@ -988,6 +988,24 @@ git commit -m "feat: add tree listing, blob reads, churn and default branch to g
 
 ---
 
+#### Final whole-branch review fixes (2026-11-04)
+
+- A1 (`e0e74ad`): `safety` gains `-c log.showSignature=false`, both log readers (`Churn`, `LastChanged`) pass `--no-show-signature`, and `gitEnv` appends `GIT_NO_LAZY_FETCH=1` and `GIT_NO_REPLACE_OBJECTS=1`. A repository with `log.showSignature=true`, its own `gpg.program` and a commit carrying a forged `gpgsig` header made `bootstrap plan` run that program (reproduced on git 2.55.0). Tests: `TestLogReadersNeverRunTheRepositorysGpgProgram` (gitx_signature_test.go; skipped on Windows, the stand-in is a shell script; it first proves a plain `git log` runs the stand-in) and `TestGitEnvSwitchesOffLazyFetchAndReplaceObjects`. The per-call `--no-show-signature` is a second layer under the `safety` argument and has no test of its own: removing it from `Churn` alone survives injection, by design.
+- A3 (`403d1ef`): `HeadTime(ctx) (time.Time, error)` is new: HEAD's committer time from `log --no-show-signature -1 --format=%ct HEAD`. The plan anchors the churn window on it (see Task 6).
+- B4 (`a751ae8`): `Churn` no longer trims leading newlines from tokens. With an empty format git writes no newline between commits, so a token is a path exactly as stored; the trim turned a file named "\nfoo.go" into "foo.go". Test: `TestChurnKeepsALeadingNewlineInAFileName` (skipped on Windows).
+- C1 (`0f2b764`): `ReadBlob(ctx, oid string, size, max int64)` takes the size `ListTree` already returned and runs one `cat-file blob` instead of `cat-file -s` then `cat-file blob`. A size over `max` returns `ErrTooLarge` before git runs; what comes back is also held to `max`, so an understated size cannot let a larger object through. Callers: `RepoReader.Read` passes `e.Size`; the verify `Blob` callback is now `func(oid string, size int64)` and `checkLines` passes `src.Size`.
+
+Inject steps replacing Step 5's second line (the old `'if n > max {'` anchor no longer exists):
+
+Run: `scripts/inject.sh internal/gitx/inventory.go 'if size > max {' 'if size > max+1<<40 {' ./internal/gitx/ 'TestReadBlobHonoursTheLimitAndRefusesNonIDs' 'must refuse before reading'`
+Run: `scripts/inject.sh internal/gitx/inventory.go 'if int64(len(data)) > max {' 'if int64(len(data)) > max+1<<40 {' ./internal/gitx/ 'TestReadBlobHonoursTheLimitAndRefusesNonIDs' 'must be ErrTooLarge'`
+Run: `scripts/inject.sh internal/gitx/gitx.go '"-c", "log.showSignature=false",' '' ./internal/gitx/ 'TestLogReadersNeverRun' 'a plain log through Repo.git ran'`
+Run: `scripts/inject.sh internal/gitx/gitx.go '"GIT_NO_LAZY_FETCH=1", ' '' ./internal/gitx/ 'TestGitEnvSwitches' 'lacks GIT_NO_LAZY_FETCH'`
+Run: `scripts/inject.sh internal/gitx/gitx.go ', "GIT_NO_REPLACE_OBJECTS=1"' '' ./internal/gitx/ 'TestGitEnvSwitches' 'lacks GIT_NO_REPLACE_OBJECTS'`
+Run: `scripts/inject.sh internal/gitx/inventory.go '		if p := string(tok); p != "" {' '		if p := strings.TrimLeft(string(tok), "\n"); p != "" {' ./internal/gitx/ 'TestChurnKeepsALeadingNewline' 'want 1 for'`
+
+Expected: each exits 0 (RED).
+
 ### Task 3: `redact.Scan` with offsets
 
 **Files:**
