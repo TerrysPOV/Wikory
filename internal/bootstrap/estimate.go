@@ -105,6 +105,9 @@ type Plan struct {
 	Scope, Head, Hash string
 	Sample, Batches   int
 	Roots             map[string]string // --source name -> directory; not part of the hash
+	// Branch is the branch the checkout was on when it was planned, or "detached"; not part of the
+	// hash (the hash is of the repository state, which is HEAD). finish refuses another branch.
+	Branch string
 	Result
 	Estimates []Estimate
 }

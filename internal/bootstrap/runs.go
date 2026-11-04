@@ -89,6 +89,8 @@ type Run struct {
 	TokensOut int    `json:"tokens_out"`
 	Accepted  int    `json:"claims_accepted"`
 	Rejected  int    `json:"claims_rejected"`
+	// Branch is the branch the run was planned on, or "detached".
+	Branch string `json:"branch"`
 }
 
 // RunStatus is a run with its item and source counts.
@@ -136,11 +138,11 @@ func (r *Runs) write(ctx context.Context, fn func(ctx context.Context, tx *sql.T
 // are flagged so a sampling run leases only those.
 func (r *Runs) Create(ctx context.Context, p Plan, specs []ItemSpec) (Run, error) {
 	now := r.ts()
-	run := Run{ID: r.NewID("run_"), State: StatePlanned, PlanHash: p.Hash, Scope: p.Scope, Head: p.Head, Sample: p.Sample, CreatedAt: now, UpdatedAt: now}
+	run := Run{ID: r.NewID("run_"), State: StatePlanned, PlanHash: p.Hash, Scope: p.Scope, Head: p.Head, Sample: p.Sample, Branch: p.Branch, CreatedAt: now, UpdatedAt: now}
 	sampled := SampleSet(p.Sample, len(specs))
 	err := r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO bs_runs(run_id,checkout_id,state,plan_hash,scope,head_commit,sample,roots,created_at,updated_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?)`, run.ID, r.CheckoutID, run.State, run.PlanHash, run.Scope, run.Head, run.Sample, encodeRoots(p.Roots), now, now); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO bs_runs(run_id,checkout_id,state,plan_hash,scope,head_commit,sample,roots,branch,created_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?)`, run.ID, r.CheckoutID, run.State, run.PlanHash, run.Scope, run.Head, run.Sample, encodeRoots(p.Roots), run.Branch, now, now); err != nil {
 			return err
 		}
 		for _, s := range p.Sources {
@@ -221,11 +223,11 @@ func boolInt(b bool) int {
 	return 0
 }
 
-const runCols = `run_id,state,plan_hash,scope,head_commit,sample,end_marker,tokens_in,tokens_out,accepted,rejected,created_at,updated_at`
+const runCols = `run_id,state,plan_hash,scope,head_commit,sample,end_marker,tokens_in,tokens_out,accepted,rejected,created_at,updated_at,branch`
 
 func scanRun(row interface{ Scan(...any) error }) (Run, error) {
 	var x Run
-	err := row.Scan(&x.ID, &x.State, &x.PlanHash, &x.Scope, &x.Head, &x.Sample, &x.EndMarker, &x.TokensIn, &x.TokensOut, &x.Accepted, &x.Rejected, &x.CreatedAt, &x.UpdatedAt)
+	err := row.Scan(&x.ID, &x.State, &x.PlanHash, &x.Scope, &x.Head, &x.Sample, &x.EndMarker, &x.TokensIn, &x.TokensOut, &x.Accepted, &x.Rejected, &x.CreatedAt, &x.UpdatedAt, &x.Branch)
 	if errors.Is(err, sql.ErrNoRows) {
 		return x, ErrNoRun
 	}

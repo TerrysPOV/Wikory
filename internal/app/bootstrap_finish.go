@@ -65,6 +65,11 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		}
 		return Result{}, &UsageError{Msg: fmt.Sprintf("the repository moved from %.12s to %.12s since this run was planned; the baseline describes the planned commit, so plan again", run.Head, head)}
 	}
+	if cur := branchLabel(ctx, p); cur != run.Branch {
+		// The pages describe the default branch at the planned commit; a checkout on another
+		// branch at the same commit is someone else's work in progress and must not receive them.
+		return Result{}, &UsageError{Msg: fmt.Sprintf("this run was planned on branch %q and the checkout is now on %q; switch back to %q to finish it, or drop it with wikory bootstrap abandon --run %s and plan again", run.Branch, cur, run.Branch, run.ID)}
+	}
 	prog := newBootstrapProgress(env)
 	// The progress line is ended on every way out of here, so an error never starts in the middle of it.
 	staged := false

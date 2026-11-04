@@ -139,6 +139,7 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 	}
 	plan := bootstrap.BuildPlan(res, strings.Join(scope, "+"), head, sample)
 	plan.Roots = roots
+	plan.Branch = branchLabel(ctx, p)
 	run, err := newRuns(p).Create(ctx, plan, bootstrap.ExtractSpecs(res))
 	if err != nil {
 		return Result{}, err
@@ -184,6 +185,14 @@ func sourcePlace(top, dir string) string {
 		return "repository"
 	}
 	return ""
+}
+
+// branchLabel is the branch the checkout is on, or "detached" when HEAD names no branch.
+func branchLabel(ctx context.Context, p *project) string {
+	if b := p.Repo.Branch(ctx); b != "" {
+		return b
+	}
+	return "detached"
 }
 
 // churnWindow is how far back from HEAD's commit time churn counts commits.
