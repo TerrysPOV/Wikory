@@ -28,7 +28,10 @@ type planReport struct {
 	Inspected  int                  `json:"inspected"`
 	Batches    int                  `json:"batches"`
 	Estimates  []bootstrap.Estimate `json:"estimates"`
-	Next       string               `json:"next"`
+	// Roots is each --source name and the directory it reads, so the person's yes covers which
+	// directories outside the repository are read.
+	Roots map[string]string `json:"roots"`
+	Next  string            `json:"next"`
 }
 
 func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error) {
@@ -58,6 +61,7 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 		return Result{}, &UsageError{Msg: "the repository has no commits to baseline"}
 	}
 	readers := []bootstrap.Reader{bootstrap.NewRepoReader(p.Repo, head)}
+	var notices []string
 	scope := []string{"repo"}
 	roots := map[string]string{}
 	for _, spec := range fl["source"] {
@@ -73,6 +77,12 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 		}
 		if !filepath.IsAbs(dir) {
 			dir = filepath.Join(p.Repo.Top, dir)
+		}
+		switch where := sourcePlace(p.Repo.Top, dir); where {
+		case "project-memory":
+			return Result{}, &UsageError{Msg: fmt.Sprintf("--source %s: %s is inside %s/, which is Wikory's own output; a bootstrap never reads its own wiki back as a source", name, spec[len(name)+1:], pmDir)}
+		case "repository":
+			notices = append(notices, fmt.Sprintf("--source %s is inside the repository, so its files are also read as repository files; a source is meant for material kept outside it", name))
 		}
 		roots[name] = dir
 		root, err := confine.Open(dir)
@@ -124,7 +134,6 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 	if err != nil {
 		return Result{}, err
 	}
-	var notices []string
 	if prep.Redactions > 0 {
 		notices = append(notices, fmt.Sprintf("%d value(s) were redacted while preparing work files; check the sources for secrets", prep.Redactions))
 	}
@@ -135,7 +144,7 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 		return Result{}, err
 	}
 	rep := planReport{RunID: run.ID, PlanHash: plan.Hash, Scope: plan.Scope, Head: head, Sample: sample,
-		Sources: map[string]int{}, Components: len(res.Components), Batches: plan.Batches, Estimates: plan.Estimates}
+		Sources: map[string]int{}, Components: len(res.Components), Batches: plan.Batches, Estimates: plan.Estimates, Roots: roots}
 	for _, s := range res.Sources {
 		rep.Sources[s.Disposition]++
 	}
@@ -149,6 +158,32 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 		rep.Next += " --sample" // a run planned with a sample cannot start in full until its sample has run
 	}
 	return Result{Data: rep, Text: planText(rep), Notices: notices}, nil
+}
+
+// sourcePlace says where a --source directory sits: "project-memory" when it resolves to Wikory's
+// own output directory or anything under it, "repository" when it is elsewhere inside the
+// checkout, and "" when it is outside. Links are resolved first, so a link cannot hide where a
+// directory really is; a directory that cannot be resolved is left to confine.Open to refuse.
+func sourcePlace(top, dir string) string {
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return ""
+	}
+	root, err := filepath.EvalSymlinks(top)
+	if err != nil {
+		root = top
+	}
+	within := func(base string) bool {
+		rel, err := filepath.Rel(base, resolved)
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	}
+	switch {
+	case within(filepath.Join(root, pmDir)):
+		return "project-memory"
+	case within(root):
+		return "repository"
+	}
+	return ""
 }
 
 // churnWindow is how far back from HEAD's commit time churn counts commits.
@@ -203,6 +238,17 @@ func planText(r planReport) string {
 		fmt.Fprintf(&b, " %s=%d", k, r.Sources[k])
 	}
 	fmt.Fprintf(&b, "\nComponents: %d found, %d to be verified\n", r.Components, r.Inspected)
+	if len(r.Roots) > 0 {
+		names := make([]string, 0, len(r.Roots))
+		for n := range r.Roots {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		b.WriteString("Directories outside the repository that will be read:\n")
+		for _, n := range names {
+			fmt.Fprintf(&b, "  --source %s=%s\n", n, r.Roots[n])
+		}
+	}
 	if n := r.Sources[bootstrap.DispUnmergedBranch]; n > 0 || r.Sources[bootstrap.DispOtherWorktree] > 0 {
 		fmt.Fprintf(&b, "Not read: %d branch(es) with unmerged commits and %d other worktree(s). The baseline is the default branch at HEAD; work that lives elsewhere is not in it.\n", n, r.Sources[bootstrap.DispOtherWorktree])
 	}
