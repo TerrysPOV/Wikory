@@ -83,7 +83,13 @@ func Inventory(ctx context.Context, readers []Reader, opt Options) (Result, erro
 		if s.Disposition != "" {
 			continue // a reader already recorded why this was not read
 		}
-		if why := Exclusion(s.Path, s.Size, nil); why != "" {
+		if hasControl(s.Path) {
+			// A name with a newline or other control character could forge a digest header, so it
+			// is recorded and never read or queued.
+			s.Disposition = DispBadName
+		} else if spans := redact.Scan(s.Path); len(spans) > 0 {
+			s.Disposition, s.SecretSpans = "skipped:secret", len(spans) // a secret in a name would reach every digest header
+		} else if why := Exclusion(s.Path, s.Size, nil); why != "" {
 			s.Disposition = why
 		} else if s.Tier == TierImplementation && s.Name == "repo" {
 			implPaths = append(implPaths, s.Path)

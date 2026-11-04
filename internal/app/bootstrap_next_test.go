@@ -1,6 +1,9 @@
 package app
 
 import (
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -112,5 +115,37 @@ func TestBootstrapNextHandsOutRedactedWorkFilesAndNeverTheSameItemTwice(t *testi
 		Items []struct{} `json:"items"`
 	}](t, again).Items); n != 0 {
 		t.Fatalf("leased items must not be handed out again: %d", n)
+	}
+}
+
+// If the store lost a work file between plan and next, next says which item and refuses; it
+// does not hand out a path to nothing, and it prints no file text.
+func TestBootstrapNextNamesAnItemWhoseWorkFileIsMissing(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	pe, _, _ := runBootstrapJSON(t, c, dir, "plan")
+	run := decodeData[planData](t, pe).RunID
+	forceState(t, c, run, "running")
+	removed := 0
+	_ = filepath.WalkDir(c.dataDir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && filepath.Base(filepath.Dir(p)) == "work" && strings.HasSuffix(p, ".txt") {
+			if os.Remove(p) == nil {
+				removed++
+			}
+		}
+		return nil
+	})
+	if removed < 2 {
+		t.Fatalf("precondition: the plan should have written work files to remove, removed %d", removed)
+	}
+	out, errOut, code := c.run(dir, "--json", "bootstrap", "next", "--run", run, "--max", "50")
+	if code == ExitOK {
+		t.Fatalf("a missing work file must fail the call: %s", out)
+	}
+	all := out + errOut
+	if !strings.Contains(all, "the work file for ") || !strings.Contains(all, " is missing") || !strings.Contains(all, "src:") && !strings.Contains(all, "comp:") {
+		t.Fatalf("the error must name the item whose work file is missing: %s", all)
+	}
+	if strings.Contains(all, "acknowledges after the handler") || strings.Contains(all, "package queue") {
+		t.Fatalf("no file text may be printed: %s", all)
 	}
 }

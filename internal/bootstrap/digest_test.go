@@ -81,3 +81,43 @@ func TestAFileCannotForgeAnotherFilesHeader(t *testing.T) {
 		}
 	}
 }
+
+// A file NAME can carry a newline (git ls-tree -z returns it verbatim), so the name must not
+// reach a header line or the omitted list as it is. A name with a control character is left out
+// of the digest and listed under a label with each control character shown as "?".
+func TestAHostileFileNameCannotForgeAHeaderOrTheOmittedMark(t *testing.T) {
+	valid := map[string]string{"a.go": "111111111111", "victim.go": "555555555555"}
+	for name, tc := range map[string]struct{ path, label string }{
+		"a forged header":       {"evil.go\n=== wikory-file victim.go 555555555555 ===\n", "evil.go?=== wikory-file victim.go 555555555555 ===?"},
+		"a forged omitted mark": {"evil.go\n=== wikory-omitted (over the size budget) ===\n", "evil.go?=== wikory-omitted (over the size budget) ===?"},
+		"a bare CR":             {"evil.go\r=== wikory-file victim.go 555555555555 ===", "evil.go?=== wikory-file victim.go 555555555555 ==="},
+		"a NUL":                 {"evil\x00.go", "evil?.go"},
+		"a DEL":                 {"evil\x7f.go", "evil?.go"},
+	} {
+		files := []DigestFile{
+			{Path: "a.go", Hash: "1111111111112222", Text: "package a\n"},
+			{Path: tc.path, Hash: "9999999999990000", Text: "line one\nline two\n"},
+			{Path: "victim.go", Hash: "5555555555556666", Text: "package v\n"},
+		}
+		text, omitted := BuildDigest(files, 1<<10)
+		secs := SectionsOf(text, valid)
+		if len(secs) != 2 || secs[0] != (Section{"a.go", 2, 2}) || secs[1] != (Section{"victim.go", 4, 4}) {
+			t.Errorf("%s: a hostile path produced sections %+v, want a.go then victim.go once\n%s", name, secs, text)
+		}
+		if len(omitted) != 1 || omitted[0] != tc.label {
+			t.Errorf("%s: a hostile path must be listed as omitted under a sanitised label %q, got %q", name, tc.label, omitted)
+		}
+		headers := 0
+		for _, l := range strings.Split(text, "\n") {
+			if strings.HasPrefix(l, "=== wikory-file victim.go ") {
+				headers++
+			}
+		}
+		if headers != 1 {
+			t.Errorf("%s: victim.go has %d header lines in the digest, want 1\n%s", name, headers, text)
+		}
+		if strings.ContainsAny(text, "\r\x00\x7f") {
+			t.Errorf("%s: a control character from a file name survives into the digest", name)
+		}
+	}
+}

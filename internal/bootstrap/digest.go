@@ -1,6 +1,9 @@
 package bootstrap
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+)
 
 const (
 	headerPrefix = "=== wikory-file "
@@ -22,6 +25,23 @@ func short(h string) string {
 		return h[:12]
 	}
 	return h
+}
+
+// hasControl reports whether a path contains a control character (newline, CR, NUL, DEL and
+// the rest of unicode.IsControl). Git returns file names verbatim, so a name can carry a
+// newline; such a name must not be written into a header line or the omitted list.
+func hasControl(p string) bool {
+	return strings.IndexFunc(p, unicode.IsControl) >= 0
+}
+
+// visiblePath is a path with each control character shown as "?", safe to list.
+func visiblePath(p string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return '?'
+		}
+		return r
+	}, p)
 }
 
 func headerLine(f DigestFile) string {
@@ -46,12 +66,19 @@ func frame(s string) string {
 
 // BuildDigest concatenates files under header lines, in the order given, until the budget is
 // spent. A file that does not fit is left out whole and listed at the end; a smaller file that
-// comes later may still fit. Each file's text is framed first (see frame).
+// comes later may still fit. Each file's text is framed first (see frame). A file whose path
+// holds a control character is never written: it is left out and listed by its visiblePath, so
+// neither a header nor the omitted list can be forged from a file name. The caller redacts
+// each file's text before calling (see WorkFiles.WriteDigest); BuildDigest redacts nothing.
 func BuildDigest(files []DigestFile, max int) (string, []string) {
 	var b strings.Builder
 	var omitted []string
 	used := 0
 	for _, f := range files {
+		if hasControl(f.Path) {
+			omitted = append(omitted, visiblePath(f.Path))
+			continue
+		}
 		body := frame(f.Text)
 		if !strings.HasSuffix(body, "\n") {
 			body += "\n"

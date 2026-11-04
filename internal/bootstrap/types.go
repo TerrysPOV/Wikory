@@ -28,6 +28,7 @@ const (
 	DispLink           = "skipped:link"
 	DispUnmergedBranch = "skipped:unmerged-branch"
 	DispOtherWorktree  = "skipped:other-worktree"
+	DispBadName        = "skipped:bad-name"
 )
 
 // Entry is one listed file before it is read.

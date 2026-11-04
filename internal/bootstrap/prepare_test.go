@@ -56,3 +56,52 @@ func TestPrepareWorkRefusesAFileThatChangedSinceInventory(t *testing.T) {
 		t.Fatal("content that no longer matches the scanned hash must not become a work file")
 	}
 }
+
+// A file that ends on an unset assignment is clean on its own. Redacting the joined digest
+// instead of each file lets the assignment's separator reach across the newline and swallow the
+// next file's header, so b.go would lose its section and a false redaction notice would be raised.
+func TestPrepareWorkKeepsEverySectionWhenAFileEndsOnAnUnsetAssignment(t *testing.T) {
+	ctx := context.Background()
+	w, _ := newWork(t)
+	repo := &memReader{name: "repo", files: map[string]string{
+		"internal/queue/a.go": "package queue\n// see config: pass" + "word=\n",
+		"internal/queue/b.go": "package queue\n\nfunc B() {}\n",
+		"docs/design.md":      "The internal/queue package acks after the handler.\n",
+	}}
+	res, err := Inventory(ctx, []Reader{repo}, Options{MaxFileBytes: MaxFileBytes, Budget: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := srcBy(res, "internal/queue/a.go"); a.Disposition != DispQueued {
+		t.Fatalf("precondition: a.go is clean on its own: %+v", a)
+	}
+	st, err := PrepareWork(ctx, []Reader{repo}, res, w, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Redactions != 0 {
+		t.Fatalf("nothing in these files is a secret, so no redaction notice: %d", st.Redactions)
+	}
+	valid := map[string]string{}
+	for _, s := range res.Sources {
+		valid[s.Path] = short(s.Hash)
+	}
+	checked := false
+	for _, sp := range ExtractSpecs(res) {
+		if sp.Ref != "comp:internal/queue" {
+			continue
+		}
+		checked = true
+		b, err := w.Read(sp.InputHash, 1<<20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		secs := SectionsOf(string(b), valid)
+		if len(secs) != 2 || secs[0] != (Section{"internal/queue/a.go", 2, 3}) || secs[1] != (Section{"internal/queue/b.go", 5, 7}) {
+			t.Fatalf("each file keeps its own section: %+v\n%s", secs, b)
+		}
+	}
+	if !checked {
+		t.Fatal("expected a digest item for internal/queue")
+	}
+}

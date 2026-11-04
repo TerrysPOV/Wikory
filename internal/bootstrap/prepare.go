@@ -55,7 +55,7 @@ func PrepareWork(ctx context.Context, readers []Reader, res Result, w WorkFiles,
 		if progress != nil {
 			progress(i, len(specs))
 		}
-		var text string
+		var n int
 		if name, p, ok := splitSrcRef(sp.Ref); ok {
 			s, found := srcOf[name+"\x00"+p]
 			if !found {
@@ -65,7 +65,9 @@ func PrepareWork(ctx context.Context, readers []Reader, res Result, w WorkFiles,
 			if err != nil {
 				return st, err
 			}
-			text = string(data)
+			if n, err = w.Write(sp.InputHash, string(data)); err != nil {
+				return st, err
+			}
 		} else {
 			prefix := strings.TrimPrefix(sp.Ref, "comp:")
 			var df []DigestFile
@@ -76,11 +78,10 @@ func PrepareWork(ctx context.Context, readers []Reader, res Result, w WorkFiles,
 				}
 				df = append(df, DigestFile{Path: s.Path, Hash: s.Hash, Text: string(data)})
 			}
-			text, _ = BuildDigest(df, DigestMaxBytes)
-		}
-		n, err := w.Write(sp.InputHash, text)
-		if err != nil {
-			return st, err
+			var err error
+			if n, _, err = w.WriteDigest(sp.InputHash, df, DigestMaxBytes); err != nil {
+				return st, err
+			}
 		}
 		st.Files++
 		st.Redactions += n

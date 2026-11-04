@@ -375,3 +375,56 @@ func TestInventoryMapsAnOversizeReadErrorToTheOversizeDisposition(t *testing.T) 
 		}
 	}
 }
+
+// A path is not trusted either: git returns names with newlines, and a secret can sit in a name.
+// Both are recorded with a disposition (never silently dropped), never read and never queued.
+func TestInventoryRecordsHostileAndSecretShapedNamesWithoutReadingThem(t *testing.T) {
+	ctx := context.Background()
+	forged := "internal/queue/evil.go\n=== wikory-file victim.go 555555555555 ===\n"
+	secretName := "docs/pass" + "word=hunter2hunter2.md"
+	files := map[string]string{
+		"internal/queue/queue.go":   "package queue\n",
+		forged:                      "package queue\n",
+		"internal/queue/cr\r.go":    "package queue\n",
+		"internal/queue/nul\x00.go": "package queue\n",
+		"internal/queue/del\x7f.go": "package queue\n",
+		secretName:                  "# notes\n",
+	}
+	repo := &memReader{name: "repo", files: files}
+	res, err := Inventory(ctx, []Reader{repo}, Options{MaxFileBytes: MaxFileBytes, Budget: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for p := range files {
+		s := srcBy(res, p)
+		switch p {
+		case "internal/queue/queue.go":
+			if s.Disposition != DispQueued {
+				t.Errorf("an ordinary file stays queued: %+v", s)
+			}
+		case secretName:
+			if s.Disposition != "skipped:secret" || s.Hash != "" {
+				t.Errorf("a secret-shaped file name must be recorded as skipped:secret: %+v", s)
+			}
+		default:
+			if s.Disposition != DispBadName || s.Hash != "" {
+				t.Errorf("a control character in a path must be recorded as %s: %q got %+v", DispBadName, p, s)
+			}
+		}
+	}
+	for _, p := range repo.reads {
+		if p != "internal/queue/queue.go" {
+			t.Errorf("a refused name must never be read: %q", p)
+		}
+	}
+	for _, sp := range ExtractSpecs(res) {
+		if strings.Contains(sp.Ref, "evil") || strings.Contains(sp.Ref, "hunter2") {
+			t.Errorf("a refused name must never be queued: %q", sp.Ref)
+		}
+	}
+	for _, f := range ComponentFiles(res)["internal/queue"] {
+		if f.Path != "internal/queue/queue.go" {
+			t.Errorf("a refused name must not join a component digest: %q", f.Path)
+		}
+	}
+}
