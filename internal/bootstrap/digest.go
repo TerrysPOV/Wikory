@@ -1,0 +1,120 @@
+package bootstrap
+
+import "strings"
+
+const (
+	headerPrefix = "=== wikory-file "
+	headerSuffix = " ==="
+	omittedMark  = "=== wikory-omitted (over the size budget) ==="
+)
+
+// DigestFile is one file going into a component digest. Hash is the file's content hash.
+type DigestFile struct{ Path, Hash, Text string }
+
+// Section is the line range of one file's text inside a digest.
+type Section struct {
+	Path       string
+	Start, End int
+}
+
+func short(h string) string {
+	if len(h) > 12 {
+		return h[:12]
+	}
+	return h
+}
+
+func headerLine(f DigestFile) string {
+	return headerPrefix + f.Path + " " + short(f.Hash) + headerSuffix
+}
+
+// frame keeps file text from posing as digest structure. Line endings become LF, so the digest's
+// lines are the lines every other check counts, and a line that starts like a header or the
+// omitted marker gets a leading space. After framing no line of any file begins where a header
+// does, so SectionsOf can trust every header it finds. (The hash prefix in a header is public, so
+// it could never be what stopped a forgery.)
+func frame(s string) string {
+	s = strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n")
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		if strings.HasPrefix(l, headerPrefix) || strings.HasPrefix(l, omittedMark) {
+			lines[i] = " " + l
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// BuildDigest concatenates files under header lines, in the order given, until the budget is
+// spent. A file that does not fit is left out whole and listed at the end; a smaller file that
+// comes later may still fit. Each file's text is framed first (see frame).
+func BuildDigest(files []DigestFile, max int) (string, []string) {
+	var b strings.Builder
+	var omitted []string
+	used := 0
+	for _, f := range files {
+		body := frame(f.Text)
+		if !strings.HasSuffix(body, "\n") {
+			body += "\n"
+		}
+		if used+len(body) > max {
+			omitted = append(omitted, f.Path)
+			continue
+		}
+		used += len(body)
+		b.WriteString(headerLine(f) + "\n" + body)
+	}
+	if len(omitted) > 0 {
+		b.WriteString(omittedMark + "\n" + strings.Join(omitted, "\n") + "\n")
+	}
+	return b.String(), omitted
+}
+
+// SectionsOf finds each file's text in a digest. Only a header whose path and hash prefix are
+// both in valid counts; any other line that merely looks like one is file text.
+func SectionsOf(text string, valid map[string]string) []Section {
+	lines := strings.Split(text, "\n")
+	n := len(lines)
+	if n > 0 && lines[n-1] == "" {
+		n--
+	}
+	var secs []Section
+	cur := -1
+	for i := 0; i < n; i++ {
+		l := lines[i]
+		if l == omittedMark {
+			break
+		}
+		if strings.HasPrefix(l, headerPrefix) && strings.HasSuffix(l, headerSuffix) {
+			inner := strings.TrimSuffix(strings.TrimPrefix(l, headerPrefix), headerSuffix)
+			if sp := strings.LastIndex(inner, " "); sp > 0 && valid[inner[:sp]] == inner[sp+1:] {
+				if cur >= 0 {
+					secs[cur].End = i
+				}
+				secs = append(secs, Section{Path: inner[:sp], Start: i + 2})
+				cur = len(secs) - 1
+				continue
+			}
+		}
+	}
+	if cur >= 0 {
+		end := n
+		for i := 0; i < n; i++ {
+			if lines[i] == omittedMark {
+				end = i
+				break
+			}
+		}
+		secs[cur].End = end
+	}
+	return secs
+}
+
+// SectionAt is the section that holds a 1-based line, if any.
+func SectionAt(secs []Section, line int) (Section, bool) {
+	for _, s := range secs {
+		if line >= s.Start && line <= s.End {
+			return s, true
+		}
+	}
+	return Section{}, false
+}

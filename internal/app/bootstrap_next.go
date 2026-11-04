@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ type nextItem struct {
 	Ref       string `json:"ref"`
 	Epoch     int    `json:"epoch"`
 	WorkFile  string `json:"work_file"`
+	WorkPath  string `json:"work_path"`
 	InputHash string `json:"input_hash"`
 }
 
@@ -79,15 +81,18 @@ func bootstrapNext(ctx context.Context, env *Env, args []string) (Result, error)
 	for _, stage := range st.Items {
 		rep.Remaining += stage["pending"] + stage["leased"]
 	}
+	wf := bootstrap.WorkFiles{Root: p.Store.Root, CheckoutID: p.Checkout.ID}
 	for _, it := range b.Items {
-		rep.Items = append(rep.Items, nextItem{ID: it.ID, Stage: it.Stage, Ref: it.Ref, Epoch: it.Epoch, InputHash: it.InputHash, WorkFile: workFileRel(p.Checkout.ID, runID, it.ID)})
+		rel := wf.Rel(it.InputHash)
+		f, err := p.Store.Root.OpenRead(rel)
+		if err != nil {
+			return Result{}, fmt.Errorf("the work file for %s is missing (%v); run wikory bootstrap plan again", it.Ref, describeConfine(err))
+		}
+		f.Close()
+		rep.Items = append(rep.Items, nextItem{ID: it.ID, Stage: it.Stage, Ref: it.Ref, Epoch: it.Epoch, InputHash: it.InputHash,
+			WorkFile: rel, WorkPath: filepath.Join(p.Store.Dir, filepath.FromSlash(rel))})
 	}
 	return Result{Data: rep, Text: rep.Status + "\n"}, nil
-}
-
-// workFileRel is where an item's redacted work file lives in the private store.
-func workFileRel(checkoutID, runID, itemID string) string {
-	return "bootstrap/" + checkoutID + "/" + runID + "/items/" + itemID + ".txt"
 }
 
 // statusLine is the one-line summary the driver mirrors on its task list.

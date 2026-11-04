@@ -1,7 +1,9 @@
 package app
 
 import (
+	"database/sql"
 	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -254,5 +256,29 @@ func TestBootstrapPlanRefusesTheSameSourceNameTwice(t *testing.T) {
 	e, code, _ := runBootstrapJSON(t, c, dir, "plan", "--source", "notes="+one, "--source", "notes="+two)
 	if code != ExitUsage || e.OK || !strings.Contains(e.Error.Message, "twice") {
 		t.Fatalf("two directories under one name would collide in the run: code=%d %+v", code, e)
+	}
+}
+
+// forceState sets a run's state directly. Confirm (Task 14) is the real way; earlier tasks'
+// tests use this to reach the states they need.
+func forceState(t *testing.T, c *cli, runID, state string) {
+	t.Helper()
+	var dbPath string
+	_ = filepath.WalkDir(c.dataDir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && d.Name() == "wikory.db" {
+			dbPath = p
+		}
+		return nil
+	})
+	if dbPath == "" {
+		t.Fatal("no wikory.db under the data directory")
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE bs_runs SET state=? WHERE run_id=?`, state, runID); err != nil {
+		t.Fatal(err)
 	}
 }

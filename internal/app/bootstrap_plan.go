@@ -114,6 +114,15 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 	if err != nil {
 		return Result{}, err
 	}
+	wf := bootstrap.WorkFiles{Root: p.Store.Root, CheckoutID: p.Checkout.ID}
+	prep, err := bootstrap.PrepareWork(ctx, readers, res, wf, nil)
+	if err != nil {
+		return Result{}, err
+	}
+	var notices []string
+	if prep.Redactions > 0 {
+		notices = append(notices, fmt.Sprintf("%d value(s) were redacted while preparing work files; check the sources for secrets", prep.Redactions))
+	}
 	plan := bootstrap.BuildPlan(res, strings.Join(scope, "+"), head, sample)
 	plan.Roots = roots
 	run, err := newRuns(p).Create(ctx, plan, bootstrap.ExtractSpecs(res))
@@ -131,7 +140,7 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 		}
 	}
 	rep.Next = fmt.Sprintf("wikory bootstrap confirm --run %s --plan-hash %s", run.ID, plan.Hash)
-	return Result{Data: rep, Text: planText(rep)}, nil
+	return Result{Data: rep, Text: planText(rep), Notices: notices}, nil
 }
 
 // requireCleanDefaultBranch is the baseline precondition: bootstrap describes the default

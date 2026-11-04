@@ -70,3 +70,47 @@ func TestBootstrapPlanBindsTheSampleSizeToTheRun(t *testing.T) {
 		}
 	}
 }
+
+func TestBootstrapNextHandsOutRedactedWorkFilesAndNeverTheSameItemTwice(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	pe, _, _ := runBootstrapJSON(t, c, dir, "plan")
+	run := decodeData[planData](t, pe).RunID
+	forceState(t, c, run, "running")
+	e, code, _ := runBootstrapJSON(t, c, dir, "next", "--run", run, "--max", "50")
+	if code != ExitOK {
+		t.Fatalf("%+v", e)
+	}
+	d := decodeData[struct {
+		Items []struct {
+			Item     string `json:"item"`
+			Ref      string `json:"ref"`
+			Epoch    int    `json:"epoch"`
+			WorkPath string `json:"work_path"`
+		} `json:"items"`
+	}](t, e)
+	if len(d.Items) < 2 {
+		t.Fatalf("expected the design doc, the handoff and a component digest: %+v", d.Items)
+	}
+	sawComp := false
+	for _, it := range d.Items {
+		b := readFile(t, it.WorkPath)
+		if it.Epoch != 1 || b == "" {
+			t.Fatalf("%+v", it)
+		}
+		if strings.HasPrefix(it.Ref, "comp:") {
+			sawComp = true
+			if !strings.Contains(b, "=== wikory-file internal/queue/queue.go ") {
+				t.Fatalf("digest: %s", b)
+			}
+		}
+	}
+	if !sawComp {
+		t.Fatal("an inspected component should be offered as a digest item")
+	}
+	again, _, _ := runBootstrapJSON(t, c, dir, "next", "--run", run, "--max", "50")
+	if n := len(decodeData[struct {
+		Items []struct{} `json:"items"`
+	}](t, again).Items); n != 0 {
+		t.Fatalf("leased items must not be handed out again: %d", n)
+	}
+}
