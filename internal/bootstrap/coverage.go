@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/TerrysPOV/Wikory/internal/ids"
 	"github.com/TerrysPOV/Wikory/internal/redact"
@@ -99,9 +98,6 @@ type Coverage struct {
 	Unindexed []string `json:"unindexed_claims"`
 }
 
-// maxLabelRunes bounds one printed name, so a hostile path cannot flood the report.
-const maxLabelRunes = 200
-
 // safeLabel makes a name taken from the project (a file, a branch, a directory) fit to print. A
 // name that is itself secret-shaped is withheld and shown only as a hash prefix. Otherwise each
 // control or invisible character, and each line or paragraph separator, shows as "?", so a name
@@ -113,11 +109,11 @@ func safeLabel(p string) string {
 	var b strings.Builder
 	n := 0
 	for _, r := range p {
-		if n++; n > maxLabelRunes {
+		if n++; n > maxShownRunes {
 			b.WriteString("...")
 			break
 		}
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+		if unprintable(r) {
 			r = '?'
 		}
 		b.WriteRune(r)

@@ -4,7 +4,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/text/unicode/norm"
@@ -96,7 +95,7 @@ func CheckText(t string) (code, why string) {
 		return "markup", "the text contains link or image markup, which a page would render as a link or an image"
 	}
 	for _, r := range t {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+		if unprintable(r) {
 			return "bad-text", "the text contains a control or invisible character"
 		}
 	}
@@ -111,10 +110,10 @@ func Safe(s string) string {
 	var b strings.Builder
 	n := 0
 	for _, r := range s {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+		if unprintable(r) {
 			continue
 		}
-		if n++; n > 200 {
+		if n++; n > maxShownRunes {
 			b.WriteString("...")
 			break
 		}

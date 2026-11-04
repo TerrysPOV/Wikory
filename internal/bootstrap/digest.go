@@ -28,11 +28,24 @@ func short(h string) string {
 	return h
 }
 
-// hasControl reports whether a path contains a control character (newline, CR, NUL, DEL and
-// the rest of unicode.IsControl). Git returns file names verbatim, so a name can carry a
-// newline; such a name must not be written into a header line or the omitted list.
+// unprintable is the one rule for a character that is never printed or written raw: a control
+// character (newline, CR, NUL, DEL and the rest of unicode.IsControl), a format character such as
+// U+202E (which reverses how the text after it is shown), or a line or paragraph separator. Every
+// printer of text from the project or from a subagent (digest headers, claim text, rejection
+// messages, report labels) uses it.
+func unprintable(r rune) bool {
+	return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r)
+}
+
+// maxShownRunes bounds one printed name or message taken from the project or a subagent, so a
+// hostile one cannot flood a report or a transcript.
+const maxShownRunes = 200
+
+// hasControl reports whether a path contains an unprintable character (see unprintable). Git
+// returns file names verbatim, so a name can carry a newline or a U+2028; such a name must not be
+// written into a header line or the omitted list.
 func hasControl(p string) bool {
-	return strings.IndexFunc(p, unicode.IsControl) >= 0
+	return strings.IndexFunc(p, unprintable) >= 0
 }
 
 // unconfinable reports a path that confine.Split refuses on every platform: one holding a
@@ -45,10 +58,10 @@ func unconfinable(p string) bool {
 	return strings.ContainsRune(p, '\\') || (len(p) >= 2 && p[1] == ':')
 }
 
-// visiblePath is a path with each control character shown as "?", safe to list.
+// visiblePath is a path with each unprintable character shown as "?", safe to list.
 func visiblePath(p string) string {
 	return strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
+		if unprintable(r) {
 			return '?'
 		}
 		return r
