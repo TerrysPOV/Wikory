@@ -14627,21 +14627,35 @@ git commit -m "feat: add the bootstrap coverage report, finish command and end m
 - Test: `internal/bootstrap/measure_test.go`, `internal/app/bootstrap_confirm_test.go`
 
 **Interfaces:**
-- Consumes: `Runs.Transition`, run state machine (Task 8), `Run.PlanHash`.
+- Consumes: `Runs.Transition`, run state machine (Task 8), `Run.PlanHash`, `bootstrap.BuildPlan` (Task 6), `Runs.Sources` and `Runs.Components`.
 - Produces:
 
 ```go
+// Measure is what the sample showed, from the stored run. Tokens are asserted by the driver.
+// The sample covers extraction only: verification starts only in a running run, so its cost is
+// still the plan's estimate, and ProjectedTokens is the extraction projection alone.
 type Measure struct {
-	SampleItems, SampleDone int
-	DurationSecs            float64
-	TokensIn, TokensOut     int
-	AcceptanceRate          float64 // accepted / (accepted + rejected); 0 when nothing was proposed
-	ProjectedTokens         int     // from the sample, for the extract items not yet run; asserted (verification is not sampled)
+	SampleItems     int     `json:"sample_items"`
+	SampleDone      int     `json:"sample_done"`
+	DurationSecs    float64 `json:"duration_secs"`
+	TokensIn        int     `json:"tokens_in"`
+	TokensOut       int     `json:"tokens_out"`
+	AcceptanceRate  float64 `json:"acceptance_rate"`  // accepted / (accepted + rejected); 0 when nothing was proposed
+	ProjectedTokens int     `json:"projected_tokens"` // for the extract items not yet run, from the sample; asserted
 }
 func (r *Runs) Measure(ctx context.Context, id string) (Measure, error)
 ```
 
-The gate (design 4.5, with plan-level decision 4): every paid step needs the plan hash. `plan` costs nothing and prints the hash. `confirm --run R --plan-hash H --sample` starts the sample (needs a run planned with `--sample N`). When the sample's items are all submitted the run is `awaiting-confirm` and `status` shows measured duration, asserted tokens, the excerpt-acceptance rate and a projection. `confirm --run R --plan-hash H` starts the full run from `planned` (a run planned without a sample) or from `awaiting-confirm`. A run planned with a sample cannot go straight to the full run. **The sample measures extraction only**: verification starts only in a running run, so its cost stays the plan's estimate until the full run's first verify batch has been measured (design 4.5 says the sample runs the real pipeline; this narrows it, and Known limits records the narrowing). The sample's figures are frozen when it settles, so the full run adding its own tokens and claim counts does not change what `status` reports as the sample. The hash gate is advisory against a hostile local agent (architecture spec 14.4); `/wikory:bootstrap` instructs the agent to pass it only after the person says yes.
+The gate (design 4.5, with plan-level decision 4): every paid step needs the plan hash. `plan` costs nothing and prints the hash. `confirm --run R --plan-hash H --sample` starts the sample (needs a run planned with `--sample N`; `--sample` takes no value). When the sample's items are all submitted the run is `awaiting-confirm` and `status` shows measured duration, asserted tokens, the excerpt-acceptance rate and a projection. `confirm --run R --plan-hash H` starts the full run from `planned` (a run planned without a sample) or from `awaiting-confirm` (a run planned with one). A run planned with a sample cannot go straight to the full run. **The sample measures extraction only**: verification starts only in a running run, so its cost stays the plan's estimate until the full run's first verify batch has been measured (design 4.5 says the sample runs the real pipeline; this narrows it, and Known limits records the narrowing). The sample's figures are frozen when it settles, so the full run adding its own tokens and claim counts does not change what `status` reports as the sample. The hash gate is advisory against a hostile local agent (architecture spec 14.4); `/wikory:bootstrap` instructs the agent to pass it only after the person says yes.
+
+What `confirm` checks, in this order, each refusal a usage error (exit 2) that changes nothing:
+1. The flags: `--run` and `--plan-hash` are required, and `--sample` takes no value.
+2. **The stored run still reproduces the plan that was shown.** The hash is rebuilt through `BuildPlan` from the run's stored sources, components, scope and head and the running binary's constants (the stored `--sample` size is passed but is not hashed; `bs_items` are not compared, because the items table is advisory, architecture spec 14.4). If the rebuilt hash differs from the stored `plan_hash` column, the run is refused with "the stored run no longer matches the plan that was shown ... run wikory bootstrap plan again", whatever hash the person passed. This comes first because the person passes the hash they were shown, which equals the stored column, and `status` prints that same column: a refusal that said "read the hash again" would send a driver round in a circle.
+3. **The hash is the plan's.** A hash that is not the stored one (a typo, other case) is refused with "the plan hash given is not this plan's hash; the plan output prints it, and wikory bootstrap status --json prints it as run.plan_hash".
+4. **The repository has not moved.** HEAD must equal the run's head ("the repository moved ... plan again"); the work files were built from that commit. The working tree and the `--source` directories are not re-checked.
+5. **The state.** One source-state check only: `--sample` moves `planned` to `sampling`; the full run moves `awaiting-confirm` (a run planned with a sample) or `planned` (a run planned without one) to `running`. Nothing moves a run back to `planned`, so there is no second guard. When the move is refused with `ErrState`, the friendly message is chosen from the run's state as it is now: `sampling` gives "the sample is still running", and `planned` with a sample gives "confirm the sample first"; any other state returns the plain error.
+
+**Fix round 1 (review findings).** (1) The first version rebuilt the hash and compared the person's hash with it before comparing the rebuilt hash with the stored column, so the accurate "plan again" refusal was unreachable and a damaged run was told to read the hash again; the order is now as above, and `TestConfirmRecomputesThePlanHashFromTheStoredRun` asserts the message, with `TestAMistypedHashOnAnUntouchedStorePointsAtWhereTheHashIsPrinted` for the other case. (2) No CLI test ran a sampled run through to its full run, so the atomic source-state choice could have been set to `planned` for sampled runs (refusing every sampled run in `awaiting-confirm` for good) without any test noticing; `TestASampledRunReachesTheFullRunAndTheSampleFiguresStayFrozen` walks `plan --sample 1`, `confirm --sample`, `next`, `submit`, `confirm`, `next`, `submit` and `status`. (3) The read-then-transition source-state choice was dead defensive code and is gone; (4) `TestConfirmAcceptsARunPlannedWithSourcesWhoseNamesSortAwkwardly` confirms a run planned with two `--source` directories whose paths sort differently under byte and case-folding order, which passed at once (`Runs.Sources` orders by SQLite's default byte collation, the order `Inventory` sorts in) and is proved by an injection that folds case; (5) the "full run while the sample is still running" test asserts the usage message and exit code 2.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -14742,6 +14756,28 @@ func TestMeasureOfARunWithoutASampleIsZero(t *testing.T) {
 		t.Fatalf("%+v %v", m, err)
 	}
 }
+
+// While the sample is still running the counters are live: the figures freeze only when it settles.
+func TestMeasureIsLiveWhileTheSampleRuns(t *testing.T) {
+	ctx := context.Background()
+	r, _, _, _ := newTestRuns(t)
+	run := mustRun(t, r, 2, 8)
+	_ = r.Transition(ctx, run.ID, StateSampling, StatePlanned)
+	b, _ := r.Next(ctx, run.ID, 50)
+	if err := r.AddCounts(ctx, run.ID, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Complete(ctx, b.Items[0].ID, b.Items[0].Epoch, Usage{InputTokens: 700, OutputTokens: 70}, nil); err != nil {
+		t.Fatal(err)
+	}
+	m, err := r.Measure(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.SampleItems != 2 || m.SampleDone != 1 || m.TokensIn != 700 || m.TokensOut != 70 || m.AcceptanceRate != 0.5 || m.ProjectedTokens != 770*6 {
+		t.Fatalf("the live figures of a running sample: %+v", m)
+	}
+}
 ```
 
 `internal/app/bootstrap_confirm_test.go`:
@@ -14750,6 +14786,11 @@ func TestMeasureOfARunWithoutASampleIsZero(t *testing.T) {
 package app
 
 import (
+	"database/sql"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -14804,8 +14845,9 @@ func TestASampledRunNeedsTheSampleConfirmationFirst(t *testing.T) {
 	if len(items) != 1 {
 		t.Fatalf("the sample is exactly the one item asked for: %d", len(items))
 	}
-	if _, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", d.PlanHash); code == ExitOK {
-		t.Fatal("the full run cannot start while the sample is still running")
+	e, code, _ = runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", d.PlanHash)
+	if code != ExitUsage || e.OK || !strings.Contains(e.Error.Message, "the sample is still running") {
+		t.Fatalf("the full run cannot start while the sample is still running: %d %+v", code, e)
 	}
 }
 
@@ -14827,6 +14869,286 @@ func TestStatusShowsTheMeasuredSampleAndLabelsTokensAsAsserted(t *testing.T) {
 	if code != ExitOK || !strings.Contains(out, "asserted") || !strings.Contains(out, "sample") {
 		t.Fatalf("%s", out)
 	}
+	if !strings.Contains(out, "extraction only") || !strings.Contains(out, "verification is not sampled") {
+		t.Fatalf("the status must say the sample covers extraction only: %s", out)
+	}
+}
+
+// execDB runs a statement against the checkout's database, as a damaged or tampered store would look.
+func execDB(t *testing.T, c *cli, query string, args ...any) int64 {
+	t.Helper()
+	var dbPath string
+	_ = filepath.WalkDir(c.dataDir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && d.Name() == "wikory.db" {
+			dbPath = p
+		}
+		return nil
+	})
+	if dbPath == "" {
+		t.Fatal("no wikory.db under the data directory")
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	res, err := db.Exec(query, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, _ := res.RowsAffected()
+	return n
+}
+
+// A refused confirm must leave the run unconfirmed, whichever check refused it.
+func assertNoWorkHandedOut(t *testing.T, c *cli, dir, runID, why string) {
+	t.Helper()
+	if _, code, _ := runBootstrapJSON(t, c, dir, "next", "--run", runID); code == ExitOK {
+		t.Fatalf("%s: the run must not hand out work", why)
+	}
+}
+
+func TestConfirmRefusesARunWhoseRepositoryHasMoved(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	pe, _, _ := runBootstrapJSON(t, c, dir, "plan", "--sample", "1")
+	d := decodeData[planData](t, pe)
+	gitIn(t, dir, "commit", "--allow-empty", "-qm", "the repository moves on")
+	for _, args := range [][]string{
+		{"confirm", "--run", d.RunID, "--plan-hash", d.PlanHash, "--sample"},
+		{"confirm", "--run", d.RunID, "--plan-hash", d.PlanHash},
+	} {
+		e, code, _ := runBootstrapJSON(t, c, dir, args...)
+		if code != ExitUsage || e.OK || !strings.Contains(e.Error.Message, "moved") {
+			t.Fatalf("%v: a plan describes the commit it was made at: code %d %+v", args, code, e)
+		}
+	}
+	assertNoWorkHandedOut(t, c, dir, d.RunID, "after the repository moved")
+}
+
+func TestConfirmRecomputesThePlanHashFromTheStoredRun(t *testing.T) {
+	// The stored plan_hash column is not what the person's hash is compared with: the hash is
+	// rebuilt from the stored sources and components, so a store that no longer describes the
+	// plan that was shown is refused even when the hash the person passes equals the column.
+	dir, c := bootstrapRepo(t)
+	pe, _, _ := runBootstrapJSON(t, c, dir, "plan")
+	d := decodeData[planData](t, pe)
+	if n := execDB(t, c, `UPDATE bs_sources SET hash='tampered' WHERE run_id=? AND disposition='queued'`, d.RunID); n == 0 {
+		t.Fatal("the fixture has no queued source to change")
+	}
+	e, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", d.PlanHash)
+	if code != ExitUsage || e.OK || !strings.Contains(e.Error.Message, "stored run no longer matches") {
+		t.Fatalf("a changed store must not confirm under the old hash, and the remedy is to plan again, not to read the hash again: code %d %+v", code, e)
+	}
+	assertNoWorkHandedOut(t, c, dir, d.RunID, "after the stored sources changed")
+
+	// A stored hash that was rewritten to match nothing is refused too.
+	pe2, _, _ := runBootstrapJSON(t, c, dir, "plan")
+	d2 := decodeData[planData](t, pe2)
+	if n := execDB(t, c, `UPDATE bs_runs SET plan_hash=? WHERE run_id=?`, "feedface", d2.RunID); n != 1 {
+		t.Fatalf("rewrote %d runs", n)
+	}
+	for _, h := range []string{"feedface", d2.PlanHash} {
+		// The hash the person was shown, and the rewritten column's own value, both get the
+		// plan-again remedy: status would print the same hash, so a driver told to read it
+		// again would loop.
+		if e, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d2.RunID, "--plan-hash", h); code != ExitUsage || e.OK || !strings.Contains(e.Error.Message, "stored run no longer matches") {
+			t.Fatalf("hash %q against a rewritten column must say the stored run no longer matches: code %d %+v", h, code, e)
+		}
+	}
+	assertNoWorkHandedOut(t, c, dir, d2.RunID, "after the stored hash was rewritten")
+}
+
+func TestARefusedFullConfirmLeavesASampledRunUnconfirmed(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	pe, _, _ := runBootstrapJSON(t, c, dir, "plan", "--sample", "1")
+	d := decodeData[planData](t, pe)
+	if _, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", d.PlanHash); code != ExitUsage {
+		t.Fatal("a sampled run cannot jump to the full run")
+	}
+	assertNoWorkHandedOut(t, c, dir, d.RunID, "after a refused full confirm")
+}
+
+func TestConfirmSampleTakesNoValue(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	pe, _, _ := runBootstrapJSON(t, c, dir, "plan", "--sample", "1")
+	d := decodeData[planData](t, pe)
+	for _, flag := range []string{"--sample=false", "--sample=0"} {
+		if e, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", d.PlanHash, flag); code != ExitUsage || e.OK {
+			t.Fatalf("%s: code %d %+v", flag, code, e)
+		}
+	}
+	assertNoWorkHandedOut(t, c, dir, d.RunID, "after refused flag forms")
+}
+
+func TestAMistypedHashOnAnUntouchedStorePointsAtWhereTheHashIsPrinted(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	pe, _, _ := runBootstrapJSON(t, c, dir, "plan")
+	d := decodeData[planData](t, pe)
+	e, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", "deadbeef")
+	if code != ExitUsage || e.OK {
+		t.Fatalf("code %d %+v", code, e)
+	}
+	msg := e.Error.Message
+	if !strings.Contains(msg, "is not this plan's hash") || strings.Contains(msg, "plan again") {
+		t.Fatalf("a mistyped hash on a sound store is the person's slip, not a damaged run: %q", msg)
+	}
+	// The message names what prints the hash, and that really does.
+	if !strings.Contains(msg, "bootstrap status --json") || !strings.Contains(msg, "run.plan_hash") {
+		t.Fatalf("the message must say where the hash is printed: %q", msg)
+	}
+	st, _, _ := runBootstrapJSON(t, c, dir, "status", "--run", d.RunID)
+	got := decodeData[struct {
+		Run struct {
+			PlanHash string `json:"plan_hash"`
+		} `json:"run"`
+	}](t, st).Run.PlanHash
+	if got != d.PlanHash || got == "" {
+		t.Fatalf("status --json run.plan_hash = %q, want %q", got, d.PlanHash)
+	}
+	assertNoWorkHandedOut(t, c, dir, d.RunID, "after a mistyped hash")
+}
+
+// sourceTree writes files (relative path -> content) under a fresh directory outside the repository.
+func sourceTree(t *testing.T, files map[string]string) string {
+	t.Helper()
+	root, _ := filepath.EvalSymlinks(t.TempDir())
+	for rel, content := range files {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// The rebuilt plan hash reads sources back from the store in SQL order. Names and paths whose
+// byte order differs from a case-folding or punctuation-skipping order prove that order is the
+// one inventory produced; if it were not, every run planned with --source would be refused.
+func TestConfirmAcceptsARunPlannedWithSourcesWhoseNamesSortAwkwardly(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	notes := sourceTree(t, map[string]string{
+		"a.md": "Alpha note.\n", "B.md": "Bravo note.\n", "Z.md": "Zulu note.\n",
+		"_x.md": "Underscore first.\n", "-y.md": "Dash first.\n",
+		"a_b.md": "Underscore inside.\n", "a-b.md": "Dash inside.\n",
+		"\u00e9.md": "Accented.\n", "sub/Q.md": "Upper in a folder.\n", "sub/q.md": "Lower in a folder.\n",
+	})
+	more := sourceTree(t, map[string]string{"one.md": "One.\n", "Two.md": "Two.\n"})
+	pe, _, errOut := runBootstrapJSON(t, c, dir, "plan", "--source", "notes="+notes, "--source", "notes-2="+more)
+	d := decodeData[planData](t, pe)
+	if d.RunID == "" || d.Scope != "repo+notes+notes-2" {
+		t.Fatalf("%+v %s", d, errOut)
+	}
+	e, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", d.PlanHash)
+	if code != ExitOK || !e.OK {
+		t.Fatalf("a run planned with --source must confirm under the hash it was shown: %d %+v", code, e)
+	}
+	if _, code, _ := runBootstrapJSON(t, c, dir, "next", "--run", d.RunID); code != ExitOK {
+		t.Fatal("a confirmed run hands out work")
+	}
+}
+
+type leased struct {
+	Batch string `json:"batch"`
+	Items []struct {
+		Item  string `json:"item"`
+		Ref   string `json:"ref"`
+		Epoch int    `json:"epoch"`
+	} `json:"items"`
+}
+
+// submitLeased submits one result per leased item. The two documents of the fixture carry a real
+// claim; any other item is submitted with none, which is a valid result.
+func submitLeased(t *testing.T, c *cli, dir, runID string, b leased, in, out int) {
+	t.Helper()
+	claims := map[string]string{
+		"src:repo:docs/design.md":                          `{"text":"The queue acknowledges after the handler returns.","kind":"current-impl","excerpt":"acknowledges after the handler returns","locator":"L1-L1"}`,
+		"src:repo:.claude/handoffs/PRIOR_SESSION_STATE.md": `{"text":"Queue retry is an open item.","kind":"hypothesis","excerpt":"Open item: internal/queue retry.","locator":"L1-L1"}`,
+	}
+	var rs []string
+	for i, it := range b.Items {
+		usage := `{"input_tokens":0,"output_tokens":0}`
+		if i == 0 {
+			usage = fmt.Sprintf(`{"input_tokens":%d,"output_tokens":%d}`, in, out)
+		}
+		rs = append(rs, fmt.Sprintf(`{"item":%q,"epoch":%d,"claims":[%s],"usage":%s}`, it.Item, it.Epoch, claims[it.Ref], usage))
+	}
+	c.stdin = `{"stage":"extract","results":[` + strings.Join(rs, ",") + `]}`
+	if e, code, _ := runBootstrapJSON(t, c, dir, "submit", "--run", runID, "--batch", b.Batch); code != ExitOK || !e.OK {
+		t.Fatalf("submit: %d %+v", code, e)
+	}
+}
+
+type sampleStatus struct {
+	Run struct {
+		State    string `json:"state"`
+		TokensIn int    `json:"tokens_in"`
+	} `json:"run"`
+	Sample struct {
+		Items int     `json:"sample_items"`
+		Done  int     `json:"sample_done"`
+		In    int     `json:"tokens_in"`
+		Out   int     `json:"tokens_out"`
+		Rate  float64 `json:"acceptance_rate"`
+	} `json:"sample"`
+}
+
+// The whole sequence a person walks through: sample, measure, then the full run. The CLI is the
+// only code that picks the source state of the full-run confirm, so this is the test that fails
+// if a sampled run in awaiting-confirm can never be confirmed.
+func TestASampledRunReachesTheFullRunAndTheSampleFiguresStayFrozen(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	pe, _, _ := runBootstrapJSON(t, c, dir, "plan", "--sample", "1")
+	d := decodeData[planData](t, pe)
+	extractItems := 0
+	for _, e := range d.Estimates {
+		if e.Stage == "extract" {
+			extractItems = e.Items
+		}
+	}
+	if extractItems < 2 {
+		t.Fatalf("the fixture needs at least two extract items: %+v", d.Estimates)
+	}
+	if e, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", d.PlanHash, "--sample"); code != ExitOK || !e.OK {
+		t.Fatalf("confirm --sample: %d %+v", code, e)
+	}
+	ne, _, _ := runBootstrapJSON(t, c, dir, "next", "--run", d.RunID, "--max", "50")
+	first := decodeData[leased](t, ne)
+	if len(first.Items) != 1 {
+		t.Fatalf("the sample is the one item asked for: %+v", first)
+	}
+	submitLeased(t, c, dir, d.RunID, first, 1000, 100)
+
+	status := func() sampleStatus {
+		t.Helper()
+		st, _, _ := runBootstrapJSON(t, c, dir, "status", "--run", d.RunID)
+		return decodeData[sampleStatus](t, st)
+	}
+	settled := status()
+	if settled.Run.State != "awaiting-confirm" || settled.Sample.Done != 1 || settled.Sample.In != 1000 || settled.Sample.Out != 100 {
+		t.Fatalf("the sample should have settled with its own figures: %+v", settled)
+	}
+
+	// The person says yes to the full run, without --sample.
+	if e, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", d.PlanHash); code != ExitOK || !e.OK {
+		t.Fatalf("a sampled run in awaiting-confirm must confirm to the full run: %d %+v", code, e)
+	}
+	re, _, _ := runBootstrapJSON(t, c, dir, "next", "--run", d.RunID, "--max", "50")
+	rest := decodeData[leased](t, re)
+	if len(rest.Items) != extractItems-1 {
+		t.Fatalf("the full run leases the %d items the sample did not: got %d", extractItems-1, len(rest.Items))
+	}
+	submitLeased(t, c, dir, d.RunID, rest, 7000, 700)
+
+	after := status()
+	if after.Run.TokensIn != 8000 {
+		t.Fatalf("the run total should include the full run's tokens: %+v", after)
+	}
+	if after.Sample != settled.Sample {
+		t.Fatalf("the sample figures must stay what the sample measured: settled %+v, after the full run %+v", settled.Sample, after.Sample)
+	}
 }
 ```
 
@@ -14837,30 +15159,46 @@ Expected: FAIL to compile: `r.Measure undefined`.
 
 - [ ] **Step 3: Implement**
 
-Append to `internal/bootstrap/runs.go` (or a new `measure.go`):
+Add `"math"` to the imports of `internal/bootstrap/runs.go` and append (or put in a new `measure.go`):
 
 ```go
 // Measure is what the sample showed, from the stored run. Tokens are asserted by the driver.
+// The sample covers extraction only: verification starts only in a running run, so its cost is
+// still the plan's estimate, and ProjectedTokens is the extraction projection alone.
 type Measure struct {
-	SampleItems, SampleDone int
-	DurationSecs            float64
-	TokensIn, TokensOut     int
-	AcceptanceRate          float64
-	ProjectedTokens         int
+	SampleItems     int     `json:"sample_items"`
+	SampleDone      int     `json:"sample_done"`
+	DurationSecs    float64 `json:"duration_secs"`
+	TokensIn        int     `json:"tokens_in"`
+	TokensOut       int     `json:"tokens_out"`
+	AcceptanceRate  float64 `json:"acceptance_rate"`  // accepted / (accepted + rejected); 0 when nothing was proposed
+	ProjectedTokens int     `json:"projected_tokens"` // for the extract items not yet run, from the sample; asserted
 }
 
 // Measure reports a run's sample. A run planned without a sample reports zeros. Duration is
 // from the first lease to the last completion of a sampled item. Tokens and the acceptance rate
 // are the sample's own: live while it runs, frozen when it settles, so the full run cannot move
-// them. The projection covers extraction only.
+// them. The projection covers extraction only. Everything is read in one snapshot, so a sample
+// that settles mid-call cannot show live figures beside a settled state.
 func (r *Runs) Measure(ctx context.Context, id string) (Measure, error) {
 	var m Measure
-	run, err := r.Get(ctx, id)
-	if err != nil || run.Sample == 0 {
+	tx, err := r.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return m, err
+	}
+	defer tx.Rollback()
+	var state string
+	var sample, tin, tout, acc, rej, sin, sout, sacc, srej int
+	err = tx.QueryRowContext(ctx, `SELECT state,sample,tokens_in,tokens_out,accepted,rejected,sample_in,sample_out,sample_acc,sample_rej
+		FROM bs_runs WHERE run_id=? AND checkout_id=?`, id, r.CheckoutID).Scan(&state, &sample, &tin, &tout, &acc, &rej, &sin, &sout, &sacc, &srej)
+	if errors.Is(err, sql.ErrNoRows) {
+		return m, ErrNoRun
+	}
+	if err != nil || sample == 0 {
 		return m, err
 	}
 	var first, last sql.NullString
-	err = r.DB.QueryRowContext(ctx, `SELECT count(*), sum(CASE WHEN state='done' THEN 1 ELSE 0 END), min(NULLIF(leased_at,'')), max(NULLIF(done_at,''))
+	err = tx.QueryRowContext(ctx, `SELECT count(*), coalesce(sum(CASE WHEN state='done' THEN 1 ELSE 0 END),0), min(NULLIF(leased_at,'')), max(NULLIF(done_at,''))
 		FROM bs_items WHERE run_id=? AND checkout_id=? AND stage='extract' AND sampled=1`, id, r.CheckoutID).Scan(&m.SampleItems, &m.SampleDone, &first, &last)
 	if err != nil {
 		return m, err
@@ -14872,13 +15210,6 @@ func (r *Runs) Measure(ctx context.Context, id string) (Measure, error) {
 			m.DurationSecs = b.Sub(a).Seconds()
 		}
 	}
-	tin, tout, acc, rej := run.TokensIn, run.TokensOut, run.Accepted, run.Rejected
-	var state string
-	var sin, sout, sacc, srej int
-	if err := r.DB.QueryRowContext(ctx, `SELECT state,sample_in,sample_out,sample_acc,sample_rej FROM bs_runs WHERE run_id=? AND checkout_id=?`, id, r.CheckoutID).
-		Scan(&state, &sin, &sout, &sacc, &srej); err != nil {
-		return m, err
-	}
 	if state != StateSampling {
 		tin, tout, acc, rej = sin, sout, sacc, srej
 	}
@@ -14887,11 +15218,16 @@ func (r *Runs) Measure(ctx context.Context, id string) (Measure, error) {
 		m.AcceptanceRate = float64(acc) / float64(n)
 	}
 	var total int
-	if err := r.DB.QueryRowContext(ctx, `SELECT count(*) FROM bs_items WHERE run_id=? AND checkout_id=? AND stage='extract'`, id, r.CheckoutID).Scan(&total); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM bs_items WHERE run_id=? AND checkout_id=? AND stage='extract'`, id, r.CheckoutID).Scan(&total); err != nil {
 		return m, err
 	}
 	if m.SampleDone > 0 && total > m.SampleItems {
-		m.ProjectedTokens = (m.TokensIn + m.TokensOut) / m.SampleDone * (total - m.SampleItems)
+		// int64 so the product cannot wrap where int is 32 bits wide; it is clamped, not wrapped.
+		p := (int64(m.TokensIn) + int64(m.TokensOut)) / int64(m.SampleDone) * int64(total-m.SampleItems)
+		if p > math.MaxInt {
+			p = math.MaxInt
+		}
+		m.ProjectedTokens = int(p)
 	}
 	return m, nil
 }
@@ -14904,15 +15240,26 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/TerrysPOV/Wikory/internal/bootstrap"
 )
 
+// bootstrapConfirm is the cost gate: the only way a run reaches sampling or running, and so the
+// only way any paid model work starts. A person reads the plan, says yes, and the driver passes
+// the plan hash back. The hash is advisory against a hostile local agent (it can read the hash
+// from status), so this command also makes the honest paths safe: a changed store, a moved
+// repository and a skipped sample are all refused.
 func bootstrapConfirm(ctx context.Context, env *Env, args []string) (Result, error) {
 	fl, err := parseFlags(normaliseBoolFlag(args, "sample"), map[string]bool{"run": true, "plan-hash": true, "sample": true})
 	if err != nil {
 		return Result{}, err
+	}
+	for _, v := range fl["sample"] {
+		if v != "true" {
+			return Result{}, &UsageError{Msg: "--sample takes no value: wikory bootstrap confirm --run RUN --plan-hash HASH --sample"}
+		}
 	}
 	runID, hash := oneFlag(fl, "run"), oneFlag(fl, "plan-hash")
 	if runID == "" || hash == "" {
@@ -14927,8 +15274,27 @@ func bootstrapConfirm(ctx context.Context, env *Env, args []string) (Result, err
 	if err != nil {
 		return Result{}, err
 	}
+	// The stored run is checked first. The hash is rebuilt from what the store holds, and a run
+	// whose store (or whose binary's constants) no longer reproduces the hash it was planned
+	// under cannot be confirmed whatever hash the person passes. The remedy is a fresh plan: the
+	// person's hash equals the stored column, and status prints that same column, so telling a
+	// driver to read the hash again would send it round in a circle.
+	rebuilt, err := rebuiltPlanHash(ctx, runs, run)
+	if err != nil {
+		return Result{}, err
+	}
+	if rebuilt != run.PlanHash {
+		return Result{}, &UsageError{Msg: "the stored run no longer matches the plan that was shown (the store or the wikory binary changed since it was planned), so it cannot be confirmed; run wikory bootstrap plan again"}
+	}
 	if hash != run.PlanHash {
-		return Result{}, &UsageError{Msg: "the plan hash does not match this run; read the plan again with wikory bootstrap status and pass its hash once the person has agreed to it"}
+		return Result{}, &UsageError{Msg: "the plan hash given is not this plan's hash; the plan output prints it, and wikory bootstrap status --json prints it as run.plan_hash"}
+	}
+	head, err := p.Repo.HeadCommit(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	if head != run.Head {
+		return Result{}, &UsageError{Msg: fmt.Sprintf("the repository moved from %.12s to %.12s since this run was planned; the baseline describes the planned commit, so plan again", run.Head, head)}
 	}
 	sample := len(fl["sample"]) > 0
 	switch {
@@ -14944,17 +15310,47 @@ func bootstrapConfirm(ctx context.Context, env *Env, args []string) (Result, err
 		}
 		return Result{Text: fmt.Sprintf("Sample of %d item(s) confirmed for run %s. Hand out work with wikory bootstrap next.\n", run.Sample, runID),
 			Data: map[string]any{"run_id": runID, "state": bootstrap.StateSampling}}, nil
-	case run.State == bootstrap.StatePlanned && run.Sample > 0:
-		return Result{}, &UsageError{Msg: "this run was planned with a sample; confirm the sample first (wikory bootstrap confirm --sample), then confirm the full run once its measurements are in"}
 	}
-	if err := runs.Transition(ctx, runID, bootstrap.StateRunning, bootstrap.StatePlanned, bootstrap.StateAwaiting); err != nil {
-		if run.State == bootstrap.StateSampling {
-			return Result{}, &UsageError{Msg: "the sample is still running; submit its items and the run will move to awaiting-confirm"}
+	// The one state check: a run planned with a sample reaches the full run only through
+	// awaiting-confirm, which its settled sample puts it in, and nothing moves a run back to
+	// planned. The sample size is fixed at planning, so the source state is too. The friendlier
+	// messages are chosen after a refusal, from the state the run is in now.
+	from := bootstrap.StatePlanned
+	if run.Sample > 0 {
+		from = bootstrap.StateAwaiting
+	}
+	if err := runs.Transition(ctx, runID, bootstrap.StateRunning, from); err != nil {
+		if errors.Is(err, bootstrap.ErrState) {
+			if now, gerr := runs.Get(ctx, runID); gerr == nil {
+				switch {
+				case now.State == bootstrap.StateSampling:
+					return Result{}, &UsageError{Msg: "the sample is still running; submit its items and the run will move to awaiting-confirm"}
+				case now.State == bootstrap.StatePlanned && now.Sample > 0:
+					return Result{}, &UsageError{Msg: "this run was planned with a sample; confirm the sample first (wikory bootstrap confirm --sample), then confirm the full run once its measurements are in"}
+				}
+			}
 		}
 		return Result{}, err
 	}
 	return Result{Text: fmt.Sprintf("Run %s confirmed. Hand out work with wikory bootstrap next.\n", runID),
 		Data: map[string]any{"run_id": runID, "state": bootstrap.StateRunning}}, nil
+}
+
+// rebuiltPlanHash rebuilds a run's plan hash through BuildPlan from the sources, components,
+// scope and head the store holds, with the estimate constants the running binary has. The run's
+// work items (bs_items) are not compared: the hash covers the work list derived from the
+// sources, and the items table is advisory (architecture spec 14.4). The stored sample size is
+// passed so the rebuilt plan is the one that was shown; BuildPlan does not hash it.
+func rebuiltPlanHash(ctx context.Context, runs *bootstrap.Runs, run bootstrap.Run) (string, error) {
+	srcs, err := runs.Sources(ctx, run.ID)
+	if err != nil {
+		return "", err
+	}
+	comps, err := runs.Components(ctx, run.ID)
+	if err != nil {
+		return "", err
+	}
+	return bootstrap.BuildPlan(bootstrap.Result{Sources: srcs, Components: comps}, run.Scope, run.Head, run.Sample).Hash, nil
 }
 
 // normaliseBoolFlag lets --NAME stand alone: it turns a bare --NAME into --NAME=true so the
@@ -14978,21 +15374,43 @@ Add to the dispatcher:
 		return bootstrapConfirm(ctx, env, args[1:])
 ```
 
-In `bootstrapStatus` (`bootstrap_next.go`), after building the report, when `st.Run.Sample > 0` add a `Sample *bootstrap.Measure \`json:"sample,omitempty"\`` field to `statusReport` filled from `runs.Measure`, and append to the text:
+In `bootstrapStatus` (`bootstrap_next.go`), add a `Sample` field to `statusReport` and, when `st.Run.Sample > 0`, fill it from `runs.Measure` and append to the text:
 
 ```go
-	if m != nil {
-		text += fmt.Sprintf("sample: %d/%d items, %.0fs, tokens (asserted) %d in %d out, excerpt acceptance %.0f%%, projected extraction for the rest about %d tokens (asserted); verification is not sampled, see the plan's estimate\n",
+	// Sample is what the sample showed, for a run planned with one. It covers extraction only.
+	Sample *bootstrap.Measure `json:"sample,omitempty"`
+```
+
+```go
+	if st.Run.Sample > 0 {
+		m, err := runs.Measure(ctx, id)
+		if err != nil {
+			return Result{}, err
+		}
+		rep.Sample = &m
+		text += fmt.Sprintf("sample (extraction only): %d/%d items, %.0fs, tokens (asserted) %d in %d out, excerpt acceptance %.0f%%, projected extraction for the rest about %d tokens (asserted); verification is not sampled, see the plan's estimate\n",
 			m.SampleDone, m.SampleItems, m.DurationSecs, m.TokensIn, m.TokensOut, m.AcceptanceRate*100, m.ProjectedTokens)
 	}
 ```
 
-In `planText` (`bootstrap_plan.go`) replace the last two lines so the gate is explicit:
+In `bootstrapPlan` (`bootstrap_plan.go`) a run planned with a sample prints a `--sample` confirm as its next step, and `planText` names the gate:
+
+```go
+	rep.Next = fmt.Sprintf("wikory bootstrap confirm --run %s --plan-hash %s", run.ID, plan.Hash)
+	if sample > 0 {
+		rep.Next += " --sample" // a run planned with a sample cannot start in full until its sample has run
+	}
+```
 
 ```go
 	b.WriteString("Nothing has been sent to a model. A person must say yes before any paid step.\n")
-	b.WriteString("  To sample first:  wikory bootstrap plan --sample N, then confirm --run RUN --plan-hash HASH --sample\n")
-	b.WriteString("  To run in full:   " + r.Next + "\n")
+	if r.Sample > 0 {
+		b.WriteString("  To sample (extraction only):  " + r.Next + "\n")
+		b.WriteString("  To run in full:   once the sample's measurements are in, the same command without --sample\n")
+	} else {
+		b.WriteString("  To sample first:  wikory bootstrap plan --sample N, then confirm --run RUN --plan-hash HASH --sample\n")
+		b.WriteString("  To run in full:   " + r.Next + "\n")
+	}
 ```
 
 - [ ] **Step 4: Run to verify they pass**
@@ -15002,10 +15420,27 @@ Expected: PASS. Tests from Tasks 9 to 13 that use `forceState(..., "running")` k
 
 - [ ] **Step 5: Prove the gate can fail**
 
+Each step is one fault at one site and must exit 0 (RED as predicted). Exit 2 is INCONCLUSIVE: rewrite a mutation that does not compile (a fault that leaves a variable unused, for example, needs `&& false` rather than `false`).
+
 Run: `scripts/inject.sh internal/app/bootstrap_confirm.go 'if hash != run.PlanHash {' 'if false {' ./internal/app/ 'TestConfirmNeedsTheExactPlanHash' 'code 0'`
-Run: `scripts/inject.sh internal/app/bootstrap_confirm.go 'case run.State == bootstrap.StatePlanned && run.Sample > 0:' 'case false:' ./internal/app/ 'TestASampledRunNeedsTheSampleConfirmationFirst' 'jump to the full run'`
+Run: `scripts/inject.sh internal/app/bootstrap_confirm.go 'if rebuilt != run.PlanHash {' 'if rebuilt != run.PlanHash && false {' ./internal/app/ 'TestConfirmRecomputesThePlanHashFromTheStoredRun' 'the remedy is to plan again'`
+Run: `scripts/inject.sh internal/app/bootstrap_confirm.go $'\tif rebuilt != run.PlanHash {\n\t\treturn Result{}, &UsageError{Msg: \"the stored run no longer matches the plan that was shown (the store or the wikory binary changed since it was planned), so it cannot be confirmed; run wikory bootstrap plan again\"}\n\t}\n\tif hash != run.PlanHash {\n\t\treturn Result{}, &UsageError{Msg: \"the plan hash given is not this plan\x27s hash; the plan output prints it, and wikory bootstrap status --json prints it as run.plan_hash\"}\n\t}\n' $'\tif hash != run.PlanHash {\n\t\treturn Result{}, &UsageError{Msg: \"the plan hash given is not this plan\x27s hash; the plan output prints it, and wikory bootstrap status --json prints it as run.plan_hash\"}\n\t}\n\tif rebuilt != run.PlanHash {\n\t\treturn Result{}, &UsageError{Msg: \"the stored run no longer matches the plan that was shown (the store or the wikory binary changed since it was planned), so it cannot be confirmed; run wikory bootstrap plan again\"}\n\t}\n' ./internal/app/ 'TestConfirmRecomputesThePlanHashFromTheStoredRun' 'must say the stored run no longer matches'`
+Run: `scripts/inject.sh internal/app/bootstrap_confirm.go 'rebuilt, err := rebuiltPlanHash(ctx, runs, run)' 'rebuilt, err := run.PlanHash, error(nil)' ./internal/app/ 'TestConfirmRecomputesThePlanHashFromTheStoredRun' 'must not confirm under the old hash'`
+Run: `scripts/inject.sh internal/app/bootstrap_confirm.go 'status --json prints it as run.plan_hash' 'status prints it as run.plan_hash' ./internal/app/ 'TestAMistypedHash' 'must say where the hash is printed'`
+Run: `scripts/inject.sh internal/app/bootstrap_next.go 'Run          bootstrap.Run             `json:"run"`' 'Run          bootstrap.Run             `json:"runx"`' ./internal/app/ 'TestAMistypedHash' 'status --json run.plan_hash ='`
+Run: `scripts/inject.sh internal/app/bootstrap_confirm.go 'from = bootstrap.StateAwaiting' 'from = bootstrap.StatePlanned' ./internal/app/ 'TestASampledRunReachesTheFullRun' 'must confirm to the full run'`
+Run: `scripts/inject.sh internal/app/bootstrap_confirm.go 'if run.Sample > 0 {' 'if false {' ./internal/app/ 'TestASampledRunNeedsTheSampleConfirmationFirst' 'jump to the full run'`
+Run: `scripts/inject.sh internal/app/bootstrap_confirm.go 'case now.State == bootstrap.StateSampling:' 'case false:' ./internal/app/ 'TestASampledRunNeedsTheSampleConfirmationFirst' 'cannot start while the sample is still running'`
+Run: `scripts/inject.sh internal/app/bootstrap_confirm.go 'case now.State == bootstrap.StatePlanned && now.Sample > 0:' 'case false:' ./internal/app/ 'TestASampledRunNeedsTheSampleConfirmationFirst' 'jump to the full run'`
+Run: `scripts/inject.sh internal/app/bootstrap_confirm.go 'if head != run.Head {' 'if false {' ./internal/app/ 'TestConfirmRefusesARunWhoseRepositoryHasMoved' 'describes the commit'`
+Run: `scripts/inject.sh internal/app/bootstrap_confirm.go 'if v != "true" {' 'if v != "true" && false {' ./internal/app/ 'TestConfirmSampleTakesNoValue' 'code 0'`
 Run: `scripts/inject.sh internal/bootstrap/runs.go 'if run.State != StateSampling && run.State != StateRunning {' 'if run.State == StateDone {' ./internal/app/ 'TestConfirmNeedsTheExactPlanHash' 'no one confirmed'`
 Run: `scripts/inject.sh internal/bootstrap/runs.go 'if state != StateSampling {' 'if false {' ./internal/bootstrap/ 'TestMeasureStaysTheSampleAfterTheFullRunStarts' 'must not move'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'tin, tout, acc, rej = sin, sout, sacc, srej' '_, _, _, _ = sin, sout, sacc, srej' ./internal/bootstrap/ 'TestMeasureStaysTheSampleAfterTheFullRunStarts' 'must not move'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'if state != StateSampling {' 'if false {' ./internal/app/ 'TestASampledRunReachesTheFullRun' 'sample figures must stay'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'restrict := boolInt(run.State == StateSampling)' 'restrict := 1' ./internal/app/ 'TestASampledRunReachesTheFullRun' 'the full run leases'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go 'ORDER BY source,path' 'ORDER BY source,path COLLATE NOCASE' ./internal/app/ 'TestConfirmAcceptsARunPlannedWithSources' 'must confirm under the hash it was shown'`
+
 Expected: each exits 0 (RED).
 
 - [ ] **Step 6: Commit**
