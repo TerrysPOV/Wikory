@@ -69,6 +69,9 @@ func bootstrapNext(ctx context.Context, env *Env, args []string) (Result, error)
 			return Result{}, &UsageError{Msg: "--max needs a whole number of at least 1"}
 		}
 	}
+	if _, err := bootstrap.PrepareVerify(ctx, runs, bootstrap.WorkFiles{Root: p.Store.Root, CheckoutID: p.Checkout.ID}, runID); err != nil {
+		return Result{}, err
+	}
 	b, err := runs.Next(ctx, runID, max)
 	if err != nil {
 		return Result{}, err

@@ -78,26 +78,35 @@ func bootstrapSubmit(ctx context.Context, env *Env, args []string) (Result, erro
 	// Every result is read and checked before any is submitted, so a bad one later in the batch
 	// cannot leave earlier ones committed with no report.
 	var props []bootstrap.Proposal
-	if in.Stage == "extract" {
-		for _, rawRes := range in.Results {
+	var sets []bootstrap.VerdictSet
+	for _, rawRes := range in.Results {
+		var item string
+		var usage bootstrap.Usage
+		if in.Stage == "extract" {
 			var prop bootstrap.Proposal
 			if err := strictUnmarshal(rawRes, &prop); err != nil {
 				return Result{}, &UsageError{Msg: "an extract result is not the expected JSON: " + jsonProblem(err)}
 			}
-			if err := prop.Usage.Check(); err != nil {
-				return Result{}, &UsageError{Msg: "an extract result has usage the driver cannot have spent: " + err.Error()}
+			props, item, usage = append(props, prop), prop.Item, prop.Usage
+		} else {
+			var vs bootstrap.VerdictSet
+			if err := strictUnmarshal(rawRes, &vs); err != nil {
+				return Result{}, &UsageError{Msg: "a verify result is not the expected JSON: " + jsonProblem(err)}
 			}
-			if it, err := runs.Item(ctx, prop.Item); err == nil && it.RunID != runID {
-				return Result{}, &UsageError{Msg: "an item in the submission does not belong to the run given with --run"}
-			} else if err != nil && !errors.Is(err, bootstrap.ErrNoItem) {
-				return Result{}, err
-			}
-			props = append(props, prop)
+			sets, item, usage = append(sets, vs), vs.Item, vs.Usage
+		}
+		if err := usage.Check(); err != nil {
+			return Result{}, &UsageError{Msg: "a " + in.Stage + " result has usage the driver cannot have spent: " + err.Error()}
+		}
+		if it, err := runs.Item(ctx, item); err == nil && it.RunID != runID {
+			return Result{}, &UsageError{Msg: "an item in the submission does not belong to the run given with --run"}
+		} else if err != nil && !errors.Is(err, bootstrap.ErrNoItem) {
+			return Result{}, err
 		}
 	}
 	rep := submitReport{RunID: runID, Results: []submitResult{}}
 	var notices []string
-	for i, rawRes := range in.Results {
+	for i := range in.Results {
 		var sr submitResult
 		switch in.Stage {
 		case "extract":
@@ -107,12 +116,9 @@ func bootstrapSubmit(ctx context.Context, env *Env, args []string) (Result, erro
 				sr.Error = describeSubmitError(err)
 			}
 		case "verify":
-			r, err := submitVerify(ctx, p, runs, wf, batch, rawRes)
-			var ue *UsageError
-			if errors.As(err, &ue) {
-				return Result{}, err
-			}
-			sr = r
+			r, err := bootstrap.ApplyVerdicts(ctx, bootstrap.VerifyInput{Runs: runs, Env: p.validateEnv(), Mint: ids.NewULID, Batch: batch, V: sets[i],
+				Blob: func(oid string) ([]byte, error) { return p.Repo.ReadBlob(ctx, oid, bootstrap.MaxFileBytes) }})
+			sr = submitResult{Item: r.Item, Accepted: r.Confirmed + r.Contradicted, Rejected: r.Rejected, Findings: r.Findings, Requeued: r.Requeued}
 			if err != nil {
 				sr.Error = describeSubmitError(err)
 			}
@@ -174,9 +180,4 @@ func describeSubmitError(err error) string {
 		return "refused: the lease on this item expired or belongs to another batch; ask for new work with wikory bootstrap next"
 	}
 	return bootstrap.Safe(err.Error())
-}
-
-// submitVerify is replaced by the real verify submission in Task 11.
-func submitVerify(context.Context, *project, *bootstrap.Runs, bootstrap.WorkFiles, string, json.RawMessage) (submitResult, error) {
-	return submitResult{}, errors.New("verify submissions are not available yet")
 }
