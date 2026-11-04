@@ -30,4 +30,6 @@ Run it in a throwaway repository, with default permissions, and write nothing in
 5. Confirm that a chained second command prompts: a `wikory bootstrap` call followed by any other command gets a prompt.
 6. `wikory bootstrap confirm` prompts, and the command waits for your approval of it.
 
+If a bootstrap stops part way (the session ends, a lease lapses, finish is interrupted), run `/wikory:bootstrap` again: it checks `wikory bootstrap status` first and offers to resume the latest run where it stopped. Resuming a run you already said yes to needs no new yes; a run that was only planned, or a sample waiting for the full run, still needs one. To drop a run instead, `wikory bootstrap abandon --run RUN` marks it abandoned and changes no page; then plan again.
+
 Wikory never deletes anything it read. If you bootstrapped from an old wiki (`--source name=DIR`), the coverage report ends with a checklist: back the folder up, then delete it by hand.

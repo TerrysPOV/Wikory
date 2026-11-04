@@ -240,6 +240,12 @@ func TestBootstrapCommandPinsTheSampleSequenceAndTheLoopExit(t *testing.T) {
 		"If the state is `awaiting-confirm`, leave the loop without calling `next`",
 		"A settled sample is not leased work",
 		`"Go ahead with the full run?"`,
+		"0. Before planning, run `wikory bootstrap status --json`",
+		"offer to resume it at step 4, the loop",
+		"offer to resume it at step 7, finish",
+		"The person's yes for the full run is still required.",
+		"needs no new yes, because the person's yes covered that plan hash",
+		"`wikory bootstrap abandon --run RUN`",
 	)
 	mustNotContain(t, "command", body, "Repeat from step 4 until", "the rest are leased and unfinished")
 }
@@ -266,6 +272,7 @@ func TestBootstrapCommandNamesOnlyRealSubcommandsAndFlags(t *testing.T) {
 		"confirm": {"run", "plan-hash", "sample", "json"},
 		"finish":  {"run", "json"},
 		"status":  {"run", "json"},
+		"abandon": {"run", "json"},
 	}
 	seen := map[string]bool{}
 	for _, m := range regexp.MustCompile("`wikory bootstrap ([a-z]+)([^`]*)`").FindAllStringSubmatch(body, -1) {
