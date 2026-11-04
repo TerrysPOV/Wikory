@@ -5895,6 +5895,26 @@ git commit -m "feat: add bootstrap run state, leases and the plan, next and stat
 
 ---
 
+#### Final whole-branch review fixes (2026-11-04)
+
+- A5 (`26cecfc`): `Measure.ProjectedTokens` is `*int`: nil (null in JSON) when extract items remain and no sampled item completed, so an all-rejected sample never shows a projection of 0 tokens; it is 0 when the sample was every extract item. `ProjectionUnknown` is the text "unknown: no sampled item completed". `bootstrap status` builds its sample line with `sampleText(m)`, which shows the tokens already spent either way. Tests: `TestMeasureOfASampleWithNoCompletedItemHasNoProjection`, `TestSampleTextSaysAnUnknownProjectionIsUnknown`.
+- A9 (`e5d3521`): `Runs.Create` writes `files` and `entry` to `bs_components`, and `Runs.Components` reads them back. Churn and the mention counts are still not stored; the hash (which omits `Files`) is unchanged by this.
+- A8 and A11: `bootstrap status --run RUN` adds the stored coverage report (`coverage`, and its text) for a done run; `status --json` already gives step 0 of the command the latest run's `state`, `plan_hash`, `id`, `sample` and `sample` measurements (`TestStatusJSONGivesTheCommandWhatItNeedsToResume`).
+- B7 (`f01e4ea`): `Runs.Next` refused in a state that cannot hand out work says what to do in that state (`nextRemedy`): a finishing, done or abandoned run is never pointed at `confirm`. Test: `TestNextRefusalSaysWhatToDoInEachState`.
+- B11 (`02eb215`): `Run.Branch` (`branch` in JSON, `bs_runs.branch`) is in `runCols`.
+- C2 (`0f2b764`): `Runs.Fail` and `Runs.AddCounts` are removed; tests use `FailCounted(..., 0, 0, Usage{})` and a test-only `addCounts` SQL helper. `Runs.Components` no longer re-sorts what `ORDER BY rank` returned.
+
+Run: `scripts/inject.sh internal/bootstrap/runs.go '	case m.SampleDone > 0:' '	case m.SampleDone == 0:
+		zero := 0
+		m.ProjectedTokens = &zero
+	case m.SampleDone > 0:' ./internal/bootstrap/ 'TestMeasureOfASampleWithNoCompletedItem' 'must be unknown'`
+Run: `scripts/inject.sh internal/app/bootstrap_next.go '	proj := bootstrap.ProjectionUnknown' '	proj := "about 0 tokens (asserted)"' ./internal/app/ 'TestSampleTextSaysAnUnknown' 'must be named as unknown'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go '	case StateFinishing:
+		return "it is being finished: run wikory bootstrap finish"' '	case StateFinishing:
+		return "wikory bootstrap confirm"' ./internal/bootstrap/ 'TestNextRefusalSaysWhatToDo' 'want it to say'`
+
+Expected: each exits 0 (RED).
+
 ### Task 9: Work files and component digests
 
 **Files:**
