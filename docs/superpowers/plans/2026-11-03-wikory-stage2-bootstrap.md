@@ -1091,6 +1091,24 @@ func TestScanSpansAreOrderedAndInRange(t *testing.T) {
 		prev = sp.Start
 	}
 }
+
+func TestScanUnionsAPartiallyOverlappingTail(t *testing.T) {
+	// The assignment value is capped at 200 characters, so it ends inside the key: the sk-
+	// rule starts at offset 160 (inside the value) and ends at 263 (after it). Neither span
+	// is nested in the other, so only the extend branch keeps the key's tail in the result.
+	in := "PASS" + "WORD=" + strings.Repeat("a", 150) + " sk" + "-" + strings.Repeat("B", 100)
+	const wantStart, wantEnd = 9, 263
+	spans := Scan(in)
+	if len(spans) != 1 {
+		t.Fatalf("partial overlap must merge into one span, got %+v", spans)
+	}
+	if spans[0].Start != wantStart || spans[0].End != wantEnd {
+		t.Errorf("partial overlap span = [%d,%d), want [%d,%d)", spans[0].Start, spans[0].End, wantStart, wantEnd)
+	}
+	if !strings.HasSuffix(in[spans[0].Start:spans[0].End], strings.Repeat("B", 100)) {
+		t.Errorf("merged span drops the tail of the key")
+	}
+}
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -1141,7 +1159,9 @@ func Scan(s string) []Span {
 			spans = append(spans, Span{Kind: r.kind, Start: start, End: end})
 		}
 	}
-	// Position order, widest first at equal Start, so a merge only ever extends the last span.
+	// Position order, widest first at equal Start. The widest-first tie-break is an
+	// optimisation, not a correctness requirement: it makes same-Start nesting cheap (the
+	// narrower span is skipped as nested) but the merge below unions any overlap either way.
 	sort.SliceStable(spans, func(i, j int) bool {
 		if spans[i].Start != spans[j].Start {
 			return spans[i].Start < spans[j].Start
@@ -1167,7 +1187,7 @@ func Scan(s string) []Span {
 Run: `go test ./internal/redact/ -count=1`
 Expected: PASS. If `TestScanSeesEverythingStringRedacts` names a fixture that `String` does not change, fix the fixture (the test says so). If a real input is redacted by `String` but missed by `Scan`, fix `Scan`.
 
-- [ ] **Step 5: Prove each Scan test can fail** (four separate runs, one fault each)
+- [ ] **Step 5: Prove each Scan test can fail** (five separate runs, one fault each)
 
 Run: `scripts/inject.sh internal/redact/scan.go 'if end <= start || markerRe.MatchString(s[start:end]) {' 'if end <= start || true {' ./internal/redact/ 'TestScanSeesEverythingStringRedacts' 'Scan found nothing'`
 Expected: exit 0 (RED).
@@ -1180,6 +1200,9 @@ Expected: exit 0 (RED).
 
 Run: `scripts/inject.sh internal/redact/scan.go 'sp.Start < out[n-1].End' 'sp.Start == out[n-1].Start && sp.End == out[n-1].End' ./internal/redact/ 'TestScanReportsEachPlaceOnce' 'must be one span'`
 Expected: exit 0 (RED). This restores the old identical-range dedupe, which leaves `DB_PASSWORD=hunter2hunter2 # note here` as two overlapping spans.
+
+Run: `scripts/inject.sh internal/redact/scan.go 'if sp.End > out[n-1].End {' 'if false {' ./internal/redact/ 'TestScanUnionsAPartiallyOverlappingTail' 'partial overlap span'`
+Expected: exit 0 (RED). Without the extend branch the merged span stops at the end of the capped assignment value (offset 209) and the tail of the key is lost.
 
 - [ ] **Step 6: Commit**
 
