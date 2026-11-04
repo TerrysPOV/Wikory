@@ -280,9 +280,20 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 	for _, s := range all {
 		byID[s.ClaimID] = s
 	}
-	judge := map[string]bool{}
-	for _, s := range AssignClaims(comps, all)[comp.Prefix] {
-		judge[s.ClaimID] = true
+	// Ownership does not depend on a claim's status, so a verifier naming a decided claim of
+	// another component is told the same as for any claim that is not its own. judge is the part
+	// of the component's work that is still undecided.
+	owns, judge := map[string]bool{}, map[string]bool{}
+	undecided := make([]StoredClaim, len(all))
+	for i, s := range all {
+		undecided[i] = s
+		undecided[i].Status = "unverified"
+	}
+	for _, s := range AssignClaims(comps, undecided)[comp.Prefix] {
+		owns[s.ClaimID] = true
+		if st := byID[s.ClaimID].Status; st == "unverified" || st == "historical" {
+			judge[s.ClaimID] = true
+		}
 	}
 
 	var changes []change
@@ -292,8 +303,8 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 		rej := func(c, why string) { rep.Rejected = append(rep.Rejected, Reject{Index: i, Code: c, Why: why}) }
 		cur, known := byID[v.Claim]
 		switch {
-		case !known:
-			rej("unknown-claim", "no such claim in this run")
+		case !known || !owns[v.Claim]:
+			rej("unknown-claim", "no such claim in this component's work file")
 			continue
 		case seen[v.Claim]:
 			rej("duplicate", "two verdicts for one claim")
@@ -301,9 +312,6 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 		case cur.Status != "unverified" && cur.Status != "historical":
 			seen[v.Claim] = true
 			rep.Ignored++
-			continue
-		case !judge[v.Claim]:
-			rej("unknown-claim", "this claim is not part of this component's work file")
 			continue
 		}
 		seen[v.Claim] = true
@@ -334,7 +342,13 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 				okEv = false
 				break
 			}
-			if why := checkLines(in.Blob, src, l.Lines); why != "" {
+			why, err := checkLines(in.Blob, src, l.Lines)
+			if err != nil {
+				// Reading the plan's blob failed. That says nothing about the verdict, so the item
+				// is left leased and untouched for a retry.
+				return quietReport(it.ID), err
+			}
+			if why != "" {
 				rej("bad-evidence-lines", "evidence item "+strconv.Itoa(ei)+": "+why)
 				okEv = false
 				break
@@ -347,8 +361,8 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 		}
 		parsed, err := claim.ParseComment(cur.Meta)
 		if err != nil {
-			rej("validator", "the stored claim no longer parses: "+Safe(err.Error()))
-			continue
+			// Corrupt store data is not the verifier's fault: leave the item for a retry.
+			return quietReport(it.ID), fmt.Errorf("bootstrap: the stored claim %s no longer parses: %w", cur.ClaimID, err)
 		}
 		if v.Result == ResultContradicted {
 			if c, why := CheckText(v.Corrected); c != "" {
@@ -362,6 +376,10 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 					return quietReport(it.ID), err
 				}
 				rej("validator", Safe(err.Error()))
+				continue
+			}
+			if evidenceUnresolved(outNew) {
+				rej("evidence-unresolved", "the evidence could not be resolved against the committed files")
 				continue
 			}
 			parsed.Status = "conflicting"
@@ -399,15 +417,17 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 		for _, f := range fs {
 			rep.Findings = append(rep.Findings, Safe(f.Msg))
 		}
+		decided[v.Claim] = true
+		if out.Status != "verified" {
+			// The validator refused to verify on this evidence: the verdict is not accepted, so
+			// the claim keeps its status, metadata, evidence, dependencies and location as read.
+			rep.Undetermined++
+			continue
+		}
 		upd := cur
 		upd.Status, upd.Meta, upd.Loc = out.Status, out.Render(), locJSON(locs)
 		changes = append(changes, change{update: &upd, before: cur})
-		decided[v.Claim] = true
-		if out.Status == "verified" {
-			rep.Confirmed++
-		} else {
-			rep.Undetermined++
-		}
+		rep.Confirmed++
 	}
 	for id := range judge {
 		if !decided[id] && !seen[id] {
@@ -428,14 +448,18 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 		// Another verdict decided one of these claims after they were read. Nothing was written
 		// (the transaction rolled back); the item goes back for a fresh look at the claims as
 		// they are now.
-		rep.Confirmed, rep.Contradicted, rep.Undetermined = 0, 0, 0
+		rep = quietReport(it.ID)
 		if ferr := in.Runs.FailCounted(ctx, it.ID, it.Epoch, 0, 0, in.V.Usage); ferr != nil {
 			return rep, ferr
 		}
 		rep.Requeued = true
 		return rep, nil
 	}
-	return rep, err
+	if err != nil {
+		// The transaction rolled back, so nothing in the report was recorded.
+		return quietReport(it.ID), err // rolled back
+	}
+	return rep, nil
 }
 
 // writeChanges applies a verify submission's changes inside the completion transaction. An
@@ -484,32 +508,45 @@ func writeChanges(ctx context.Context, tx *sql.Tx, checkoutID string, it Item, c
 
 // checkLines holds a verdict's line range to the file it cites: it must look like L10-L20, run
 // forwards, and end inside the file the plan recorded. With no blob reader nothing can be
-// bounded, so nothing is accepted. The reason it returns never repeats the range it was given.
-func checkLines(blob func(oid string) ([]byte, error), src Source, lines string) string {
+// bounded, so nothing is accepted. The reason it returns never repeats the range it was given. A
+// failure to read the blob is an error, never a reason: it says nothing about the verdict.
+func checkLines(blob func(oid string) ([]byte, error), src Source, lines string) (string, error) {
 	m := linesRe.FindStringSubmatch(lines)
 	if m == nil {
-		return "lines must look like L10-L20"
+		return "lines must look like L10-L20", nil
 	}
 	a, _ := strconv.Atoi(m[1])
 	b, _ := strconv.Atoi(m[2])
 	if a > b {
-		return "the line range runs backwards"
+		return "the line range runs backwards", nil
 	}
 	if blob == nil {
-		return "the file's length cannot be checked"
+		return "the file's length cannot be checked", nil
 	}
 	data, err := blob(src.OID)
 	if err != nil {
-		return "the file could not be read to check the range"
+		return "", fmt.Errorf("bootstrap: reading the file %s to check a line range: %w", src.Path, err) // read error
 	}
 	n := strings.Count(string(data), "\n")
 	if len(data) > 0 && data[len(data)-1] != '\n' {
 		n++
 	}
 	if b > n {
-		return "the range ends beyond the end of the file"
+		return "the range ends beyond the end of the file", nil
 	}
-	return ""
+	return "", nil
+}
+
+// evidenceUnresolved says whether any blob evidence of a claim the validator rendered carries no
+// object id, which it clears whenever the file is not committed, dirty or stale at HEAD. Evidence
+// that was handed in without an id (as a verdict's is) has one only if it resolved.
+func evidenceUnresolved(c claim.Claim) bool {
+	for _, e := range c.Evidence {
+		if e.Kind == claim.EvBlob && e.OID == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // locJSON keeps a verdict's evidence locators privately with the claim they decided. The claim

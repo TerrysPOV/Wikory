@@ -26,16 +26,22 @@ type verifyRig struct {
 	item   Item
 	batch  string
 	c1, c2 StoredClaim
+	run0   Run // the run's counters once the rig is built
 }
 
 // extractedRig is a running run whose doc extract item is done and has stored two claims, with
 // the verify stage not yet prepared.
 func extractedRig(t *testing.T) (*Runs, WorkFiles, Run) {
 	t.Helper()
+	return extractedRigFor(t, sampleResult())
+}
+
+// extractedRigFor is extractedRig over a plan the caller has shaped.
+func extractedRigFor(t *testing.T, res Result) (*Runs, WorkFiles, Run) {
+	t.Helper()
 	ctx := context.Background()
 	r, _, _, _ := newTestRuns(t)
 	w, _ := newWork(t)
-	res := sampleResult()
 	hash := ids.SHA256Hex([]byte(workText))
 	run, err := r.Create(ctx, BuildPlan(res, "repo", "head1", 0), []ItemSpec{{Stage: "extract", Ref: "src:repo:docs/decisions/0001.md", InputHash: hash}})
 	if err != nil {
@@ -60,8 +66,14 @@ func extractedRig(t *testing.T) (*Runs, WorkFiles, Run) {
 
 func newVerifyRig(t *testing.T) *verifyRig {
 	t.Helper()
+	return newVerifyRigFor(t, sampleResult())
+}
+
+// newVerifyRigFor is newVerifyRig over a plan the caller has shaped.
+func newVerifyRigFor(t *testing.T, res Result) *verifyRig {
+	t.Helper()
 	ctx := context.Background()
-	r, w, run := extractedRig(t)
+	r, w, run := extractedRigFor(t, res)
 	// All extract work is done, so verify items can be prepared.
 	n, err := PrepareVerify(ctx, r, w, run.ID)
 	if err != nil || n != 1 {
@@ -75,7 +87,8 @@ func newVerifyRig(t *testing.T) *verifyRig {
 	if len(cs) != 2 {
 		t.Fatal(len(cs))
 	}
-	return &verifyRig{r: r, run: run, item: vb.Items[0], batch: vb.ID, c1: cs[0], c2: cs[1]}
+	run0, _ := r.Get(ctx, run.ID)
+	return &verifyRig{r: r, run: run, item: vb.Items[0], batch: vb.ID, c1: cs[0], c2: cs[1], run0: run0}
 }
 
 func (v *verifyRig) apply(t *testing.T, verdicts ...Verdict) (VerifyReport, error) {
@@ -149,8 +162,8 @@ func TestConfirmedWithoutResolvableCodeEvidenceStaysUnverified(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := claimByID(t, v.r, v.run.ID, v.c1.ClaimID); got.Status == "verified" {
-		t.Fatalf("verified must be earned from evidence the validator can resolve: %+v", got)
+	if got := claimByID(t, v.r, v.run.ID, v.c1.ClaimID); got.Status != "unverified" || got.Meta != v.c1.Meta || got.Loc != v.c1.Loc {
+		t.Fatalf("verified must be earned from evidence the validator can resolve, and a refused confirmation changes nothing: %+v", got)
 	}
 }
 

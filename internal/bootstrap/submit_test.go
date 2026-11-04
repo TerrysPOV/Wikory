@@ -236,6 +236,30 @@ func TestSubmitReturnsAnInfrastructureFailureAndChangesNothing(t *testing.T) {
 	}
 }
 
+// The completion runs in one transaction, so when it fails nothing it was handed was stored. The
+// report must not claim acceptances or rejects that were rolled back.
+func TestSubmitReportsNothingWhenTheCompletionFails(t *testing.T) {
+	ctx := context.Background()
+	s := newSubmitRig(t)
+	if _, err := s.r.DB.Exec(`CREATE TRIGGER fail_claim_inserts BEFORE INSERT ON bs_claims BEGIN SELECT RAISE(ABORT, 'disk full'); END`); err != nil {
+		t.Fatal(err)
+	}
+	badLocator := ProposedClaim{Text: "Handlers may run twice after a crash.", Kind: "current-impl",
+		Excerpt: "acknowledged only after the handler returns", Locator: "L99-L99"}
+	rep, err := s.submit(t, badLocator, good())
+	if err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("the completion failure comes back unchanged: %v", err)
+	}
+	if rep.Item != s.item.ID || rep.Accepted != 0 || len(rep.Rejected) != 0 || rep.Rejected == nil || len(rep.Findings) != 0 || rep.Findings == nil || rep.Requeued {
+		t.Fatalf("the transaction rolled back, so the report must say nothing: %+v", rep)
+	}
+	it, _ := s.r.Item(ctx, s.item.ID)
+	run, _ := s.r.Get(ctx, s.run.ID)
+	if cs, _ := s.r.Claims(ctx, s.run.ID); it.State != "leased" || it.Attempts != 0 || run.Accepted != 0 || run.Rejected != 0 || len(cs) != 0 {
+		t.Fatalf("%+v %+v %+v", it, run, cs)
+	}
+}
+
 // Evidence paths are chosen by the binary, so a secret shape should never reach a validator
 // refusal. This is defence in depth: if one ever did, Safe is the last thing between the
 // message and the working agent's transcript.

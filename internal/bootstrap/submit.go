@@ -188,5 +188,10 @@ func Submit(ctx context.Context, in SubmitInput) (SubmitReport, error) {
 		_, err := tx.ExecContext(ctx, `UPDATE bs_runs SET accepted=accepted+?, rejected=rejected+? WHERE run_id=?`, len(admitted), rejectedN, it.RunID)
 		return err
 	})
-	return rep, err
+	if err != nil {
+		// The transaction rolled back: nothing in the report was stored, and a retry would count
+		// it again.
+		return SubmitReport{Item: it.ID, Rejected: []Reject{}, Findings: []string{}}, err // rolled back
+	}
+	return rep, nil
 }
