@@ -38,7 +38,9 @@ func Scan(s string) []Span {
 			spans = append(spans, Span{Kind: r.kind, Start: start, End: end})
 		}
 	}
-	// Position order, widest first at equal Start, so a merge only ever extends the last span.
+	// Position order, widest first at equal Start. The widest-first tie-break is an
+	// optimisation, not a correctness requirement: it makes same-Start nesting cheap (the
+	// narrower span is skipped as nested) but the merge below unions any overlap either way.
 	sort.SliceStable(spans, func(i, j int) bool {
 		if spans[i].Start != spans[j].Start {
 			return spans[i].Start < spans[j].Start

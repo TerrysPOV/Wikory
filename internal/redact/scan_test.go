@@ -96,3 +96,21 @@ func TestScanSpansAreOrderedAndInRange(t *testing.T) {
 		prev = sp.Start
 	}
 }
+
+func TestScanUnionsAPartiallyOverlappingTail(t *testing.T) {
+	// The assignment value is capped at 200 characters, so it ends inside the key: the sk-
+	// rule starts at offset 160 (inside the value) and ends at 263 (after it). Neither span
+	// is nested in the other, so only the extend branch keeps the key's tail in the result.
+	in := "PASS" + "WORD=" + strings.Repeat("a", 150) + " sk" + "-" + strings.Repeat("B", 100)
+	const wantStart, wantEnd = 9, 263
+	spans := Scan(in)
+	if len(spans) != 1 {
+		t.Fatalf("partial overlap must merge into one span, got %+v", spans)
+	}
+	if spans[0].Start != wantStart || spans[0].End != wantEnd {
+		t.Errorf("partial overlap span = [%d,%d), want [%d,%d)", spans[0].Start, spans[0].End, wantStart, wantEnd)
+	}
+	if !strings.HasSuffix(in[spans[0].Start:spans[0].End], strings.Repeat("B", 100)) {
+		t.Errorf("merged span drops the tail of the key")
+	}
+}
