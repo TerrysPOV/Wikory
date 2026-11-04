@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/TerrysPOV/Wikory/internal/bootstrap"
@@ -35,17 +36,20 @@ func bootstrapConfirm(ctx context.Context, env *Env, args []string) (Result, err
 	if err != nil {
 		return Result{}, err
 	}
-	// The hash the person approved is compared with one rebuilt from what the store holds, not
-	// with the stored column: a store that no longer describes the plan that was shown is refused.
+	// The stored run is checked first. The hash is rebuilt from what the store holds, and a run
+	// whose store (or whose binary's constants) no longer reproduces the hash it was planned
+	// under cannot be confirmed whatever hash the person passes. The remedy is a fresh plan: the
+	// person's hash equals the stored column, and status prints that same column, so telling a
+	// driver to read the hash again would send it round in a circle.
 	rebuilt, err := rebuiltPlanHash(ctx, runs, run)
 	if err != nil {
 		return Result{}, err
 	}
-	if hash != rebuilt {
-		return Result{}, &UsageError{Msg: "the plan hash does not match this run; read the plan again with wikory bootstrap status and pass its hash once the person has agreed to it"}
-	}
 	if rebuilt != run.PlanHash {
-		return Result{}, &UsageError{Msg: "the stored run no longer matches the plan that was shown, so it cannot be confirmed; plan again"}
+		return Result{}, &UsageError{Msg: "the stored run no longer matches the plan that was shown (the store or the wikory binary changed since it was planned), so it cannot be confirmed; run wikory bootstrap plan again"}
+	}
+	if hash != run.PlanHash {
+		return Result{}, &UsageError{Msg: "the plan hash given is not this plan's hash; the plan output prints it, and wikory bootstrap status --json prints it as run.plan_hash"}
 	}
 	head, err := p.Repo.HeadCommit(ctx)
 	if err != nil {
@@ -68,18 +72,25 @@ func bootstrapConfirm(ctx context.Context, env *Env, args []string) (Result, err
 		}
 		return Result{Text: fmt.Sprintf("Sample of %d item(s) confirmed for run %s. Hand out work with wikory bootstrap next.\n", run.Sample, runID),
 			Data: map[string]any{"run_id": runID, "state": bootstrap.StateSampling}}, nil
-	case run.State == bootstrap.StatePlanned && run.Sample > 0:
-		return Result{}, &UsageError{Msg: "this run was planned with a sample; confirm the sample first (wikory bootstrap confirm --sample), then confirm the full run once its measurements are in"}
 	}
-	// A run planned with a sample reaches the full run only through awaiting-confirm, which its
-	// settled sample puts it in; the sample size is fixed at planning, so the source states are too.
+	// The one state check: a run planned with a sample reaches the full run only through
+	// awaiting-confirm, which its settled sample puts it in, and nothing moves a run back to
+	// planned. The sample size is fixed at planning, so the source state is too. The friendlier
+	// messages are chosen after a refusal, from the state the run is in now.
 	from := bootstrap.StatePlanned
 	if run.Sample > 0 {
 		from = bootstrap.StateAwaiting
 	}
 	if err := runs.Transition(ctx, runID, bootstrap.StateRunning, from); err != nil {
-		if run.State == bootstrap.StateSampling {
-			return Result{}, &UsageError{Msg: "the sample is still running; submit its items and the run will move to awaiting-confirm"}
+		if errors.Is(err, bootstrap.ErrState) {
+			if now, gerr := runs.Get(ctx, runID); gerr == nil {
+				switch {
+				case now.State == bootstrap.StateSampling:
+					return Result{}, &UsageError{Msg: "the sample is still running; submit its items and the run will move to awaiting-confirm"}
+				case now.State == bootstrap.StatePlanned && now.Sample > 0:
+					return Result{}, &UsageError{Msg: "this run was planned with a sample; confirm the sample first (wikory bootstrap confirm --sample), then confirm the full run once its measurements are in"}
+				}
+			}
 		}
 		return Result{}, err
 	}
@@ -88,7 +99,10 @@ func bootstrapConfirm(ctx context.Context, env *Env, args []string) (Result, err
 }
 
 // rebuiltPlanHash rebuilds a run's plan hash through BuildPlan from the sources, components,
-// scope, head and constants the store holds. The sample size is not part of the hash.
+// scope and head the store holds, with the estimate constants the running binary has. The run's
+// work items (bs_items) are not compared: the hash covers the work list derived from the
+// sources, and the items table is advisory (architecture spec 14.4). The stored sample size is
+// passed so the rebuilt plan is the one that was shown; BuildPlan does not hash it.
 func rebuiltPlanHash(ctx context.Context, runs *bootstrap.Runs, run bootstrap.Run) (string, error) {
 	srcs, err := runs.Sources(ctx, run.ID)
 	if err != nil {

@@ -2,7 +2,9 @@ package app
 
 import (
 	"database/sql"
+	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -58,8 +60,9 @@ func TestASampledRunNeedsTheSampleConfirmationFirst(t *testing.T) {
 	if len(items) != 1 {
 		t.Fatalf("the sample is exactly the one item asked for: %d", len(items))
 	}
-	if _, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", d.PlanHash); code == ExitOK {
-		t.Fatal("the full run cannot start while the sample is still running")
+	e, code, _ = runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", d.PlanHash)
+	if code != ExitUsage || e.OK || !strings.Contains(e.Error.Message, "the sample is still running") {
+		t.Fatalf("the full run cannot start while the sample is still running: %d %+v", code, e)
 	}
 }
 
@@ -148,8 +151,8 @@ func TestConfirmRecomputesThePlanHashFromTheStoredRun(t *testing.T) {
 		t.Fatal("the fixture has no queued source to change")
 	}
 	e, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", d.PlanHash)
-	if code != ExitUsage || e.OK {
-		t.Fatalf("a changed store must not confirm under the old hash: code %d %+v", code, e)
+	if code != ExitUsage || e.OK || !strings.Contains(e.Error.Message, "stored run no longer matches") {
+		t.Fatalf("a changed store must not confirm under the old hash, and the remedy is to plan again, not to read the hash again: code %d %+v", code, e)
 	}
 	assertNoWorkHandedOut(t, c, dir, d.RunID, "after the stored sources changed")
 
@@ -160,8 +163,11 @@ func TestConfirmRecomputesThePlanHashFromTheStoredRun(t *testing.T) {
 		t.Fatalf("rewrote %d runs", n)
 	}
 	for _, h := range []string{"feedface", d2.PlanHash} {
-		if e, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d2.RunID, "--plan-hash", h); code != ExitUsage || e.OK {
-			t.Fatalf("hash %q against a rewritten column: code %d %+v", h, code, e)
+		// The hash the person was shown, and the rewritten column's own value, both get the
+		// plan-again remedy: status would print the same hash, so a driver told to read it
+		// again would loop.
+		if e, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d2.RunID, "--plan-hash", h); code != ExitUsage || e.OK || !strings.Contains(e.Error.Message, "stored run no longer matches") {
+			t.Fatalf("hash %q against a rewritten column must say the stored run no longer matches: code %d %+v", h, code, e)
 		}
 	}
 	assertNoWorkHandedOut(t, c, dir, d2.RunID, "after the stored hash was rewritten")
@@ -187,4 +193,175 @@ func TestConfirmSampleTakesNoValue(t *testing.T) {
 		}
 	}
 	assertNoWorkHandedOut(t, c, dir, d.RunID, "after refused flag forms")
+}
+
+func TestAMistypedHashOnAnUntouchedStorePointsAtWhereTheHashIsPrinted(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	pe, _, _ := runBootstrapJSON(t, c, dir, "plan")
+	d := decodeData[planData](t, pe)
+	e, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", "deadbeef")
+	if code != ExitUsage || e.OK {
+		t.Fatalf("code %d %+v", code, e)
+	}
+	msg := e.Error.Message
+	if !strings.Contains(msg, "is not this plan's hash") || strings.Contains(msg, "plan again") {
+		t.Fatalf("a mistyped hash on a sound store is the person's slip, not a damaged run: %q", msg)
+	}
+	// The message names what prints the hash, and that really does.
+	if !strings.Contains(msg, "bootstrap status --json") || !strings.Contains(msg, "run.plan_hash") {
+		t.Fatalf("the message must say where the hash is printed: %q", msg)
+	}
+	st, _, _ := runBootstrapJSON(t, c, dir, "status", "--run", d.RunID)
+	got := decodeData[struct {
+		Run struct {
+			PlanHash string `json:"plan_hash"`
+		} `json:"run"`
+	}](t, st).Run.PlanHash
+	if got != d.PlanHash || got == "" {
+		t.Fatalf("status --json run.plan_hash = %q, want %q", got, d.PlanHash)
+	}
+	assertNoWorkHandedOut(t, c, dir, d.RunID, "after a mistyped hash")
+}
+
+// sourceTree writes files (relative path -> content) under a fresh directory outside the repository.
+func sourceTree(t *testing.T, files map[string]string) string {
+	t.Helper()
+	root, _ := filepath.EvalSymlinks(t.TempDir())
+	for rel, content := range files {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// The rebuilt plan hash reads sources back from the store in SQL order. Names and paths whose
+// byte order differs from a case-folding or punctuation-skipping order prove that order is the
+// one inventory produced; if it were not, every run planned with --source would be refused.
+func TestConfirmAcceptsARunPlannedWithSourcesWhoseNamesSortAwkwardly(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	notes := sourceTree(t, map[string]string{
+		"a.md": "Alpha note.\n", "B.md": "Bravo note.\n", "Z.md": "Zulu note.\n",
+		"_x.md": "Underscore first.\n", "-y.md": "Dash first.\n",
+		"a_b.md": "Underscore inside.\n", "a-b.md": "Dash inside.\n",
+		"\u00e9.md": "Accented.\n", "sub/Q.md": "Upper in a folder.\n", "sub/q.md": "Lower in a folder.\n",
+	})
+	more := sourceTree(t, map[string]string{"one.md": "One.\n", "Two.md": "Two.\n"})
+	pe, _, errOut := runBootstrapJSON(t, c, dir, "plan", "--source", "notes="+notes, "--source", "notes-2="+more)
+	d := decodeData[planData](t, pe)
+	if d.RunID == "" || d.Scope != "repo+notes+notes-2" {
+		t.Fatalf("%+v %s", d, errOut)
+	}
+	e, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", d.PlanHash)
+	if code != ExitOK || !e.OK {
+		t.Fatalf("a run planned with --source must confirm under the hash it was shown: %d %+v", code, e)
+	}
+	if _, code, _ := runBootstrapJSON(t, c, dir, "next", "--run", d.RunID); code != ExitOK {
+		t.Fatal("a confirmed run hands out work")
+	}
+}
+
+type leased struct {
+	Batch string `json:"batch"`
+	Items []struct {
+		Item  string `json:"item"`
+		Ref   string `json:"ref"`
+		Epoch int    `json:"epoch"`
+	} `json:"items"`
+}
+
+// submitLeased submits one result per leased item. The two documents of the fixture carry a real
+// claim; any other item is submitted with none, which is a valid result.
+func submitLeased(t *testing.T, c *cli, dir, runID string, b leased, in, out int) {
+	t.Helper()
+	claims := map[string]string{
+		"src:repo:docs/design.md":                          `{"text":"The queue acknowledges after the handler returns.","kind":"current-impl","excerpt":"acknowledges after the handler returns","locator":"L1-L1"}`,
+		"src:repo:.claude/handoffs/PRIOR_SESSION_STATE.md": `{"text":"Queue retry is an open item.","kind":"hypothesis","excerpt":"Open item: internal/queue retry.","locator":"L1-L1"}`,
+	}
+	var rs []string
+	for i, it := range b.Items {
+		usage := `{"input_tokens":0,"output_tokens":0}`
+		if i == 0 {
+			usage = fmt.Sprintf(`{"input_tokens":%d,"output_tokens":%d}`, in, out)
+		}
+		rs = append(rs, fmt.Sprintf(`{"item":%q,"epoch":%d,"claims":[%s],"usage":%s}`, it.Item, it.Epoch, claims[it.Ref], usage))
+	}
+	c.stdin = `{"stage":"extract","results":[` + strings.Join(rs, ",") + `]}`
+	if e, code, _ := runBootstrapJSON(t, c, dir, "submit", "--run", runID, "--batch", b.Batch); code != ExitOK || !e.OK {
+		t.Fatalf("submit: %d %+v", code, e)
+	}
+}
+
+type sampleStatus struct {
+	Run struct {
+		State    string `json:"state"`
+		TokensIn int    `json:"tokens_in"`
+	} `json:"run"`
+	Sample struct {
+		Items int     `json:"sample_items"`
+		Done  int     `json:"sample_done"`
+		In    int     `json:"tokens_in"`
+		Out   int     `json:"tokens_out"`
+		Rate  float64 `json:"acceptance_rate"`
+	} `json:"sample"`
+}
+
+// The whole sequence a person walks through: sample, measure, then the full run. The CLI is the
+// only code that picks the source state of the full-run confirm, so this is the test that fails
+// if a sampled run in awaiting-confirm can never be confirmed.
+func TestASampledRunReachesTheFullRunAndTheSampleFiguresStayFrozen(t *testing.T) {
+	dir, c := bootstrapRepo(t)
+	pe, _, _ := runBootstrapJSON(t, c, dir, "plan", "--sample", "1")
+	d := decodeData[planData](t, pe)
+	extractItems := 0
+	for _, e := range d.Estimates {
+		if e.Stage == "extract" {
+			extractItems = e.Items
+		}
+	}
+	if extractItems < 2 {
+		t.Fatalf("the fixture needs at least two extract items: %+v", d.Estimates)
+	}
+	if e, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", d.PlanHash, "--sample"); code != ExitOK || !e.OK {
+		t.Fatalf("confirm --sample: %d %+v", code, e)
+	}
+	ne, _, _ := runBootstrapJSON(t, c, dir, "next", "--run", d.RunID, "--max", "50")
+	first := decodeData[leased](t, ne)
+	if len(first.Items) != 1 {
+		t.Fatalf("the sample is the one item asked for: %+v", first)
+	}
+	submitLeased(t, c, dir, d.RunID, first, 1000, 100)
+
+	status := func() sampleStatus {
+		t.Helper()
+		st, _, _ := runBootstrapJSON(t, c, dir, "status", "--run", d.RunID)
+		return decodeData[sampleStatus](t, st)
+	}
+	settled := status()
+	if settled.Run.State != "awaiting-confirm" || settled.Sample.Done != 1 || settled.Sample.In != 1000 || settled.Sample.Out != 100 {
+		t.Fatalf("the sample should have settled with its own figures: %+v", settled)
+	}
+
+	// The person says yes to the full run, without --sample.
+	if e, code, _ := runBootstrapJSON(t, c, dir, "confirm", "--run", d.RunID, "--plan-hash", d.PlanHash); code != ExitOK || !e.OK {
+		t.Fatalf("a sampled run in awaiting-confirm must confirm to the full run: %d %+v", code, e)
+	}
+	re, _, _ := runBootstrapJSON(t, c, dir, "next", "--run", d.RunID, "--max", "50")
+	rest := decodeData[leased](t, re)
+	if len(rest.Items) != extractItems-1 {
+		t.Fatalf("the full run leases the %d items the sample did not: got %d", extractItems-1, len(rest.Items))
+	}
+	submitLeased(t, c, dir, d.RunID, rest, 7000, 700)
+
+	after := status()
+	if after.Run.TokensIn != 8000 {
+		t.Fatalf("the run total should include the full run's tokens: %+v", after)
+	}
+	if after.Sample != settled.Sample {
+		t.Fatalf("the sample figures must stay what the sample measured: settled %+v, after the full run %+v", settled.Sample, after.Sample)
+	}
 }
