@@ -294,7 +294,7 @@ func RenderPages(m RenderModel) []PageOut {
 		if !hasRationale {
 			intro = append(intro, "No rationale was found for this component in the sources.")
 		}
-		specs = append(specs, pageSpec{base: componentBase(c.Prefix), typ: "component", title: "Component: " + displayName(c.Prefix), intro: intro, secs: secs,
+		specs = append(specs, pageSpec{base: componentBase(c.Prefix), typ: "component", title: "Component: `" + displayName(c.Prefix) + "`", intro: intro, secs: secs,
 			empty: "No implementation claims were extracted for this component.", links: []string{"bootstrap-overview", "bootstrap-architecture"}})
 	}
 

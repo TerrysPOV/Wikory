@@ -488,6 +488,26 @@ func TestAComponentNameWithMarkupStillRendersPagesTheParserReadsWhole(t *testing
 	}
 }
 
+// A component name is shown only inside a code span, in the title and heading as everywhere else,
+// so a name shaped like a link or an image is inert text and the page still parses whole.
+func TestAComponentNameShapedLikeALinkRendersInert(t *testing.T) {
+	for _, odd := range []string{"[x](http://e)", "![i](http://e/p.png)"} {
+		m := renderModel(t)
+		m.Components = []Component{{Name: odd, Prefix: odd, Rank: 1, Inspected: true, Files: 1}}
+		m.Claims = []StoredClaim{stored(t, "comp:"+odd, "current-impl", "verified", "The odd package works.", 0)}
+		for _, pg := range RenderPages(m) {
+			parsed := claim.ParsePage(pg.Path, pg.Content)
+			if len(parsed.Findings) != 0 || parsed.Degraded != "" {
+				t.Errorf("%q: %s: findings %+v, degraded %q", odd, pg.Path, parsed.Findings, parsed.Degraded)
+			}
+			text := string(pg.Content)
+			if strings.Count(text, odd) != strings.Count(text, "`"+odd+"`") {
+				t.Errorf("%q: %s shows the name outside a code span:\n%s", odd, pg.Path, text)
+			}
+		}
+	}
+}
+
 // The parser check can only halve a part; it does not know the byte budget. A model of about
 // 100 KiB of claims would halve into two parts of 50 KiB, each readable and each over budget,
 // so the sizes must be packed to the budget first.
