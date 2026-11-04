@@ -10849,6 +10849,28 @@ git commit -m "feat: add the verify stage with conflicting claim pairs"
 
 ---
 
+#### Final whole-branch review fixes (2026-11-04)
+
+- A10 (`64f5d3a`): one match rule and one ownership rule. `claimTouches(c, s)` is the ref-or-path match; `ClaimsFor` adds the undecided filter (`isUndecided`) on top. `AssignClaims` now assigns every claim it is given, whatever its status, to at most one inspected component (ownership); callers that want the work still to judge pass `undecidedClaims(...)` (`PrepareVerify`, `VerifyOwed`), and `ApplyVerdicts` passes every claim for its ownership check instead of copying each claim with a forged status. `BuildCoverage` and the page placement (Task 12, Task 13) use the same `AssignClaims`, so the page a claim sits on, the verifier that judged it and the component credited as verified are the same. Tests: `TestTheVerifierThePageAndTheCoverageAgreeOnAClaimsComponent` (internal/app and internal/app/sub, a claim from sub naming sub's file: coverage lists only sub as verified), `TestPrepareVerifyQueuesOnlyUndecidedWork`; `TestAClaimNamingTwoComponentsGoesToExactlyOneVerifier` passes `undecidedClaims(cs)` and also asserts a decided claim still has an owner.
+- A6 (`3bb75c6`): `verifyTargets(comps, assigned, files)` also needs the component to have files: one with none would hand its verifier an empty evidence set, every verdict `bad-evidence-path`, paid three times. `VerifyOwed` reads the sources for this. Its claims stay as they are.
+- B12 (`ad6e036`): a contradicted verdict no longer writes the validator's re-rendering of the **original** claim: re-resolving the original's own evidence silently dropped the object id of evidence that had gone stale since extraction. The original keeps its metadata as read apart from the status (the validator's) and the `Contradicts` link, the rule Task 11's review applies to a downgraded confirmation. Test: `TestAContradictionChangesOnlyTheOriginalsStatusAndLink`.
+- C1 and C2 (`0f2b764`): `VerifyInput.Blob` is `func(oid string, size int64) ([]byte, error)` and `checkLines` passes the source's size; `locatorRe` (Task 10) replaces the identical `linesRe`; the exported `EnqueueVerify` wrapper is gone, tests call `enqueueVerify`.
+
+Run: `scripts/inject.sh internal/bootstrap/coverage.go '		for _, cl := range owned[c.Prefix] {' '		_ = owned
+		for _, cl := range claims {
+			if !claimTouches(c, cl) {
+				continue
+			}' ./internal/bootstrap/ 'TestTheVerifierThePageAndTheCoverageAgree' 'only the component whose verifier judged the claim is verified'`
+Run: `scripts/inject.sh internal/bootstrap/verify.go '	for _, s := range AssignClaims(comps, all)[comp.Prefix] {' '	for _, s := range AssignClaims(comps, undecidedClaims(all))[comp.Prefix] {' ./internal/bootstrap/ '.' 'FAIL'` (RED through `TestAClaimAlreadyDecidedIsNotDecidedAgain`)
+Run: `scripts/inject.sh internal/bootstrap/verify.go '	assigned := AssignClaims(comps, undecidedClaims(claims))
+	var specs []ItemSpec' '	assigned := AssignClaims(comps, claims)
+	var specs []ItemSpec' ./internal/bootstrap/ 'TestPrepareVerifyQueuesOnlyUndecidedWork' 'one verify item'`
+Run: `scripts/inject.sh internal/bootstrap/verify.go 'AssignClaims(comps, undecidedClaims(claims)), files)), nil' 'AssignClaims(comps, claims), files)), nil' ./internal/bootstrap/ 'TestPrepareVerifyQueuesOnlyUndecidedWork' 'VerifyOwed counts the component'`
+Run: `scripts/inject.sh internal/bootstrap/verify.go 'len(assigned[c.Prefix]) > 0 && len(files[c.Prefix]) > 0 {' 'len(assigned[c.Prefix]) > 0 {' ./internal/bootstrap/ 'TestAnInspectedComponentWithNoFiles' 'only the component with files is a verify target'`
+Run: `scripts/inject.sh internal/bootstrap/verify.go '			upd.Status, upd.Meta, upd.Loc = kept.Status, kept.Render(), locJSON(locs)' '			upd.Status, upd.Meta, upd.Loc = kept.Status, outOld.Render(), locJSON(locs)' ./internal/bootstrap/ 'TestAContradictionChangesOnly' 'changed beyond status and link'`
+
+Expected: each exits 0 (RED).
+
 ### Task 12: `origin` frontmatter and deterministic page rendering
 
 **Files:**
