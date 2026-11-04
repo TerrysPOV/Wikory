@@ -31,6 +31,9 @@ jobs:
       - name: Self-tests of the fault-injection runner and the fixture scrubber (unix)
         if: runner.os != 'Windows'
         run: scripts/inject_selftest.sh && scripts/scrub_selftest.sh
+      - name: Exit checks, by test name, including the stage 2 kill test (unix)
+        if: runner.os != 'Windows'
+        run: scripts/exit-checks.sh
       - name: Stage 0 spikes that need this platform
         run: go test -tags spike -count=1 -v -run "TestFTS5Available|TestWALParallelProcesses|TestLedger|TestOSRoot|TestOpenat|TestRootHas|TestWindowsJunctionUnderOSRoot|TestWindowsSameFileAndOpenDirectoryRename|TestDenyHookCorpus" ./internal/spikes/
       - name: Build
