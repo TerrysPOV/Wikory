@@ -38,7 +38,10 @@ func Score(c Component) float64 {
 }
 
 // Rank scores the components, orders them by score (ties by name), numbers them from 1 and
-// marks the first budget as inspected. It returns a new slice and leaves its input alone.
+// marks the first budget of them that have files as inspected. A component with no file to read
+// (Files == 0: every file it had was skipped) is ranked but never inspected, so the budget goes
+// to the next one instead of to paid work with nothing in it. It returns a new slice and leaves
+// its input alone.
 func Rank(cs []Component, budget int) []Component {
 	out := append([]Component(nil), cs...)
 	for i := range out {
@@ -50,9 +53,13 @@ func Rank(cs []Component, budget int) []Component {
 		}
 		return out[i].Name < out[j].Name
 	})
+	inspected := 0
 	for i := range out {
 		out[i].Rank = i + 1
-		out[i].Inspected = i < budget
+		out[i].Inspected = inspected < budget && out[i].Files > 0
+		if out[i].Inspected {
+			inspected++
+		}
 	}
 	return out
 }

@@ -160,10 +160,19 @@ func Inventory(ctx context.Context, readers []Reader, opt Options) (Result, erro
 		opt.Progress(len(all), len(all))
 	}
 
-	res := Result{Components: Rank(comps, opt.Budget)}
+	res := Result{}
 	for _, l := range all {
 		res.Sources = append(res.Sources, l.s)
 	}
+	// A component's Files is what it will be read from: its queued implementation files, counted
+	// the way ComponentFiles groups them for the digest. Detection counted files before any was
+	// read; one whose files were all skipped (secret, oversize, excluded) now has none, so Rank
+	// passes it over for inspection.
+	queued := ComponentFiles(Result{Sources: res.Sources, Components: comps})
+	for i := range comps {
+		comps[i].Files = len(queued[comps[i].Prefix])
+	}
+	res.Components = Rank(comps, opt.Budget)
 	return res, nil
 }
 

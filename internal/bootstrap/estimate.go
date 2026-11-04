@@ -38,8 +38,8 @@ func ExtractSpecs(res Result) []ItemSpec {
 	}
 	files := ComponentFiles(res)
 	for _, c := range res.Components {
-		if !c.Inspected {
-			continue
+		if !c.Inspected || len(files[c.Prefix]) == 0 {
+			continue // a component with nothing to read gets no paid item
 		}
 		var total int64
 		parts := make([]string, 0, len(files[c.Prefix]))
@@ -91,8 +91,9 @@ func EstimateStages(res Result) []Estimate {
 		ex.InputTokens += int(s.Bytes)/bytesPerToken + promptOverheadTokens
 	}
 	n := 0
+	files := ComponentFiles(res)
 	for _, c := range res.Components {
-		if c.Inspected {
+		if c.Inspected && len(files[c.Prefix]) > 0 {
 			n++
 		}
 	}

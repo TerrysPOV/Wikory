@@ -20,10 +20,10 @@ func TestScoreWeightsAndCaps(t *testing.T) {
 
 func TestRankOrdersByScoreThenNameAndMarksTheBudget(t *testing.T) {
 	cs := []Component{
-		{Name: "b", Prefix: "b", Churn: 10},
-		{Name: "a", Prefix: "a", Churn: 10},
-		{Name: "c", Prefix: "c", Churn: 40},
-		{Name: "d", Prefix: "d"},
+		{Name: "b", Prefix: "b", Churn: 10, Files: 1},
+		{Name: "a", Prefix: "a", Churn: 10, Files: 1},
+		{Name: "c", Prefix: "c", Churn: 40, Files: 1},
+		{Name: "d", Prefix: "d", Files: 1},
 	}
 	got := Rank(cs, 2)
 	order := []string{got[0].Name, got[1].Name, got[2].Name, got[3].Name}

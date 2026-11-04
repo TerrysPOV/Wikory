@@ -190,12 +190,15 @@ func (r *Runs) enqueueVerify(ctx context.Context, runID string, specs []ItemSpec
 	return inserted, nil
 }
 
-// verifyTargets are the inspected components that have claims to judge: the ones that get a
-// verify item. PrepareVerify queues them and VerifyOwed counts them, so the two cannot disagree.
-func verifyTargets(comps []Component, assigned map[string][]StoredClaim) []Component {
+// verifyTargets are the inspected components that have claims to judge and files to judge them
+// against: the ones that get a verify item. A component with no files would give a verifier an
+// empty evidence set, so every verdict would be refused and the item paid for again; its claims
+// stay as they are. PrepareVerify queues them and VerifyOwed counts them, so the two cannot
+// disagree.
+func verifyTargets(comps []Component, assigned map[string][]StoredClaim, files map[string][]Source) []Component {
 	var out []Component
 	for _, c := range comps {
-		if c.Inspected && len(assigned[c.Prefix]) > 0 {
+		if c.Inspected && len(assigned[c.Prefix]) > 0 && len(files[c.Prefix]) > 0 {
 			out = append(out, c)
 		}
 	}
@@ -222,7 +225,12 @@ func VerifyOwed(ctx context.Context, runs *Runs, runID string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return len(verifyTargets(comps, AssignClaims(comps, claims))), nil
+	srcs, err := runs.Sources(ctx, runID)
+	if err != nil {
+		return 0, err
+	}
+	files := ComponentFiles(Result{Sources: srcs, Components: comps})
+	return len(verifyTargets(comps, AssignClaims(comps, claims), files)), nil
 }
 
 // PrepareVerify creates the verify items once every extract item is closed: one per inspected
@@ -251,7 +259,7 @@ func PrepareVerify(ctx context.Context, runs *Runs, w WorkFiles, runID string) (
 	files := ComponentFiles(Result{Sources: srcs, Components: comps})
 	assigned := AssignClaims(comps, claims)
 	var specs []ItemSpec
-	for _, c := range verifyTargets(comps, assigned) {
+	for _, c := range verifyTargets(comps, assigned, files) {
 		related := assigned[c.Prefix]
 		var b strings.Builder
 		fmt.Fprintf(&b, "COMPONENT %s\nFILES\n", c.Prefix)
