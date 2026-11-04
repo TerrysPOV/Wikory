@@ -16516,6 +16516,20 @@ Fix round 1 was committed as `fix: make confirm a prompted step, correct the sam
 
 ---
 
+#### Final whole-branch review fixes (2026-11-04)
+
+- A11 (`fd0e021`): the command gains step 0, before planning: run `wikory bootstrap status --json` and act on the latest run's state. `sampling` or `running`: offer to resume at step 4; `finishing`: offer to resume at step 7; `awaiting-confirm`: resume at the sample review in step 6, where the person's yes for the full run is still required; `planned`: show its plan again by planning (step 1), and it needs a yes like any plan; `done`, `abandoned` or no run: plan. Resuming a sampling, running or finishing run needs no new yes (the yes covered that plan hash), and the driver says so and shows the run id and hash. `wikory bootstrap abandon --run RUN` is named as the way to drop a stuck run; it is deliberately not in `allowed-tools`, so Claude Code asks the person to approve it. The README says how a stopped bootstrap is resumed or dropped. `TestBootstrapCommandPinsTheSampleSequenceAndTheLoopExit` pins the step 0 phrases; `TestBootstrapCommandNamesOnlyRealSubcommandsAndFlags` knows `abandon` (`--run`, `--json`); `TestStatusJSONGivesTheCommandWhatItNeedsToResume` drives the binary.
+- B8 (`e2b9f16`): step 5 says that a subagent answer that is not valid JSON, or not the asked-for shape, is dropped: the rest are submitted, it is not repaired or retried inline, and its lease lapses so `next` hands the item out again. Step 3 and the README say that if the person's own settings allow `Bash(wikory:*)` (or anything covering `confirm`) or bypass permissions, `confirm` is not prompted and the gate is the command's instructions alone, and the driver tells the person so before confirming. Both are pinned in `TestBootstrapCommandTellsTheDriverHowToHandleUsageAndSubmitInput` and `TestReadmeBlocksAPaidBootstrapUntilTheReadPermissionCheckIsRecorded`.
+
+Run: `scripts/inject.sh plugins/claude/commands/bootstrap.md '0. Before planning, run `wikory bootstrap status --json`' '0. Plan straight away; do not run `wikory bootstrap status --json`' ./internal/app/ 'TestBootstrapCommandPinsTheSampleSequenceAndTheLoopExit' 'lost "0. Before planning'`
+Run: `scripts/inject.sh plugins/claude/commands/bootstrap.md 'The person'"'"'s yes for the full run is still required.' 'Carry on with the full run.' ./internal/app/ 'TestBootstrapCommandPinsTheSampleSequenceAndTheLoopExit' 'yes for the full run is still required'`
+Run: `scripts/inject.sh plugins/claude/commands/bootstrap.md '`wikory bootstrap abandon --run RUN` drops it' '`wikory bootstrap abandon --run RUN --force` drops it' ./internal/app/ 'TestBootstrapCommandNamesOnlyRealSubcommandsAndFlags' 'is not a flag of bootstrap abandon'`
+Run: `scripts/inject.sh internal/bootstrap/runs.go '	PlanHash  string `json:"plan_hash"`' '	PlanHash  string `json:"planhash"`' ./internal/app/ 'TestStatusJSONGivesTheCommand' 'plan hash and sample size'`
+Run: `scripts/inject.sh plugins/claude/commands/bootstrap.md 'drop that one result: submit the others without it' 'fix it up and submit it with the others' ./internal/app/ 'TestBootstrapCommandTellsTheDriverHowToHandleUsageAndSubmitInput' 'drop that one result'`
+Run: `scripts/inject.sh plugins/claude/README.md 'If your own permission settings allow `Bash(wikory:*)`' 'Your own permission settings never change this' ./internal/app/ 'TestReadmeBlocksAPaidBootstrap' 'If your own permission settings allow'`
+
+Expected: each exits 0 (RED).
+
 ### Task 16: Exit checks, kill test, CI and a free dry run
 
 **Files:**
