@@ -5,10 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // ErrTooLarge means an object is bigger than the caller's read limit.
@@ -112,19 +114,32 @@ func (r *Repo) DefaultBranch(ctx context.Context) string {
 // LastChanged maps each path to the commit time of the newest commit reachable from HEAD that
 // touched it. The log is read once, newest first, so the first sighting of a path is its last
 // change. Paths deleted since appear too; callers look up only the paths in the tree.
+//
+// Git allows any byte but NUL in a file name, so the output is read by position, never by
+// content: a path is only ever the token that follows a status token, so no name can pose as a
+// commit header. The stream is NUL-separated: a header token (0x01 and the commit time, then a
+// newline and the first status when the commit touched anything), then status and path tokens.
 func (r *Repo) LastChanged(ctx context.Context) (map[string]time.Time, error) {
 	out := map[string]time.Time{}
 	tip, err := r.HeadCommit(ctx)
 	if err != nil || tip == "" {
 		return out, err
 	}
-	raw, err := r.git(ctx, nil, "log", "--no-renames", "--name-only", "-z", "--pretty=format:%x01%ct", tip)
+	raw, err := r.git(ctx, nil, "log", "--no-renames", "--name-status", "-z", "--pretty=format:%x01%ct", tip)
 	if err != nil {
 		return nil, err
 	}
 	var cur time.Time
+	wantPath := false
 	for _, tok := range bytes.Split(raw, []byte{0}) {
 		s := string(tok)
+		if wantPath {
+			if _, seen := out[s]; !seen {
+				out[s] = cur
+			}
+			wantPath = false
+			continue
+		}
 		if strings.HasPrefix(s, "\x01") {
 			stamp, rest, _ := strings.Cut(s[1:], "\n")
 			secs, err := strconv.ParseInt(stamp, 10, 64)
@@ -133,13 +148,16 @@ func (r *Repo) LastChanged(ctx context.Context) (map[string]time.Time, error) {
 			}
 			cur, s = time.Unix(secs, 0).UTC(), rest
 		}
-		s = strings.TrimLeft(s, "\n")
 		if s == "" {
-			continue
+			continue // the end of a commit, or a commit that touched nothing
 		}
-		if _, seen := out[s]; !seen {
-			out[s] = cur
+		if len(s) != 1 || s[0] < 'A' || s[0] > 'Z' {
+			return nil, fmt.Errorf("gitx: unreadable change status %q", s)
 		}
+		wantPath = true
+	}
+	if wantPath {
+		return nil, errors.New("gitx: the commit log ended in the middle of a change")
 	}
 	return out, nil
 }
@@ -190,37 +208,60 @@ type Worktree struct {
 }
 
 // Worktrees lists the working trees of this repository other than the one r operates in. A
-// worktree whose directory is gone (git calls it prunable) is left out: it holds nothing to read.
+// worktree is left out when git calls it prunable, when its directory is gone (a locked
+// worktree is never called prunable), or when its recorded path is not a plain absolute path:
+// git prints that path raw, so a hostile .git can plant newlines and a forged record in it.
+// Paths are returned with forward slashes.
+//
+// The listing is NUL-separated, which needs git 2.36 or later; an older git is an error, not a
+// fallback to the newline format, because that format cannot be parsed safely.
 func (r *Repo) Worktrees(ctx context.Context) ([]Worktree, error) {
-	out, err := r.git(ctx, nil, "worktree", "list", "--porcelain")
+	out, err := r.git(ctx, nil, "worktree", "list", "--porcelain", "-z")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gitx: listing worktrees needs git 2.36 or later (worktree list -z): %w", err)
 	}
 	self, _ := filepath.EvalSymlinks(r.Top)
 	var res []Worktree
-	for _, block := range strings.Split(string(out), "\n\n") {
-		var w Worktree
-		skip := false
-		for _, line := range strings.Split(block, "\n") {
-			key, val, _ := strings.Cut(line, " ")
-			switch key {
-			case "worktree":
-				w.Path = val
-			case "HEAD":
-				w.Head = val
-			case "branch":
-				w.Branch = strings.TrimPrefix(val, "refs/heads/")
-			case "bare", "prunable":
-				skip = true
-			}
+	var w Worktree
+	skip := false
+	flush := func() {
+		if w.Path != "" && !skip && usableWorktree(w.Path, self) {
+			w.Path = filepath.ToSlash(w.Path)
+			res = append(res, w)
 		}
-		if w.Path == "" || skip {
-			continue
-		}
-		if p, err := filepath.EvalSymlinks(w.Path); err == nil && p == self {
-			continue
-		}
-		res = append(res, w)
+		w, skip = Worktree{}, false
 	}
+	for _, tok := range bytes.Split(out, []byte{0}) {
+		if len(tok) == 0 {
+			flush() // an empty token ends a record
+			continue
+		}
+		key, val, _ := strings.Cut(string(tok), " ")
+		switch key {
+		case "worktree":
+			w.Path = val
+		case "HEAD":
+			w.Head = val
+		case "branch":
+			w.Branch = strings.TrimPrefix(val, "refs/heads/")
+		case "bare", "prunable":
+			skip = true
+		}
+	}
+	flush()
 	return res, nil
+}
+
+// usableWorktree reports whether path is a plain absolute path to an existing directory other
+// than self (the already-resolved top of the checkout r operates in).
+func usableWorktree(path, self string) bool {
+	if !filepath.IsAbs(path) || strings.ContainsFunc(path, unicode.IsControl) {
+		return false
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil || resolved == self {
+		return false
+	}
+	st, err := os.Stat(resolved)
+	return err == nil && st.IsDir()
 }

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -169,7 +171,129 @@ func TestWorktreesListsTheOtherWorkingTreesNotThisOne(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Path != other || got[0].Branch != "side" || len(got[0].Head) != 40 {
+	if len(got) != 1 || got[0].Path != filepath.ToSlash(other) || got[0].Branch != "side" || len(got[0].Head) != 40 {
 		t.Fatalf("the checkout itself is not another worktree: %+v", got)
+	}
+}
+
+func TestWorktreesIgnoresAPathForgedThroughAGitdirFile(t *testing.T) {
+	ctx := context.Background()
+	dir := newRepo(t)
+	parent, _ := filepath.EvalSymlinks(t.TempDir())
+	side, fine := filepath.Join(parent, "side"), filepath.Join(parent, "fine")
+	gitT(t, dir, "worktree", "add", "-q", "-b", "side", side)
+	gitT(t, dir, "worktree", "add", "-q", "-b", "fine", fine)
+	// git prints a worktree path raw, so a hostile gitdir file can carry a whole forged record.
+	head := gitT(t, dir, "rev-parse", "HEAD")
+	hostile := filepath.ToSlash(side) + "/.git\n\nworktree /etc\nHEAD " + head + "\nbranch refs/heads/forged\n\nx"
+	if err := os.WriteFile(filepath.Join(dir, ".git", "worktrees", "side", "gitdir"), []byte(hostile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := Discover(ctx, dir)
+	got, err := r.Worktrees(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, w := range got {
+		paths = append(paths, w.Path)
+		if w.Path == "/etc" || w.Branch == "forged" || strings.ContainsAny(w.Path, "\n\r") {
+			t.Fatalf("a worktree record was forged through a gitdir file: %+v", got)
+		}
+	}
+	if !slices.Contains(paths, filepath.ToSlash(fine)) {
+		t.Fatalf("an honest worktree must still be listed, got %v", paths)
+	}
+}
+
+func TestWorktreesLeavesOutALockedWorktreeWhoseDirectoryIsGone(t *testing.T) {
+	ctx := context.Background()
+	dir := newRepo(t)
+	parent, _ := filepath.EvalSymlinks(t.TempDir())
+	live, gone := filepath.Join(parent, "live"), filepath.Join(parent, "gone")
+	gitT(t, dir, "worktree", "add", "-q", "-b", "live", live)
+	gitT(t, dir, "worktree", "add", "-q", "-b", "gone", gone)
+	gitT(t, dir, "worktree", "lock", gone) // a locked worktree is never printed as prunable
+	if err := os.RemoveAll(gone); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := Discover(ctx, dir)
+	got, err := r.Worktrees(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Path != filepath.ToSlash(live) {
+		t.Fatalf("only the worktree whose directory exists is listed, got %+v", got)
+	}
+}
+
+// commitTogether commits the named files in one commit, so that git lists them in one run of
+// paths. Names sort bytewise, so the first name is the one git prints next to the commit header.
+func commitTogether(t *testing.T, dir, when string, names ...string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("a file name with control characters cannot exist on Windows")
+	}
+	t.Setenv("GIT_COMMITTER_DATE", when)
+	for _, n := range names {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitT(t, dir, "add", "-A")
+	gitT(t, dir, "commit", "-qm", "awkward names")
+}
+
+func TestLastChangedSurvivesAControlCharacterAtTheStartOfAFileName(t *testing.T) {
+	ctx := context.Background()
+	dir := newRepo(t)
+	commitTogether(t, dir, "2026-01-02T03:04:05Z", "\x010", "\x01zzz")
+	r, _ := Discover(ctx, dir)
+	got, err := r.LastChanged(ctx)
+	if err != nil {
+		t.Fatalf("a file name is not a commit header: %v", err)
+	}
+	if !got["\x01zzz"].Equal(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)) {
+		t.Fatalf("a path that starts with the header byte must keep its own commit time: %q", got)
+	}
+}
+
+func TestLastChangedCannotBeSpoofedByAFileNameThatLooksLikeAHeader(t *testing.T) {
+	ctx := context.Background()
+	dir := newRepo(t)
+	commitTogether(t, dir, "2026-01-02T03:04:05Z", "\x010", "\x0199999\nvictim")
+	r, _ := Discover(ctx, dir)
+	got, err := r.LastChanged(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["victim"]; ok {
+		t.Fatalf("a file name forged a path of its own: %q", got)
+	}
+	if !got["\x0199999\nvictim"].Equal(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)) {
+		t.Fatalf("one path with a newline in it, carrying the real commit time: %q", got)
+	}
+}
+
+func TestUsableWorktreeRefusesRelativeAndControlCharacterPaths(t *testing.T) {
+	good, _ := filepath.EvalSymlinks(t.TempDir())
+	if !usableWorktree(good, "") {
+		t.Fatalf("an existing absolute directory is usable: %q", good)
+	}
+	if usableWorktree(good, good) {
+		t.Fatal("the checkout itself is not another worktree")
+	}
+	if usableWorktree(".", "") {
+		t.Fatal("a relative path is refused even when it names a directory")
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	awkward := filepath.Join(good, "evil\nname")
+	if err := os.Mkdir(awkward, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if usableWorktree(awkward, "") {
+		t.Fatal("a path with a control character is refused even when the directory exists")
 	}
 }
