@@ -254,6 +254,9 @@ func TestBootstrapCommandTellsTheDriverHowToHandleUsageAndSubmitInput(t *testing
 	_, body := frontmatter(t, pluginDir+"commands/bootstrap.md")
 	mustContain(t, "command", body,
 		"quoted here-document",
+		"If a subagent's answer is not valid JSON, or not the shape its prompt asks for, drop that one result",
+		"do not repair or retry it yourself, and let its lease lapse",
+		"If the person's own permission settings allow `Bash(wikory:*)` or bypass permissions, that prompt does not appear and the gate is these instructions alone: tell the person so",
 		"usage came back as 0/0",
 		"never free",
 		"not a cost estimate",
@@ -325,7 +328,8 @@ func TestAgentOutputShapesDecodeWithTheBinarysStrictDecoder(t *testing.T) {
 
 func TestReadmeBlocksAPaidBootstrapUntilTheReadPermissionCheckIsRecorded(t *testing.T) {
 	mustContain(t, "README", readPlugin(t, "README.md"),
-		"/wikory:bootstrap", "V-bootstrap-1", "Do not run a paid bootstrap on a real project until V-bootstrap-1 is recorded")
+		"/wikory:bootstrap", "V-bootstrap-1", "Do not run a paid bootstrap on a real project until V-bootstrap-1 is recorded",
+		"If your own permission settings allow `Bash(wikory:*)` (or any rule that covers `confirm`) or you run with permissions bypassed, `confirm` is not prompted and the gate is the command's instructions alone")
 }
 
 // The names and permission behaviour the command relies on cannot be tested from Go. The README
