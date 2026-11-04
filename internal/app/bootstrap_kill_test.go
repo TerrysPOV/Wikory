@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -24,6 +25,19 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// dieAt writes the step it died at to the marker file the parent named, then kills the process.
+// The marker is written immediately before the kill, so the parent can tell a helper that was
+// killed at the named step from one that died, or never started, for any other reason. If the
+// marker cannot be written the helper exits with a code that is not a kill (78), so the parent
+// fails instead of trusting a kill it cannot confirm.
+func dieAt(step string) {
+	if err := os.WriteFile(os.Getenv("WIKORY_KILL_MARKER"), []byte(step), 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, "kill marker:", err)
+		os.Exit(78)
+	}
+	killSelf()
+}
+
 // finishHelper runs `wikory bootstrap finish` on the fixture the parent built and kills itself
 // at the step in WIKORY_KILL_AT, with no deferred call run. A step of the form "confine:S:N"
 // dies at the Nth (from zero) time confine's replace reports step S, which is how a kill lands
@@ -32,18 +46,22 @@ func finishHelper() int {
 	at := os.Getenv("WIKORY_KILL_AT")
 	hook := func(step string) {
 		if step == at {
-			killSelf()
+			dieAt(at)
 		}
 	}
 	if parts := strings.Split(at, ":"); len(parts) == 3 && parts[0] == "confine" {
-		want, _ := strconv.Atoi(parts[2])
+		want, err := strconv.Atoi(parts[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "kill step", at, "has no valid count:", err)
+			return 79
+		}
 		seen := 0
 		confine.SetStepHook(func(s string) {
 			if s != parts[1] {
 				return
 			}
 			if seen == want {
-				killSelf()
+				dieAt(at)
 			}
 			seen++
 		})
@@ -91,12 +109,22 @@ func killFinishAt(t *testing.T, dir string, c *cli, run, step string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	marker := filepath.Join(t.TempDir(), "kill-marker") // outside the repository, so it cannot dirty it
 	cmd := exec.Command(exe, "-test.run=^$")
 	cmd.Env = append(os.Environ(), "WIKORY_TEST_ROLE=bootstrap-finish-helper", "WIKORY_KILL_AT="+step,
-		"WIKORY_TEST_DATA="+c.dataDir, "WIKORY_TEST_REPO="+dir, "WIKORY_TEST_RUN="+run)
-	out, _ := cmd.CombinedOutput()
-	if cmd.ProcessState.ExitCode() != killedExitCode {
-		t.Fatalf("step %s: the helper was not killed (exit %d): %s", step, cmd.ProcessState.ExitCode(), out)
+		"WIKORY_KILL_MARKER="+marker, "WIKORY_TEST_DATA="+c.dataDir, "WIKORY_TEST_REPO="+dir, "WIKORY_TEST_RUN="+run)
+	out, err := cmd.CombinedOutput()
+	// Only a real kill counts: a helper that never started, exited by itself or died by another
+	// signal would leave a finish that was never interrupted, and the rerun would trivially pass.
+	if !diedByTheKill(err) {
+		t.Fatalf("step %s: the helper was not killed (%v): %s", step, err, out)
+	}
+	got, rerr := os.ReadFile(marker)
+	if rerr != nil {
+		t.Fatalf("step %s: the helper died but left no kill marker, so it was not killed at that step (%v): %s", step, rerr, out)
+	}
+	if string(got) != step {
+		t.Fatalf("step %s: the helper died at %q, not at the named step: %s", step, got, out)
 	}
 }
 

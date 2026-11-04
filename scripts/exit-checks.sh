@@ -68,7 +68,8 @@ check "human-edited pages never replaced (plan)" 'TestPlanOpsCreatesUnchangedAnd
 check "human-edited pages never replaced (finish)" 'TestFinishNeverOverwritesAHumanEditedPage' ./internal/app/
 check "coverage names skips, never text"        'TestCoverageReportsReadSkippedSecretsAndRetirement|TestCoverageNeverContainsSecretTextOrClaimText' ./internal/bootstrap/
 check "finish: complete, current, searchable"   'TestFinishPublishesPagesAndTheyAreSearchable|TestFinishRefusesWhenTheRepositoryMovedSinceThePlan' ./internal/app/
-check "finish survives a real process kill"     'TestFinishSurvivesAProcessKillAtEveryBoundary' ./internal/app/
+check "finish survives a real process kill"     'TestFinishSurvivesAProcessKillAtEveryBoundary|TestKillClassifierAcceptsOnlyARealSIGKILL' ./internal/app/
+check "kill inside a replace leaves no residue" 'TestASecondBootstrapFinishSurvivesAKillInsideAReplaceOfAnEarlierPage' ./internal/app/
 check "cost gate needs the plan hash"           'TestConfirmNeedsTheExactPlanHash|TestASampledRunNeedsTheSampleConfirmationFirst' ./internal/app/
 check "the sample is measured"                  'TestMeasureReportsDurationTokensAcceptanceAndAProjection' ./internal/bootstrap/
 check "plan prints no secret and refuses dirt"  'TestBootstrapPlanNeverPrintsSecretText|TestBootstrapPlanRefusesAFeatureBranchAndADirtyTree' ./internal/app/

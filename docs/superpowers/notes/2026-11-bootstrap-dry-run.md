@@ -24,6 +24,16 @@ The clone was of `main` (stages 0 and 1a), with `origin/HEAD` pointed at `main` 
 
 Token figures are estimates (bytes divided by four), labelled as such in the output, and not yet measured. The plan hash was the same on a second `plan` run (`--json`), which made a new run id: the hash depends on what would be done, not on the run.
 
+### Why 200,696 input tokens and not the plan's about 189k
+
+The plan's reference run printed about 189k extract input tokens; this run printed 200,696 (11.7k more, about 6%). The cause is unexplained, but these causes are ruled out:
+
+- The figure is `bytes / 4 + 400` per item, from the sizes of queued sources and of each inspected component's files (a digest is capped at 60 KiB). It does not depend on digest framing, on the work files or on the scanner, so the review fixes to digest framing and hostile-name skips cannot move it.
+- `plan` was re-run on the same clone of `main` with a binary built from each of the 28 commits from `cc981fb` (the first with a `plan` command) to `abdee5e`. All 28 print 200,696 input tokens, 97 extract items, 288 queued sources and 16 skipped for secret, so no later inventory or review change moved the figure.
+- `main` has not moved since 2026-11-02, so the repository input is the same.
+
+What remains is that the reference came from a scratch copy taken while the plan was being written, before the estimate code existed (`6d29cbc`), and that copy cannot be reproduced. Treat 189k as an unreproduced reference and 200,696 as the figure for this tree.
+
 The plan said, as it must: "Nothing has been sent to a model. A person must say yes before any paid step."
 
 ## Checks the brief names
@@ -63,7 +73,7 @@ The plan said, as it must: "Nothing has been sent to a model. A person must say 
 
 ## What was skipped for secret-shaped text, and why it deserves a look
 
-Sixteen files were skipped as `secret`, which matches the reference run in the plan (16). Ten are expected: seven documents that quote secret-shaped fixtures (six spike results and `docs/verified-capabilities.md`), and three source files that define or exercise the redaction patterns (`internal/redact/redact.go`, `internal/redact/redact_test.go`, `internal/capture/capture_test.go`). The other six hold no secret at all. The detector is shape-based (Known limit 17 in the plan), and these lines match the assignment shape because a name contains "token":
+Sixteen files were skipped as `secret`, which matches the reference run in the plan (16). Ten are expected: seven documents that quote secret-shaped fixtures (six spike results and `docs/verified-capabilities.md`), and three source files that define or exercise the redaction patterns (`internal/redact/redact.go`, `internal/redact/redact_test.go`, `internal/capture/capture_test.go`). In the other six, only the line that matched was inspected, and in each it is ordinary code; the rest of those files was not read for secrets, so this is a judgement about the matching line, not a clean bill for the file. The detector is shape-based (Known limit 17 in the plan), and these lines match the assignment shape because a name contains "token":
 
 | File | Line | Shape that matched (the line is ordinary code) |
 |---|---|---|
@@ -74,7 +84,11 @@ Sixteen files were skipped as `secret`, which matches the reference run in the p
 | `internal/publish/publish.go` | 600 | `token := []byte("job=" + m.JobID)` |
 | `internal/spikes/fts5_spike_test.go` | 40 | `... fts5(title, body, tokenize='unicode61')` |
 
-This is safe (a skipped file is never read by a model and the coverage report lists it) but it costs coverage: the `internal/store`, `internal/app` and `internal/publish` components lose core files (`schema.go`, `project.go`, `init_cmd.go`, `briefing.go`, `publish.go`) from their digests and from extraction, so a real bootstrap of this repository would know less about them than the component ranking suggests. Nothing was changed here; this is a finding for Terry to rule on (for example, treating a name that merely contains "token" as a secret key only when the value looks like one).
+This is safe (a skipped file is never read by a model and the coverage report lists it) but it costs coverage: the `internal/store`, `internal/app` and `internal/publish` components lose core files (`schema.go`, `project.go`, `init_cmd.go`, `briefing.go`, `publish.go`) from their digests and from extraction, so a real bootstrap of this repository would know less about them than the component ranking suggests. The class is wider than these six: identifier values such as `max_tokens`, `tokenizer` and `BudgetTokens` match the assignment rule, the whole file is skipped as secret (fail closed), and the coverage report lists them as `skipped:secret` with no marker for false positives, so expect it on any codebase that handles LLM tokens (Known limit 21 in the plan). Nothing was changed here; this is a finding for Terry to rule on (for example, treating a name that merely contains "token" as a secret key only when the value looks like one).
+
+## Windows
+
+The Windows leg of the kill test (`internal/app/bootstrap_kill_windows_test.go`, a kill is `os.Exit(77)`) has been compiled and vetted only (`GOOS=windows go vet ./internal/app/` and `go test -c`); it has not been run. A Windows failure of the kill tests would first show in the `windows-latest` job of CI.
 
 ## Not done
 
