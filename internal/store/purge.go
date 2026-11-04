@@ -47,6 +47,7 @@ func (s *Store) purgeCheckoutFiles(oldIDs []string) {
 	var failed []string
 	for _, id := range oldIDs {
 		s.removeTree("turns/"+id, &failed)
+		s.removeTree("bootstrap/"+id, &failed)
 	}
 	jobs, err := s.Root.ReadDir("jobs")
 	if err != nil {

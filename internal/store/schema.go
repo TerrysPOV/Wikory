@@ -49,4 +49,40 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
   title, heading, claim, body, search_text,
   checkout_id UNINDEXED, relpath UNINDEXED, ordinal UNINDEXED,
   tokenize = 'unicode61');
+CREATE TABLE IF NOT EXISTS bs_runs(
+  run_id TEXT PRIMARY KEY, checkout_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('planned','sampling','awaiting-confirm','running','finishing','done','abandoned')),
+  plan_hash TEXT NOT NULL, scope TEXT NOT NULL, head_commit TEXT NOT NULL,
+  sample INTEGER NOT NULL DEFAULT 0, end_marker TEXT NOT NULL DEFAULT '',
+  accepted INTEGER NOT NULL DEFAULT 0, rejected INTEGER NOT NULL DEFAULT 0, roots TEXT NOT NULL DEFAULT '',
+  tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0,
+  sample_in INTEGER NOT NULL DEFAULT 0, sample_out INTEGER NOT NULL DEFAULT 0,
+  sample_acc INTEGER NOT NULL DEFAULT 0, sample_rej INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS bs_runs_by_checkout ON bs_runs(checkout_id, state);
+CREATE TABLE IF NOT EXISTS bs_sources(
+  run_id TEXT NOT NULL, checkout_id TEXT NOT NULL, source TEXT NOT NULL, path TEXT NOT NULL,
+  oid TEXT NOT NULL, tier TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL,
+  disposition TEXT NOT NULL, secret_spans INTEGER NOT NULL DEFAULT 0, secret_lines TEXT NOT NULL DEFAULT '',
+  src_date TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(run_id, source, path));
+CREATE TABLE IF NOT EXISTS bs_components(
+  run_id TEXT NOT NULL, checkout_id TEXT NOT NULL, name TEXT NOT NULL, prefix TEXT NOT NULL,
+  score REAL NOT NULL, rank INTEGER NOT NULL, inspected INTEGER NOT NULL,
+  PRIMARY KEY(run_id, name));
+CREATE TABLE IF NOT EXISTS bs_items(
+  item_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, checkout_id TEXT NOT NULL,
+  stage TEXT NOT NULL CHECK(stage IN ('extract','verify')), ref TEXT NOT NULL, input_hash TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('pending','leased','done','rejected')),
+  epoch INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, sampled INTEGER NOT NULL DEFAULT 0,
+  batch TEXT NOT NULL DEFAULT '', leased_at TEXT NOT NULL DEFAULT '', done_at TEXT NOT NULL DEFAULT '', UNIQUE(run_id, stage, ref));
+CREATE INDEX IF NOT EXISTS bs_items_by_run ON bs_items(run_id, stage, state);
+CREATE TABLE IF NOT EXISTS bs_claims(
+  run_id TEXT NOT NULL, checkout_id TEXT NOT NULL, item_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+  claim_id TEXT NOT NULL, text TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,
+  meta TEXT NOT NULL, tier TEXT NOT NULL, contra TEXT NOT NULL DEFAULT '', loc TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(run_id, item_id, ordinal));
+CREATE TABLE IF NOT EXISTS bs_pages(
+  checkout_id TEXT NOT NULL, path TEXT NOT NULL, hash TEXT NOT NULL, run_id TEXT NOT NULL,
+  PRIMARY KEY(checkout_id, path));
 `
