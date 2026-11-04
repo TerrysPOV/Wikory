@@ -136,7 +136,7 @@ func Submit(ctx context.Context, in SubmitInput) (SubmitReport, error) {
 	if it.State != "leased" || it.Epoch != in.P.Epoch || it.Batch != in.Batch {
 		return rep, ErrStaleLease
 	}
-	work, err := in.Work.Read(it.InputHash, MaxFileBytes+(64<<10))
+	work, err := in.Work.Read(it.InputHash, WorkReadMax)
 	if err != nil {
 		return rep, err
 	}

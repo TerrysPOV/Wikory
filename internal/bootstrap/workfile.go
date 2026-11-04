@@ -11,6 +11,13 @@ import (
 
 var workName = regexp.MustCompile(`^[0-9a-f]{8,64}$`)
 
+// WorkReadMax bounds every read of a work file. A source's work file is at most MaxFileBytes
+// before redaction and a marker can be longer than what it replaces, so it gets 64 KiB of
+// headroom; a component digest is at most DigestMaxBytes, header lines and omitted list included
+// (BuildDigest guarantees it). The limit is the larger of the two, so no work file Wikory wrote
+// can be refused as too large when a subagent's answer for it comes back.
+const WorkReadMax = max(MaxFileBytes+64<<10, DigestMaxBytes)
+
 // WorkFiles stores the redacted text a subagent reads. Files live in the private store under
 // bootstrap/<checkout id>/work/, so a clone rebind purges them, and are named by the hash of
 // their input so an unchanged source reuses its file.

@@ -44,7 +44,7 @@ func ExtractSpecs(res Result) []ItemSpec {
 		var total int64
 		parts := make([]string, 0, len(files[c.Prefix]))
 		for _, f := range files[c.Prefix] {
-			total += f.Size
+			total += f.Size + int64(headerBytes(f.Path))
 			parts = append(parts, f.Path+":"+f.Hash)
 		}
 		sort.Strings(parts)

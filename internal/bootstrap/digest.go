@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -48,6 +49,19 @@ func headerLine(f DigestFile) string {
 	return headerPrefix + f.Path + " " + short(f.Hash) + headerSuffix
 }
 
+// headerBytes is what a file's header line costs in a digest, newline included, when its hash is
+// a full content hash (12 characters are shown). The estimator uses it so the digest it sizes
+// is the digest BuildDigest writes.
+func headerBytes(path string) int {
+	return len(headerPrefix) + len(path) + 1 + 12 + len(headerSuffix) + 1
+}
+
+// omittedReserve is the room kept for the omitted mark and the "and K more" line, so the list of
+// left-out paths can never push a digest past its budget, however many files were left out.
+const omittedReserve = len(omittedMark) + 1 + len("=== and 9223372036854775807 more ===\n")
+
+func moreLine(k int) string { return "=== and " + strconv.Itoa(k) + " more ===\n" }
+
 // frame keeps file text from posing as digest structure. Line endings become LF, so the digest's
 // lines are the lines every other check counts, and a line that starts like a header or the
 // omitted marker gets a leading space. After framing no line of any file begins where a header
@@ -70,28 +84,61 @@ func frame(s string) string {
 // holds a control character is never written: it is left out and listed by its visiblePath, so
 // neither a header nor the omitted list can be forged from a file name. The caller redacts
 // each file's text before calling (see WorkFiles.WriteDigest); BuildDigest redacts nothing.
+//
+// The whole digest, header lines and the omitted list included, is at most max bytes (for any
+// max of at least omittedReserve). When anything is left out, omittedReserve bytes are kept for
+// the omitted mark and an "and K more" line, and the list names as many left-out paths as the
+// remaining room holds. The returned slice still lists every path left out.
 func BuildDigest(files []DigestFile, max int) (string, []string) {
-	var b strings.Builder
-	var omitted []string
-	used := 0
-	for _, f := range files {
+	type part struct{ head, body string }
+	parts := make([]part, len(files))
+	need, unwritable := 0, false
+	for i, f := range files {
 		if hasControl(f.Path) {
-			omitted = append(omitted, visiblePath(f.Path))
+			unwritable = true
 			continue
 		}
 		body := frame(f.Text)
 		if !strings.HasSuffix(body, "\n") {
 			body += "\n"
 		}
-		if used+len(body) > max {
+		parts[i] = part{headerLine(f) + "\n", body}
+		need += len(parts[i].head) + len(body)
+	}
+	budget := max
+	if unwritable || need > max {
+		budget = max - omittedReserve
+	}
+	var b strings.Builder
+	var omitted []string
+	used := 0
+	for i, f := range files {
+		if parts[i].head == "" {
+			omitted = append(omitted, visiblePath(f.Path))
+			continue
+		}
+		n := len(parts[i].head) + len(parts[i].body)
+		if used+n > budget {
 			omitted = append(omitted, f.Path)
 			continue
 		}
-		used += len(body)
-		b.WriteString(headerLine(f) + "\n" + body)
+		used += n
+		b.WriteString(parts[i].head + parts[i].body)
 	}
 	if len(omitted) > 0 {
-		b.WriteString(omittedMark + "\n" + strings.Join(omitted, "\n") + "\n")
+		b.WriteString(omittedMark + "\n")
+		room, listed := max-used-omittedReserve, 0
+		for _, p := range omitted {
+			if len(p)+1 > room {
+				break
+			}
+			b.WriteString(p + "\n")
+			room -= len(p) + 1
+			listed++
+		}
+		if listed < len(omitted) {
+			b.WriteString(moreLine(len(omitted) - listed))
+		}
 	}
 	return b.String(), omitted
 }

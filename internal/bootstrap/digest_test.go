@@ -41,7 +41,7 @@ func TestBuildDigestHonoursTheBudgetAndListsWhatItLeftOut(t *testing.T) {
 		{Path: "two.go", Hash: "bbbbbbbbbbbbbbbb", Text: big},
 		{Path: "tiny.go", Hash: "cccccccccccccccc", Text: "x\n"},
 	}
-	text, omitted := BuildDigest(files, 500)
+	text, omitted := BuildDigest(files, 600)
 	if len(omitted) != 1 || omitted[0] != "two.go" {
 		t.Fatalf("two.go does not fit and tiny.go does: omitted = %v", omitted)
 	}

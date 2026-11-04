@@ -71,7 +71,8 @@ func TestEstimateStagesCountsItemsAndTokens(t *testing.T) {
 	if est[0].Items != 3 || est[1].Items != 1 {
 		t.Fatalf("items: extract 3 (2 docs and 1 digest), verify 1 (one inspected component): %+v", est)
 	}
-	wantIn := (4000/bytesPerToken + promptOverheadTokens) + (8000/bytesPerToken + promptOverheadTokens) + (20000/bytesPerToken + promptOverheadTokens)
+	digest := 20000 + headerBytes("internal/queue/queue.go") // a digest's bytes include its header lines
+	wantIn := (4000/bytesPerToken + promptOverheadTokens) + (8000/bytesPerToken + promptOverheadTokens) + (digest/bytesPerToken + promptOverheadTokens)
 	if est[0].InputTokens != wantIn || est[0].OutputTokens != 3*extractOutPerItem {
 		t.Fatalf("extract tokens = %d/%d, want %d/%d", est[0].InputTokens, est[0].OutputTokens, wantIn, 3*extractOutPerItem)
 	}
