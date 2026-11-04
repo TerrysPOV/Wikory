@@ -88,9 +88,10 @@ func (r *Repo) Churn(ctx context.Context, since time.Time) (map[string]int, erro
 	if err != nil {
 		return nil, err
 	}
+	// With an empty format git writes nothing between commits but an empty token, so every other
+	// token is a path exactly as git stores it, a leading newline included.
 	for _, tok := range bytes.Split(out, []byte{0}) {
-		p := strings.TrimLeft(string(tok), "\n")
-		if p != "" {
+		if p := string(tok); p != "" {
 			counts[p]++
 		}
 	}
