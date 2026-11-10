@@ -102,7 +102,8 @@ func bootstrapConfirm(ctx context.Context, env *Env, args []string) (Result, err
 // scope and head the store holds, with the estimate constants the running binary has. The run's
 // work items (bs_items) are not compared: the hash covers the work list derived from the
 // sources, and the items table is advisory (architecture spec 14.4). The stored sample size is
-// passed so the rebuilt plan is the one that was shown; BuildPlan does not hash it.
+// passed and hashed (version 4), so a run whose sample size was changed after the plan was shown
+// no longer rebuilds its hash and cannot be confirmed, for its sample or its full run.
 func rebuiltPlanHash(ctx context.Context, runs *bootstrap.Runs, run bootstrap.Run) (string, error) {
 	srcs, err := runs.Sources(ctx, run.ID)
 	if err != nil {

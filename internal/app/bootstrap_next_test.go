@@ -45,8 +45,8 @@ func TestBootstrapStatusWithoutARunNamesTheLatestAndNextNeedsRun(t *testing.T) {
 	}
 }
 
-// The sample size is not in the plan hash, so the run itself must carry it: two plans of the same
-// repository that differ only in --sample have the same hash and different runs.
+// The run carries the sample size it was planned with. Since fix wave 3 (2026-11-10) the size is
+// in the plan hash as well, so two plans that differ only in --sample have different hashes.
 func TestBootstrapPlanBindsTheSampleSizeToTheRun(t *testing.T) {
 	dir, c := bootstrapRepo(t)
 	type statusRun struct {
@@ -59,8 +59,8 @@ func TestBootstrapPlanBindsTheSampleSizeToTheRun(t *testing.T) {
 	full, _, _ := runBootstrapJSON(t, c, dir, "plan")
 	sampled, _, _ := runBootstrapJSON(t, c, dir, "plan", "--sample", "2")
 	df, ds := decodeData[planData](t, full), decodeData[planData](t, sampled)
-	if df.PlanHash != ds.PlanHash {
-		t.Fatalf("precondition: --sample is outside the plan hash: %s %s", df.PlanHash, ds.PlanHash)
+	if df.PlanHash == ds.PlanHash {
+		t.Fatalf("--sample is part of the plan hash: %s %s", df.PlanHash, ds.PlanHash)
 	}
 	for _, tc := range []struct {
 		d    planData

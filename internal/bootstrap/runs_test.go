@@ -80,13 +80,14 @@ func TestCreatePersistsTheRunItsSourcesComponentsAndItems(t *testing.T) {
 	}
 }
 
-// The sample size is not part of the plan hash, so the hash cannot be what binds a run to the
-// sample it was planned with: the run must store it, and its sampled items are fixed at Create.
+// The run stores the sample size it was planned with, and its sampled items are fixed at Create.
+// Since fix wave 3 the size is in the plan hash too, so confirm can check the stored size against
+// the hash.
 func TestTheRunStoresTheSampleSizeAndFixesItsSampledItemsAtCreate(t *testing.T) {
 	ctx := context.Background()
 	r, s, _, _ := newTestRuns(t)
-	if planWith(0).Hash != planWith(3).Hash {
-		t.Fatal("precondition: the sample size is outside the plan hash, which is why the run must store it")
+	if planWith(0).Hash == planWith(3).Hash {
+		t.Fatal("the sample size is in the plan hash (version 4)")
 	}
 	for _, want := range []int{0, 3} {
 		run, err := r.Create(ctx, planWith(want), specsN(9))

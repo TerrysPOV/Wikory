@@ -4,7 +4,7 @@ import "testing"
 
 // The sample's cost is shown apart from the full run's: its sampled extract items at their own
 // sizes, and one verify item per sampled item, up to the plan's verify item count. The sample
-// size is not in the plan hash, so neither is this figure.
+// size and this figure are in the plan hash (version 4, fix wave 3).
 func TestSampleEstimatesCoverTheSampledExtractItemsAndTheirVerification(t *testing.T) {
 	res := sampleResult()
 	specs := ExtractSpecs(res) // the doc (4000 bytes), the README (8000), the queue digest
@@ -26,7 +26,7 @@ func TestSampleEstimatesCoverTheSampledExtractItemsAndTheirVerification(t *testi
 	if SampleEstimates(res, 0) != nil {
 		t.Fatal("no sample, no sample figure")
 	}
-	if BuildPlan(res, "repo", "h", 0).Hash != BuildPlan(res, "repo", "h", 3).Hash {
-		t.Fatal("the sample size, and so the sample's figure, is not in the plan hash")
+	if BuildPlan(res, "repo", "h", 0).Hash == BuildPlan(res, "repo", "h", 3).Hash {
+		t.Fatal("the sample size, and so the sample's figure, is in the plan hash")
 	}
 }

@@ -144,8 +144,9 @@ type hashComponent struct {
 
 // BuildPlan assembles the plan and its hash. The hash is built from the work and the numbers
 // Terry approves, not only from the inputs, so a change to anything that would change what is
-// done or what it is said to cost changes the hash. See planHash. It does not cover the sample
-// size or the Roots.
+// done or what it is said to cost changes the hash. See planHash. It covers the sample size
+// (version 4, fix wave 3), and so the sample's own figure, which is derived from the hashed plan
+// and that size; it does not cover the Roots.
 func BuildPlan(res Result, scope, head string, sample int) Plan {
 	est := EstimateStages(res)
 	p := Plan{Scope: scope, Head: head, Sample: sample, Result: res, Estimates: est}
@@ -159,7 +160,10 @@ func BuildPlan(res Result, scope, head string, sample int) Plan {
 // planHash hashes the plan's inputs (scope, HEAD, weights, limits, every source's content hash,
 // tier and disposition, the component ranking) together with what they produce: the ordered
 // extract work list and the estimates and batch count Terry sees. A changed estimate constant
-// or tier classifier therefore changes the hash even when the inputs do not.
+// or tier classifier therefore changes the hash even when the inputs do not. The sample size
+// is hashed too (version 4): the sample is paid work, so a yes to a
+// plan is a yes to its sample, and a run whose stored sample size changed no longer rebuilds
+// the hash it was planned under.
 //
 // Only what is identical for the same repository state on another machine is hashed: the
 // records of other branches and worktrees (local branch names, how far ahead they are, the
@@ -176,7 +180,8 @@ func planHash(p Plan) string {
 		Work       []ItemSpec
 		Estimates  []Estimate
 		Batches    int
-	}{V: 3, Scope: p.Scope, Head: p.Head,
+		Sample     int
+	}{V: 4, Scope: p.Scope, Head: p.Head, Sample: p.Sample,
 		Weights:   [4]float64{WeightChurn, WeightDocRef, WeightHandoff, WeightEntry},
 		Constants: [4]int{BatchSize, DigestMaxBytes, InspectBudget, CapChurn},
 		Work:      ExtractSpecs(p.Result), Estimates: p.Estimates, Batches: p.Batches}

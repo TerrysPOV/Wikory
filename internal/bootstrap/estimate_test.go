@@ -80,9 +80,13 @@ func TestEstimateStagesCountsItemsAndTokens(t *testing.T) {
 
 func TestPlanHashIsStableAndSensitive(t *testing.T) {
 	a := BuildPlan(sampleResult(), "repo", "abc123", 0)
-	b := BuildPlan(sampleResult(), "repo", "abc123", 5)
+	b := BuildPlan(sampleResult(), "repo", "abc123", 0)
 	if a.Hash == "" || a.Hash != b.Hash {
-		t.Fatalf("the hash is of the full plan, so --sample does not change it: %q vs %q", a.Hash, b.Hash)
+		t.Fatalf("the same plan hashes the same: %q vs %q", a.Hash, b.Hash)
+	}
+	// Fix wave 3 (2026-11-10): the sample size is hashed (version 4), so --sample changes it.
+	if BuildPlan(sampleResult(), "repo", "abc123", 5).Hash == a.Hash {
+		t.Fatal("--sample is part of the plan, so it changes the hash")
 	}
 	mut := sampleResult()
 	mut.Sources[1].Hash = "other"
