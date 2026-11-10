@@ -174,4 +174,7 @@ check "the sample through the CLI" 'TestASampleVerifiesItsClaimsAndFinishReports
 check "a correction is tied to the cited code" 'TestABoundedCorrectionWithAQuoteFromTheCitedLinesIsAccepted|TestACorrectionThatIsNotTiedToTheCitedCodeIsRefused|TestAQuoteMustSitInsideOneCitedRange|TestTheVerifyWorkFileOpensWithTheUntrustedDataPreamble' ./internal/bootstrap/
 check "the verifier is told what it may read" 'TestVerifierPromptTreatsClaimsAsUntrustedAndLimitsWhatItReads' ./internal/app/
 check "structured data under memory/ is implementation" 'TestStructuredDataUnderMemoryIsImplementationAndItsNeighboursStayNotes' ./internal/bootstrap/
+# Fix wave 3 (2026-11-10): the sample size is in the plan hash (version 4).
+check "the plan hash covers the sample size" 'TestThePlanHashCoversTheSampleSize|TestTheRunStoresTheSampleSizeAndFixesItsSampledItemsAtCreate' ./internal/bootstrap/
+check "a sample starts only under its own hash" 'TestASampleStartsOnlyUnderTheHashOfItsOwnSampleSize|TestBootstrapPlanBindsTheSampleSizeToTheRun|TestConfirmSampleNeedsTheExactPlanHash' ./internal/app/
 exit $fail
