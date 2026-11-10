@@ -168,4 +168,10 @@ check "the command can resume a run" 'TestStatusJSONGivesTheCommandWhatItNeedsTo
 check "claim text and names render inert" 'TestCheckTextRefusesLinkAndImageMarkup|TestAComponentNameShapedLikeALinkRendersInert|TestSeparatorsAndBidiOverridesInANameMakeItABadName|TestInventoryRecordsUnconfinableNamesAsBadNames|TestNextRefusalSaysWhatToDoInEachState' ./internal/bootstrap/
 check "contradiction keeps the original's meta" 'TestAContradictionChangesOnlyTheOriginalsStatusAndLink' ./internal/bootstrap/
 check "sources, branch and HEAD at plan and after" 'TestPlanRefusesASourceInsideProjectMemoryAndWarnsForOneInsideTheRepository|TestPlanShowsEverySourceDirectory|TestFinishRefusesAnotherBranchAtTheSameCommit|TestSubmitRefusesARunWhoseRepositoryMoved|TestTheUnindexedNoticeIsSanitisedAndBounded' ./internal/app/
+# Fix wave 2 (2026-11-10): Terry's rulings on the sample, the verifier's correction and the memory tier.
+check "the sample runs extract and verify, publishes nothing" 'TestASampleVerifiesItsClaimsBeforeItSettles|TestASampleWithNothingToVerifySettlesWhenVerifyIsPrepared|TestASampleVerifiesOnceItsOwnExtractionIsClosed|TestSampleEstimatesCoverTheSampledExtractItemsAndTheirVerification' ./internal/bootstrap/
+check "the sample through the CLI" 'TestASampleVerifiesItsClaimsAndFinishReportsItWithoutPublishing|TestPlanShowsTheSampleCostApartFromTheFullRun|TestASampledRunReachesTheFullRunAndTheSampleFiguresStayFrozen' ./internal/app/
+check "a correction is tied to the cited code" 'TestABoundedCorrectionWithAQuoteFromTheCitedLinesIsAccepted|TestACorrectionThatIsNotTiedToTheCitedCodeIsRefused|TestAQuoteMustSitInsideOneCitedRange|TestTheVerifyWorkFileOpensWithTheUntrustedDataPreamble' ./internal/bootstrap/
+check "the verifier is told what it may read" 'TestVerifierPromptTreatsClaimsAsUntrustedAndLimitsWhatItReads' ./internal/app/
+check "structured data under memory/ is implementation" 'TestStructuredDataUnderMemoryIsImplementationAndItsNeighboursStayNotes' ./internal/bootstrap/
 exit $fail
