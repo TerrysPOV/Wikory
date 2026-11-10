@@ -277,6 +277,7 @@ func PrepareVerify(ctx context.Context, runs *Runs, w WorkFiles, runID string) (
 	for _, c := range verifyTargets(comps, assigned, files) {
 		related := assigned[c.Prefix]
 		var b strings.Builder
+		b.WriteString(VerifyPreamble)
 		fmt.Fprintf(&b, "COMPONENT %s\nFILES\n", c.Prefix)
 		for _, f := range files[c.Prefix] {
 			b.WriteString(f.Path + "\n")
