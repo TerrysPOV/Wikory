@@ -47,6 +47,21 @@ The same procedure was repeated on a fresh throwaway clone of `main` (`769110d`)
 
 A second `plan` gave the same hash. `plan` took 4.8 s. No secret text appeared (`rg -c 'hunter|AKIA|BEGIN'` over stdout and stderr: no match).
 
+### Rerun after fix wave 2 (2026-11-10)
+
+Same procedure, plan only (`plan --sample 5`), with a scratch data directory and throwaway clones of `main` at `b85a13d`, all removed afterwards. To compare like for like, the binary from `f85da2a` (old) and the one from this branch after fix wave 2 (new) planned the same clone commit; the new binary used a copy of the old one's data directory, since a second `init` in one clone would find `project-memory/` and leave the checkout untrusted.
+
+| Measure | Old | New | Why |
+|---|---|---|---|
+| Sources, components, inspected | 288 queued, 23, 12 | the same | nothing in the inventory changed |
+| Extract stage | 97 items, 201,929 in, 67,900 out | the same | |
+| Verify stage | 12 items, 72,000 in, 9,600 out | the same | |
+| Batches | 15 | 15 | |
+| Sample figure | none | extract 5 items, 2,813 in, 3,500 out; verify 5 items, 30,000 in, 4,000 out | the sample now runs verification, and its own figure is shown apart from the full run's |
+| Plan hash (same commit) | `59b1bfc200dd39ca6e8926bf3ac5f928417a34a99379f4e8b8321784b7107521` | the same | no hashed input changed: the sample size and its figure are not hashed, so the hash version stays 3 |
+
+The hash differs from the earlier `84522dfb...` only because each throwaway clone makes its own `wikory init` commit, so HEAD differs; a second `plan` on each clone gave the same hash. No secret text appeared (`rg -c 'hunter|AKIA|BEGIN'` over stdout and stderr: no match).
+
 ## Checks the brief names
 
 - `Components` includes `internal/store` (rank 4), `internal/app` (rank 2), `plugins` (rank 14, not inspected) and `scripts` (rank 8).

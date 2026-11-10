@@ -87,6 +87,12 @@ Fix `NewProgress` so TTY is detected from the `os.File` mode (no new dependency)
 3. **Source text routing: agreed as recommended.** Subagents read redacted work files on disk, not text pasted into prompts.
 4. **Pilot spend: noted.** Planning is free. The sample and full run are paid, and neither runs without Terry's cost go-ahead and the token maths in front of him first.
 
+### Rulings (Terry, 2026-11-10)
+
+5. **Sample scope: the whole paid pipeline, no publish.** `--sample N` runs extraction on N items and verification of the claims they yield (4.5 as written), shows its cost apart from the full run's, and publishes nothing; `finish` on a sample reports it.
+6. **A verifier's correction is tied to the cited code.** A contradiction carries a `quote` found verbatim inside one cited range, the correction must be a bounded edit of the claim (at least half its words) and may name no path, URL or identifier the cited lines do not contain. The verifier is told to read only its work file and the component's files; the binary cannot enforce that, and checks the answer instead.
+7. **`memory/*.json` and `*.yaml` are the implementation tier.** Only prose under a memory directory is a note. An explicit `--source` pulls such a file in as a note.
+
 ## 6. Out of scope
 
 Session transcripts (`--include-transcripts` stays sampled-only and is not built in stage 2), the headless worker (8.6) as a driver, MCP, `wikory trust` (stage 1d), the Codex adapter, time-travel bootstrap for the benchmark, retention and backup.
