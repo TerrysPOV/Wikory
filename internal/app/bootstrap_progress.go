@@ -21,11 +21,10 @@ func newBootstrapProgress(env *Env) *Progress {
 }
 
 // verifyPrepDue reports whether the next PrepareVerify will do real work, and for how many
-// components. It mirrors PrepareVerify's own conditions; if they drift apart the only effect is
-// a progress line shown or not shown.
+// components. It asks bootstrap.VerifyPrepDue, which is PrepareVerify's own test, for a sample's
+// verify stage and the full run's alike.
 func verifyPrepDue(ctx context.Context, runs *bootstrap.Runs, runID string) (bool, int) {
-	st, err := runs.Status(ctx, runID)
-	if err != nil || st.Run.State != bootstrap.StateRunning || len(st.Items["verify"]) > 0 || st.Items["extract"]["pending"]+st.Items["extract"]["leased"] > 0 {
+	if due, err := bootstrap.VerifyPrepDue(ctx, runs, runID); err != nil || !due {
 		return false, 0
 	}
 	comps, err := runs.Components(ctx, runID)

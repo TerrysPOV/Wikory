@@ -36,7 +36,7 @@ func TestEnqueueVerifyInsertsNothingIntoARunThatIsNotRunning(t *testing.T) {
 			t.Fatal(err)
 		}
 		spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: ids.SHA256Hex([]byte("late"))}
-		if _, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil {
+		if _, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}, false); err != nil {
 			t.Fatalf("%s: a late enqueue is not an error, it simply adds nothing: %v", state, err)
 		}
 		if n := verifyItems(t, r, run.ID); n != 0 {
@@ -46,7 +46,7 @@ func TestEnqueueVerifyInsertsNothingIntoARunThatIsNotRunning(t *testing.T) {
 	// The same call on a running run still queues the item.
 	r, _, run := extractedRig(t)
 	spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: ids.SHA256Hex([]byte("on time"))}
-	if _, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil || verifyItems(t, r, run.ID) != 1 {
+	if _, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}, false); err != nil || verifyItems(t, r, run.ID) != 1 {
 		t.Fatalf("a running run takes the item: %v", err)
 	}
 }
@@ -56,17 +56,17 @@ func TestEnqueueVerifyReportsHowManyItemsItQueued(t *testing.T) {
 	ctx := context.Background()
 	r, _, run := extractedRig(t)
 	spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: ids.SHA256Hex([]byte("x"))}
-	if n, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil || n != 1 {
+	if n, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}, false); err != nil || n != 1 {
 		t.Fatalf("%d %v", n, err)
 	}
-	if n, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil || n != 0 {
+	if n, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}, false); err != nil || n != 0 {
 		t.Fatalf("a component that already has an item adds nothing: %d %v", n, err)
 	}
 	if err := r.Transition(ctx, run.ID, StateFinishing, StateRunning); err != nil {
 		t.Fatal(err)
 	}
 	other := ItemSpec{Stage: "verify", Ref: "comp:internal/other", InputHash: ids.SHA256Hex([]byte("y"))}
-	if n, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{other}); err != nil || n != 0 {
+	if n, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{other}, false); err != nil || n != 0 {
 		t.Fatalf("a finishing run takes nothing: %d %v", n, err)
 	}
 }

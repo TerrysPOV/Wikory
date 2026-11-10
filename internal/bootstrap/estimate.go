@@ -90,6 +90,12 @@ func EstimateStages(res Result) []Estimate {
 	for _, s := range specs {
 		ex.InputTokens += int(s.Bytes)/bytesPerToken + promptOverheadTokens
 	}
+	return []Estimate{ex, verifyEstimate(verifyEstimateItems(res))}
+}
+
+// verifyEstimateItems is how many verify items a full run is estimated to need: one per inspected
+// component with files to read.
+func verifyEstimateItems(res Result) int {
 	n := 0
 	files := ComponentFiles(res)
 	for _, c := range res.Components {
@@ -97,7 +103,12 @@ func EstimateStages(res Result) []Estimate {
 			n++
 		}
 	}
-	return []Estimate{ex, {Stage: "verify", Items: n, InputTokens: n * verifyInTokens, OutputTokens: n * verifyOutTokens}}
+	return n
+}
+
+// verifyEstimate sizes n verify items with the fixed per-item constants.
+func verifyEstimate(n int) Estimate {
+	return Estimate{Stage: "verify", Items: n, InputTokens: n * verifyInTokens, OutputTokens: n * verifyOutTokens}
 }
 
 // CountInspected is how many components were chosen for inspection. (The verify estimate counts

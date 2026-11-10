@@ -28,6 +28,9 @@ type planReport struct {
 	Inspected  int                  `json:"inspected"`
 	Batches    int                  `json:"batches"`
 	Estimates  []bootstrap.Estimate `json:"estimates"`
+	// SampleEstimates is what a run planned with --sample N is estimated to cost before the full
+	// run: its sampled extract items and their verification. Absent without a sample.
+	SampleEstimates []bootstrap.Estimate `json:"sample_estimates,omitempty"`
 	// Roots is each --source name and the directory it reads, so the person's yes covers which
 	// directories outside the repository are read.
 	Roots map[string]string `json:"roots"`
@@ -145,7 +148,8 @@ func bootstrapPlan(ctx context.Context, env *Env, args []string) (Result, error)
 		return Result{}, err
 	}
 	rep := planReport{RunID: run.ID, PlanHash: plan.Hash, Scope: plan.Scope, Head: head, Sample: sample,
-		Sources: map[string]int{}, Components: len(res.Components), Batches: plan.Batches, Estimates: plan.Estimates, Roots: roots}
+		Sources: map[string]int{}, Components: len(res.Components), Batches: plan.Batches, Estimates: plan.Estimates, Roots: roots,
+		SampleEstimates: bootstrap.SampleEstimates(res, sample)}
 	for _, s := range res.Sources {
 		rep.Sources[s.Disposition]++
 	}
@@ -264,11 +268,18 @@ func planText(r planReport) string {
 		fmt.Fprintf(&b, "  %-8s %4d items, about %d input and %d output tokens (estimate, bytes/4; not yet measured)\n", e.Stage, e.Items, e.InputTokens, e.OutputTokens)
 	}
 	fmt.Fprintf(&b, "Batches: %d\n", r.Batches)
+	if len(r.SampleEstimates) > 0 {
+		fmt.Fprintf(&b, "Sample of %d extract item(s), run through extraction and the verification of the claims they yield; it publishes nothing:\n", r.Sample)
+		for _, e := range r.SampleEstimates {
+			fmt.Fprintf(&b, "  %-8s %4d items, about %d input and %d output tokens (estimate, paid before the full run)\n", e.Stage, e.Items, e.InputTokens, e.OutputTokens)
+		}
+		b.WriteString("  The full run does not extract the sampled items again; it can verify a component again when the full run gives it new claims.\n")
+	}
 	b.WriteString("No per-token price is shown: none is configured, and on a subscription plan there is none.\n")
 	fmt.Fprintf(&b, "Plan hash: %s\n", r.PlanHash)
 	b.WriteString("Nothing has been sent to a model. A person must say yes before any paid step.\n")
 	if r.Sample > 0 {
-		b.WriteString("  To sample (extraction only):  " + r.Next + "\n")
+		b.WriteString("  To sample (extract and verify, nothing published):  " + r.Next + "\n")
 		b.WriteString("  To run in full:   once the sample's measurements are in, the same command without --sample\n")
 	} else {
 		b.WriteString("  To sample first:  wikory bootstrap plan --sample N, then confirm --run RUN --plan-hash HASH --sample\n")

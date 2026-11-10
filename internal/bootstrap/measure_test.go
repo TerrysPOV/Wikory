@@ -39,7 +39,8 @@ func TestMeasureOfASampleWithNoCompletedItemHasNoProjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.SampleDone != 0 || m.TokensIn == 0 {
+	// Fix wave 2: every failed attempt's tokens are kept with its item too (2 items x 3 x 550).
+	if m.SampleDone != 0 || m.TokensIn == 0 || m.ExtractTokens != 3300 {
 		t.Fatalf("every sampled item failed, and what they spent is still shown: %+v", m)
 	}
 	if m.ProjectedTokens != nil {

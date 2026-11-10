@@ -84,8 +84,9 @@ func TestStatusShowsTheMeasuredSampleAndLabelsTokensAsAsserted(t *testing.T) {
 	if code != ExitOK || !strings.Contains(out, "asserted") || !strings.Contains(out, "sample") {
 		t.Fatalf("%s", out)
 	}
-	if !strings.Contains(out, "extraction only") || !strings.Contains(out, "verification is not sampled") {
-		t.Fatalf("the status must say the sample covers extraction only: %s", out)
+	// Fix wave 2 (2026-11-10): the sample runs extraction and verification and publishes nothing.
+	if !strings.Contains(out, "extraction and verification, nothing published") || !strings.Contains(out, "projected verification for the full run") {
+		t.Fatalf("the status must say the sample covers extraction and verification: %s", out)
 	}
 }
 
@@ -296,6 +297,11 @@ func submitLeased(t *testing.T, c *cli, dir, runID string, b leased, in, out int
 	}
 }
 
+type nextData struct {
+	Items  []struct{ Item string } `json:"items"`
+	Status string                  `json:"status"`
+}
+
 type sampleStatus struct {
 	Run struct {
 		State    string `json:"state"`
@@ -335,6 +341,12 @@ func TestASampledRunReachesTheFullRunAndTheSampleFiguresStayFrozen(t *testing.T)
 		t.Fatalf("the sample is the one item asked for: %+v", first)
 	}
 	submitLeased(t, c, dir, d.RunID, first, 1000, 100)
+	// Fix wave 2 (2026-11-10): the sample's claim names no component, so the next call finds
+	// nothing to verify and settles the sample, answering with an empty batch and the new state.
+	se, code, _ := runBootstrapJSON(t, c, dir, "next", "--run", d.RunID, "--max", "50")
+	if settledNext := decodeData[nextData](t, se); code != ExitOK || len(settledNext.Items) != 0 || !strings.Contains(settledNext.Status, " is awaiting-confirm:") {
+		t.Fatalf("the next call that settles a sample answers with no items and the settled state: %d %+v", code, settledNext)
+	}
 
 	status := func() sampleStatus {
 		t.Helper()

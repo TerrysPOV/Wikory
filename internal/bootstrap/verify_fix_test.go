@@ -148,7 +148,7 @@ func TestAVerifierNamingAnotherComponentsDecidedClaimIsToldItIsUnknown(t *testin
 		t.Fatal(err)
 	}
 	spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: ids.SHA256Hex([]byte("other"))}
-	if _, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil {
+	if _, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}, false); err != nil {
 		t.Fatal(err)
 	}
 	ob, _ := r.Next(ctx, run.ID, 5)

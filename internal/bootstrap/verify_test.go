@@ -394,7 +394,7 @@ func TestASharedClaimIsQueuedForOneVerifierAndTheOtherCannotJudgeIt(t *testing.T
 	}
 	// A verifier of the other component is not given the claim and cannot decide it.
 	spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: ids.SHA256Hex([]byte("other"))}
-	if _, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil {
+	if _, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}, false); err != nil {
 		t.Fatal(err)
 	}
 	ob, _ := r.Next(ctx, run.ID, 5)
@@ -476,7 +476,7 @@ func TestAVerifyItemIsQueuedOncePerComponent(t *testing.T) {
 	_ = r.Transition(ctx, run.ID, StateRunning, StatePlanned)
 	spec := ItemSpec{Stage: "verify", Ref: "comp:internal/queue", InputHash: "h"}
 	for i := 0; i < 2; i++ {
-		if _, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}); err != nil {
+		if _, err := r.enqueueVerify(ctx, run.ID, []ItemSpec{spec}, false); err != nil {
 			t.Fatal(err)
 		}
 	}

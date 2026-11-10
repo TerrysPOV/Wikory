@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -286,8 +285,9 @@ func (r *Runs) Transition(ctx context.Context, id, to string, from ...string) er
 }
 
 // Next leases up to max pending items. Expired leases are reclaimed first (an item that has
-// expired MaxAttempts times is rejected). A sampling run leases only sampled extract items;
-// verify items are leased only once no extract item is open. An empty batch means nothing is
+// expired MaxAttempts times is rejected). A sampling run leases only sampled items: its extract
+// items, then the verify items PrepareVerify queued for the claims they yielded. Verify items are
+// leased only once no extract item of the same scope is open. An empty batch means nothing is
 // left to lease right now.
 func (r *Runs) Next(ctx context.Context, id string, max int) (Batch, error) {
 	if max <= 0 || max > maxBatch {
@@ -315,9 +315,6 @@ func (r *Runs) Next(ctx context.Context, id string, max int) (Batch, error) {
 		}
 		stage := "extract"
 		if open == 0 {
-			if restrict == 1 {
-				return settleSample(ctx, tx, id, r.ts()) // no sampled item left to lease
-			}
 			stage = "verify"
 		}
 		rows, err := tx.QueryContext(ctx, `SELECT item_id,ref,input_hash,epoch,attempts FROM bs_items
@@ -338,6 +335,9 @@ func (r *Runs) Next(ctx context.Context, id string, max int) (Batch, error) {
 			return err
 		}
 		if len(picked) == 0 {
+			if restrict == 1 {
+				return settleSample(ctx, tx, id, r.ts()) // no sampled item left to lease
+			}
 			return nil
 		}
 		b.ID = r.NewID("bat_")
@@ -385,8 +385,9 @@ func loadItem(ctx context.Context, tx *sql.Tx, id, checkout string) (Item, error
 
 // Complete marks a leased item done. It runs fn in the same transaction, so the claims a
 // submission produces and the item's new state commit or roll back together. An item that is
-// not leased at exactly this epoch is refused with ErrStaleLease. Usage is added to the run.
-// When the last sampled item of a sampling run completes, the run moves to awaiting-confirm.
+// not leased at exactly this epoch is refused with ErrStaleLease. Usage is added to the run and
+// to the item. When the last sampled item of a sampling run completes, the run moves to
+// awaiting-confirm (see settleSample).
 func (r *Runs) Complete(ctx context.Context, itemID string, epoch int, u Usage, fn func(ctx context.Context, tx *sql.Tx, it Item) error) error {
 	return r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		it, err := loadItem(ctx, tx, itemID, r.CheckoutID)
@@ -405,7 +406,8 @@ func (r *Runs) Complete(ctx context.Context, itemID string, epoch int, u Usage, 
 			}
 		}
 		now := r.ts()
-		if _, err := tx.ExecContext(ctx, `UPDATE bs_items SET state='done', done_at=? WHERE item_id=?`, now, itemID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE bs_items SET state='done', done_at=?, tokens_in=tokens_in+?, tokens_out=tokens_out+? WHERE item_id=?`,
+			now, u.InputTokens, u.OutputTokens, itemID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE bs_runs SET tokens_in=tokens_in+?, tokens_out=tokens_out+?, updated_at=? WHERE run_id=?`,
@@ -435,27 +437,42 @@ func (r *Runs) FailCounted(ctx context.Context, itemID string, epoch, accepted, 
 			accepted, rejected, u.InputTokens, u.OutputTokens, it.RunID); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE bs_items SET attempts=attempts+1, state=CASE WHEN attempts+1 >= ? THEN 'rejected' ELSE 'pending' END WHERE item_id=?`, MaxAttempts, itemID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE bs_items SET attempts=attempts+1, state=CASE WHEN attempts+1 >= ? THEN 'rejected' ELSE 'pending' END,
+			tokens_in=tokens_in+?, tokens_out=tokens_out+? WHERE item_id=?`, MaxAttempts, u.InputTokens, u.OutputTokens, itemID); err != nil {
 			return err
 		}
 		return settleSample(ctx, tx, it.RunID, r.ts())
 	})
 }
 
-// settleSample moves a sampling run to awaiting-confirm once no sampled extract item can still
-// run (each is done or rejected), and freezes what the sample cost into sample_*: the full run
-// goes on adding to the run's own counters, and the sample's figures must not move with them.
+// settleSample moves a sampling run to awaiting-confirm once the sample has nothing left to run:
+// no sampled item, extract or verify, is pending or leased, and the claims the sample yielded have
+// had their verify stage prepared. That last condition is read as "a sampled verify item exists,
+// or the sample yielded no claim": PrepareVerify queues the verify items, and when it finds the
+// claims have nothing to be verified against it settles the sample itself (closeSample), because
+// only it can tell. So Next, which cannot prepare work files, never settles a sample early.
+//
 // It runs after every step that can close an item (Complete, Fail, lease expiry) and when the
 // sample starts, so a sample whose last item is rejected, or one with no items at all, cannot
 // strand the run in sampling.
 func settleSample(ctx context.Context, tx *sql.Tx, runID, now string) error {
-	var open int
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM bs_items WHERE run_id=? AND stage='extract' AND sampled=1 AND state IN ('pending','leased')`, runID).Scan(&open); err != nil {
+	var open, verify, claims int
+	if err := tx.QueryRowContext(ctx, `SELECT
+		(SELECT count(*) FROM bs_items WHERE run_id=? AND sampled=1 AND state IN ('pending','leased')),
+		(SELECT count(*) FROM bs_items WHERE run_id=? AND sampled=1 AND stage='verify'),
+		(SELECT count(*) FROM bs_claims WHERE run_id=?)`, runID, runID, runID).Scan(&open, &verify, &claims); err != nil {
 		return err
 	}
-	if open > 0 {
+	if open > 0 || (verify == 0 && claims > 0) {
 		return nil
 	}
+	return closeSample(ctx, tx, runID, now)
+}
+
+// closeSample moves a sampling run to awaiting-confirm and freezes what the sample cost into
+// sample_*: the full run goes on adding to the run's own counters, and the sample's figures must
+// not move with them.
+func closeSample(ctx context.Context, tx *sql.Tx, runID, now string) error {
 	_, err := tx.ExecContext(ctx, `UPDATE bs_runs SET state=?, sample_in=tokens_in, sample_out=tokens_out, sample_acc=accepted, sample_rej=rejected, updated_at=? WHERE run_id=? AND state=?`,
 		StateAwaiting, now, runID, StateSampling)
 	return err
@@ -574,86 +591,4 @@ func (r *Runs) Item(ctx context.Context, id string) (Item, error) {
 		return it, ErrNoItem
 	}
 	return it, err
-}
-
-// Measure is what the sample showed, from the stored run. Tokens are asserted by the driver.
-// The sample covers extraction only: verification starts only in a running run, so its cost is
-// still the plan's estimate, and ProjectedTokens is the extraction projection alone.
-type Measure struct {
-	SampleItems    int     `json:"sample_items"`
-	SampleDone     int     `json:"sample_done"`
-	DurationSecs   float64 `json:"duration_secs"`
-	TokensIn       int     `json:"tokens_in"`
-	TokensOut      int     `json:"tokens_out"`
-	AcceptanceRate float64 `json:"acceptance_rate"` // accepted / (accepted + rejected); 0 when nothing was proposed
-	// ProjectedTokens is for the extract items not yet run, from the sample; asserted. It is nil
-	// (null in JSON) when it is unknown: extract items remain but no sampled item completed, so
-	// there is nothing to project from. A zero is never shown in place of an unknown cost.
-	ProjectedTokens *int `json:"projected_tokens"`
-}
-
-// ProjectionUnknown is how an unknown projection is described to a person.
-const ProjectionUnknown = "unknown: no sampled item completed"
-
-// Measure reports a run's sample. A run planned without a sample reports zeros and no
-// projection. Duration is
-// from the first lease to the last completion of a sampled item. Tokens and the acceptance rate
-// are the sample's own: live while it runs, frozen when it settles, so the full run cannot move
-// them. The projection covers extraction only. Everything is read in one snapshot, so a sample
-// that settles mid-call cannot show live figures beside a settled state.
-func (r *Runs) Measure(ctx context.Context, id string) (Measure, error) {
-	var m Measure
-	tx, err := r.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return m, err
-	}
-	defer tx.Rollback()
-	var state string
-	var sample, tin, tout, acc, rej, sin, sout, sacc, srej int
-	err = tx.QueryRowContext(ctx, `SELECT state,sample,tokens_in,tokens_out,accepted,rejected,sample_in,sample_out,sample_acc,sample_rej
-		FROM bs_runs WHERE run_id=? AND checkout_id=?`, id, r.CheckoutID).Scan(&state, &sample, &tin, &tout, &acc, &rej, &sin, &sout, &sacc, &srej)
-	if errors.Is(err, sql.ErrNoRows) {
-		return m, ErrNoRun
-	}
-	if err != nil || sample == 0 {
-		return m, err
-	}
-	var first, last sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT count(*), coalesce(sum(CASE WHEN state='done' THEN 1 ELSE 0 END),0), min(NULLIF(leased_at,'')), max(NULLIF(done_at,''))
-		FROM bs_items WHERE run_id=? AND checkout_id=? AND stage='extract' AND sampled=1`, id, r.CheckoutID).Scan(&m.SampleItems, &m.SampleDone, &first, &last)
-	if err != nil {
-		return m, err
-	}
-	if first.Valid && last.Valid {
-		a, e1 := time.Parse(tsLayout, first.String)
-		b, e2 := time.Parse(tsLayout, last.String)
-		if e1 == nil && e2 == nil {
-			m.DurationSecs = b.Sub(a).Seconds()
-		}
-	}
-	if state != StateSampling {
-		tin, tout, acc, rej = sin, sout, sacc, srej
-	}
-	m.TokensIn, m.TokensOut = tin, tout
-	if n := acc + rej; n > 0 {
-		m.AcceptanceRate = float64(acc) / float64(n)
-	}
-	var total int
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM bs_items WHERE run_id=? AND checkout_id=? AND stage='extract'`, id, r.CheckoutID).Scan(&total); err != nil {
-		return m, err
-	}
-	switch {
-	case total <= m.SampleItems:
-		zero := 0 // the sample was every extract item: nothing is left to project
-		m.ProjectedTokens = &zero
-	case m.SampleDone > 0:
-		// int64 so the product cannot wrap where int is 32 bits wide; it is clamped, not wrapped.
-		p := (int64(m.TokensIn) + int64(m.TokensOut)) / int64(m.SampleDone) * int64(total-m.SampleItems)
-		if p > math.MaxInt {
-			p = math.MaxInt
-		}
-		n := int(p)
-		m.ProjectedTokens = &n
-	}
-	return m, nil
 }

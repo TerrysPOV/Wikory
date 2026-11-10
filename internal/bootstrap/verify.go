@@ -83,7 +83,23 @@ type VerifyReport struct {
 // match rule: ClaimsFor, AssignClaims, and through AssignClaims the coverage report and the page
 // a claim is placed on, all use it.
 func claimTouches(c Component, s StoredClaim) bool {
-	return s.Ref == "comp:"+c.Prefix || (c.Prefix != "." && strings.Contains(s.Text, c.Prefix))
+	return refNames(s.Ref, c) || (c.Prefix != "." && strings.Contains(s.Text, c.Prefix))
+}
+
+// sampleRefPrefix marks a sample's verify item: "sample:comp:X". A run has at most one verify
+// item per ref, so the full run's verify item for X ("comp:X") can follow the sample's.
+const sampleRefPrefix = "sample:"
+
+// componentOfRef returns the component an item ref names: "comp:X" (an extract digest or a
+// full-run verify item) or "sample:comp:X" (a sample's verify item).
+func componentOfRef(ref string) (string, bool) {
+	return strings.CutPrefix(strings.TrimPrefix(ref, sampleRefPrefix), "comp:")
+}
+
+// refNames reports whether an item ref names component c.
+func refNames(ref string, c Component) bool {
+	p, ok := componentOfRef(ref)
+	return ok && p == c.Prefix
 }
 
 // isUndecided reports whether verification can still change a claim's status.
@@ -154,7 +170,7 @@ func AssignClaims(comps []Component, claims []StoredClaim) map[string][]StoredCl
 
 // ownsBetter says whether a is a better owner of s than b is.
 func ownsBetter(a, b Component, s StoredClaim) bool {
-	if ao, bo := s.Ref == "comp:"+a.Prefix, s.Ref == "comp:"+b.Prefix; ao != bo {
+	if ao, bo := refNames(s.Ref, a), refNames(s.Ref, b); ao != bo {
 		return ao
 	}
 	if len(a.Prefix) != len(b.Prefix) {
@@ -168,11 +184,13 @@ func ownsBetter(a, b Component, s StoredClaim) bool {
 
 // enqueueVerify adds verify items to a run and reports how many rows it inserted. A component
 // that already has one is left alone, so two callers racing to prepare the same run queue one
-// paid verification per component. It adds
-// nothing, and says nothing, to a run that is not running: the state is read inside the write
-// transaction, so a next call that read the run as running before finish moved it on cannot put
-// rows in a finishing or finished run, where they could never be handed out or committed.
-func (r *Runs) enqueueVerify(ctx context.Context, runID string, specs []ItemSpec) (int, error) {
+// paid verification per component. It adds nothing, and says nothing, to a run that is not in
+// the state the items are for (sampling for a sample's items, running for the full run's): the
+// state is read inside the write transaction, so a next call that read the run as running before
+// finish moved it on cannot put rows in a finishing or finished run, where they could never be
+// handed out or committed. A sample left with no verify item at all (its claims touch nothing
+// that can be verified) is settled here, in the same transaction, since nothing else can tell.
+func (r *Runs) enqueueVerify(ctx context.Context, runID string, specs []ItemSpec, sample bool) (int, error) {
 	inserted := 0
 	err := r.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		inserted = 0
@@ -184,18 +202,30 @@ func (r *Runs) enqueueVerify(ctx context.Context, runID string, specs []ItemSpec
 		if err != nil {
 			return err
 		}
-		if state != StateRunning {
+		if (sample && state != StateSampling) || (!sample && state != StateRunning) {
 			return nil
 		}
 		for _, sp := range specs {
-			res, err := tx.ExecContext(ctx, `INSERT INTO bs_items(item_id,run_id,checkout_id,stage,ref,input_hash,state) VALUES(?,?,?,'verify',?,?,'pending')
+			res, err := tx.ExecContext(ctx, `INSERT INTO bs_items(item_id,run_id,checkout_id,stage,ref,input_hash,state,sampled) VALUES(?,?,?,'verify',?,?,'pending',?)
 				ON CONFLICT(run_id, stage, ref) DO NOTHING`,
-				r.NewID("itm_"), runID, r.CheckoutID, sp.Ref, sp.InputHash)
+				r.NewID("itm_"), runID, r.CheckoutID, sp.Ref, sp.InputHash, boolInt(sample))
 			if err != nil {
 				return err
 			}
 			n, _ := res.RowsAffected()
 			inserted += int(n)
+		}
+		if !sample {
+			return nil
+		}
+		var verify, open int
+		if err := tx.QueryRowContext(ctx, `SELECT
+			(SELECT count(*) FROM bs_items WHERE run_id=? AND sampled=1 AND stage='verify'),
+			(SELECT count(*) FROM bs_items WHERE run_id=? AND sampled=1 AND state IN ('pending','leased'))`, runID, runID).Scan(&verify, &open); err != nil {
+			return err
+		}
+		if verify == 0 && open == 0 {
+			return closeSample(ctx, tx, runID, r.ts())
 		}
 		return nil
 	})
@@ -220,16 +250,17 @@ func verifyTargets(comps []Component, assigned map[string][]StoredClaim, files m
 	return out
 }
 
-// VerifyOwed is how many components still need a verify item: none when verify items exist
-// (PrepareVerify queues them all at once), otherwise the inspected components that have claims to
-// judge. It reads, and decides, the same way PrepareVerify does but works in any run state and
+// VerifyOwed is how many components still need a full-run verify item: none when the full run's
+// verify items exist (PrepareVerify queues them all at once; a sample's do not count), otherwise
+// the inspected components that have claims to judge. It reads, and decides, the same way PrepareVerify does but works in any run state and
 // changes nothing, so finish can ask it after the run has stopped accepting new work.
 func VerifyOwed(ctx context.Context, runs *Runs, runID string) (int, error) {
-	st, err := runs.Status(ctx, runID)
-	if err != nil {
+	var queued int
+	if err := runs.DB.QueryRowContext(ctx, `SELECT count(*) FROM bs_items WHERE run_id=? AND checkout_id=? AND stage='verify' AND sampled=0`,
+		runID, runs.CheckoutID).Scan(&queued); err != nil {
 		return 0, err
 	}
-	if len(st.Items["verify"]) > 0 {
+	if queued > 0 {
 		return 0, nil
 	}
 	comps, err := runs.Components(ctx, runID)
@@ -248,16 +279,47 @@ func VerifyOwed(ctx context.Context, runs *Runs, runID string) (int, error) {
 	return len(verifyTargets(comps, AssignClaims(comps, undecidedClaims(claims)), files)), nil
 }
 
-// PrepareVerify creates the verify items once every extract item is closed: one per inspected
-// component that has claims to judge, each with a work file listing the component's files and
-// those claims. It does nothing while extraction is open, and nothing when verify items exist.
-func PrepareVerify(ctx context.Context, runs *Runs, w WorkFiles, runID string) (int, error) {
-	st, err := runs.Status(ctx, runID)
+// verifyPrep says whether PrepareVerify has work to do now and whether it is a sample's. A
+// sampling run is due once its sampled extract items are closed and it has no sampled verify
+// item; a running run once every extract item is closed and it has no full-run verify item.
+func verifyPrep(ctx context.Context, runs *Runs, runID string) (due, sample bool, err error) {
+	run, err := runs.Get(ctx, runID)
 	if err != nil {
-		return 0, err
+		return false, false, err
 	}
-	if st.Run.State != StateRunning || len(st.Items["verify"]) > 0 || st.Items["extract"]["pending"]+st.Items["extract"]["leased"] > 0 {
-		return 0, nil
+	switch run.State {
+	case StateSampling:
+		sample = true
+	case StateRunning:
+	default:
+		return false, false, nil
+	}
+	var queued, open int
+	err = runs.DB.QueryRowContext(ctx, `SELECT
+		(SELECT count(*) FROM bs_items WHERE run_id=? AND checkout_id=? AND stage='verify' AND sampled=?),
+		(SELECT count(*) FROM bs_items WHERE run_id=? AND checkout_id=? AND stage='extract' AND state IN ('pending','leased') AND (?=0 OR sampled=1))`,
+		runID, runs.CheckoutID, boolInt(sample), runID, runs.CheckoutID, boolInt(sample)).Scan(&queued, &open)
+	return err == nil && queued == 0 && open == 0, sample, err
+}
+
+// VerifyPrepDue reports whether the next PrepareVerify will look for verify work: the same test
+// PrepareVerify itself makes, so the progress notice next shows cannot drift from it.
+func VerifyPrepDue(ctx context.Context, runs *Runs, runID string) (bool, error) {
+	due, _, err := verifyPrep(ctx, runs, runID)
+	return due, err
+}
+
+// PrepareVerify creates the verify items once extraction is closed: one per inspected component
+// that has claims to judge, each with a work file listing the component's files and those claims.
+// In a sampling run it does this for the sample's claims as soon as the sampled extract items are
+// closed (items "sample:comp:X"), and settles the sample when there is nothing to verify; in a
+// running run it does it once every extract item is closed, for every claim still undecided,
+// a claim the sample's verifier could not settle included (items "comp:X"). It does nothing
+// while that extraction is open, and nothing when those verify items exist.
+func PrepareVerify(ctx context.Context, runs *Runs, w WorkFiles, runID string) (int, error) {
+	due, sample, err := verifyPrep(ctx, runs, runID)
+	if err != nil || !due {
+		return 0, err
 	}
 	comps, err := runs.Components(ctx, runID)
 	if err != nil {
@@ -290,9 +352,13 @@ func PrepareVerify(ctx context.Context, runs *Runs, w WorkFiles, runID string) (
 		if _, err := w.Write(hash, b.String()); err != nil {
 			return 0, err
 		}
-		specs = append(specs, ItemSpec{Stage: "verify", Ref: "comp:" + c.Prefix, InputHash: hash})
+		ref := "comp:" + c.Prefix
+		if sample {
+			ref = sampleRefPrefix + ref
+		}
+		specs = append(specs, ItemSpec{Stage: "verify", Ref: ref, InputHash: hash})
 	}
-	return runs.enqueueVerify(ctx, runID, specs)
+	return runs.enqueueVerify(ctx, runID, specs, sample)
 }
 
 // quietReport is what an infrastructure failure reports: the item the store found and nothing
@@ -335,7 +401,7 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 	if err != nil {
 		return rep, err
 	}
-	prefix := strings.TrimPrefix(it.Ref, "comp:")
+	prefix, _ := componentOfRef(it.Ref)
 	var comp Component
 	found := false
 	for _, c := range comps {
@@ -531,7 +597,13 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 		return rep, nil
 	}
 	err = in.Runs.Complete(ctx, it.ID, it.Epoch, in.V.Usage, func(ctx context.Context, tx *sql.Tx, it Item) error {
-		return writeChanges(ctx, tx, in.Runs.CheckoutID, it, changes)
+		if err := writeChanges(ctx, tx, in.Runs.CheckoutID, it, changes); err != nil {
+			return err
+		}
+		// The verdict counts stay with the item, so a sample can report them after it settles.
+		_, err := tx.ExecContext(ctx, `UPDATE bs_items SET confirmed=?, contradicted=?, undetermined=? WHERE item_id=?`,
+			rep.Confirmed, rep.Contradicted, rep.Undetermined, it.ID)
+		return err
 	})
 	if errors.Is(err, errClaimMoved) {
 		// Another verdict decided one of these claims after they were read. Nothing was written

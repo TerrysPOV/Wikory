@@ -69,10 +69,21 @@ func bootstrapNext(ctx context.Context, env *Env, args []string) (Result, error)
 			return Result{}, &UsageError{Msg: "--max needs a whole number of at least 1"}
 		}
 	}
+	before, err := runs.Get(ctx, runID)
+	if err != nil {
+		return Result{}, err
+	}
 	if err := prepareVerifyWithProgress(ctx, env, p, runs, runID); err != nil {
 		return Result{}, err
 	}
 	b, err := runs.Next(ctx, runID, max)
+	if errors.Is(err, bootstrap.ErrState) && before.State == bootstrap.StateSampling {
+		// The sample settled during this call (its claims had nothing to verify): that is the
+		// sample finishing, not a refusal, so the answer is an empty batch and the new state.
+		if now, gerr := runs.Get(ctx, runID); gerr == nil && now.State == bootstrap.StateAwaiting {
+			b, err = bootstrap.Batch{}, nil
+		}
+	}
 	if err != nil {
 		return Result{}, err
 	}
@@ -127,7 +138,8 @@ type statusReport struct {
 	TokensNote   string                    `json:"tokens_note"`
 	// AdmissionsNote says what run.claims_accepted and run.claims_rejected count.
 	AdmissionsNote string `json:"admissions_note"`
-	// Sample is what the sample showed, for a run planned with one. It covers extraction only.
+	// Sample is what the sample showed, for a run planned with one: its extraction and the
+	// verification of the claims it yielded.
 	Sample *bootstrap.Measure `json:"sample,omitempty"`
 	// Coverage is the report stored when the run was marked done.
 	Coverage *bootstrap.Coverage `json:"coverage,omitempty"`
@@ -182,6 +194,14 @@ func sampleText(m bootstrap.Measure) string {
 	if m.ProjectedTokens != nil {
 		proj = fmt.Sprintf("about %d tokens (asserted)", *m.ProjectedTokens)
 	}
-	return fmt.Sprintf("sample (extraction only): %d/%d items, %.0fs, tokens (asserted) %d in %d out, excerpt acceptance %.0f%%, projected extraction for the rest %s; verification is not sampled, see the plan's estimate\n",
-		m.SampleDone, m.SampleItems, m.DurationSecs, m.TokensIn, m.TokensOut, m.AcceptanceRate*100, proj)
+	vproj := bootstrap.VerifyProjectionUnknown
+	if m.ProjectedVerifyTokens != nil {
+		vproj = fmt.Sprintf("about %d tokens (asserted)", *m.ProjectedVerifyTokens)
+	}
+	return fmt.Sprintf("sample (extraction and verification, nothing published): extract %d/%d items, verify %d/%d items, %.0fs, "+
+		"tokens (asserted) %d in %d out (extraction %d, verification %d), excerpt acceptance %.0f%%, "+
+		"verdicts %d confirmed, %d contradicted, %d not determinable; "+
+		"projected extraction for the rest %s; projected verification for the full run %s\n",
+		m.SampleDone, m.SampleItems, m.VerifyDone, m.VerifyItems, m.DurationSecs, m.TokensIn, m.TokensOut, m.ExtractTokens, m.VerifyTokens,
+		m.AcceptanceRate*100, m.Verdicts.Confirmed, m.Verdicts.Contradicted, m.Verdicts.Undetermined, proj, vproj)
 }

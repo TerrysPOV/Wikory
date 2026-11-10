@@ -183,7 +183,7 @@ func TestBootstrapCommandKeepsTheDriverOutOfWorkFilesAndBehindTheGate(t *testing
 	if ask < 0 || confirm < 0 || ask > confirm {
 		t.Errorf("the person must be asked (%d) before the confirm command (%d) appears", ask, confirm)
 	}
-	mustContain(t, "command", body, "extraction only", "never negative", "plan hash")
+	mustContain(t, "command", body, "extraction and verification", "publishes nothing", "never negative", "plan hash")
 }
 
 // The prompt Claude Code shows for confirm is the gate, and a yes is defined narrowly enough

@@ -70,7 +70,7 @@ func bootstrapConfirm(ctx context.Context, env *Env, args []string) (Result, err
 			return Result{Text: fmt.Sprintf("Run %s had no sample items to run; it is awaiting confirmation of the full run.\n", runID),
 				Data: map[string]any{"run_id": runID, "state": bootstrap.StateAwaiting}}, nil
 		}
-		return Result{Text: fmt.Sprintf("Sample of %d item(s) confirmed for run %s. Hand out work with wikory bootstrap next.\n", run.Sample, runID),
+		return Result{Text: fmt.Sprintf("Sample of %d extract item(s) confirmed for run %s; the claims they yield are verified before the sample settles, and nothing is published. Hand out work with wikory bootstrap next.\n", run.Sample, runID),
 			Data: map[string]any{"run_id": runID, "state": bootstrap.StateSampling}}, nil
 	}
 	// The one state check: a run planned with a sample reaches the full run only through

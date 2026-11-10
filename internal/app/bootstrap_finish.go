@@ -50,6 +50,9 @@ func bootstrapFinish(ctx context.Context, env *Env, args []string) (Result, erro
 		// nothing, so a finish killed after that move can be rerun to see its report.
 		return storedFinishReport(ctx, runs, id)
 	}
+	if run.State == bootstrap.StateSampling || run.State == bootstrap.StateAwaiting {
+		return finishSample(ctx, p, runs, run)
+	}
 	if run.State != bootstrap.StateRunning && run.State != bootstrap.StateFinishing {
 		return Result{}, fmt.Errorf("the run is %s; only a running or finishing run can be finished", run.State)
 	}

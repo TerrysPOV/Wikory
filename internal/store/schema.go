@@ -77,7 +77,10 @@ CREATE TABLE IF NOT EXISTS bs_items(
   stage TEXT NOT NULL CHECK(stage IN ('extract','verify')), ref TEXT NOT NULL, input_hash TEXT NOT NULL,
   state TEXT NOT NULL CHECK(state IN ('pending','leased','done','rejected')),
   epoch INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, sampled INTEGER NOT NULL DEFAULT 0,
-  batch TEXT NOT NULL DEFAULT '', leased_at TEXT NOT NULL DEFAULT '', done_at TEXT NOT NULL DEFAULT '', UNIQUE(run_id, stage, ref));
+  batch TEXT NOT NULL DEFAULT '', leased_at TEXT NOT NULL DEFAULT '', done_at TEXT NOT NULL DEFAULT '',
+  tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0,
+  confirmed INTEGER NOT NULL DEFAULT 0, contradicted INTEGER NOT NULL DEFAULT 0, undetermined INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(run_id, stage, ref));
 CREATE INDEX IF NOT EXISTS bs_items_by_run ON bs_items(run_id, stage, state);
 CREATE TABLE IF NOT EXISTS bs_claims(
   run_id TEXT NOT NULL, checkout_id TEXT NOT NULL, item_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
