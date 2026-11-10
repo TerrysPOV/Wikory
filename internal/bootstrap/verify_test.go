@@ -15,8 +15,14 @@ import (
 	"github.com/TerrysPOV/Wikory/internal/validate"
 )
 
-// blobOf40 stands in for the blob reader: every file the tests name is 40 lines long.
-func blobOf40(string, int64) ([]byte, error) { return []byte(strings.Repeat("x\n", 40)), nil }
+// blobOf40 stands in for the blob reader: every file the tests name is 40 lines long. Line 12,
+// inside the range codeLoc cites, holds the code a contradiction's quote is copied from.
+func blobOf40(string, int64) ([]byte, error) {
+	return []byte(strings.Repeat("x\n", 11) + "// internal/queue " + ackQuote + ".\n" + strings.Repeat("x\n", 28)), nil
+}
+
+// ackQuote is the quote a contradiction of the acknowledgement claim carries.
+const ackQuote = "acknowledges before the handler runs"
 
 // verifyRig has one inspected component (internal/queue) with two unverified claims, both
 // extracted from a design doc, and one leased verify item.
@@ -86,6 +92,11 @@ func newVerifyRigFor(t *testing.T, res Result) *verifyRig {
 	cs, _ := r.Claims(ctx, run.ID)
 	if len(cs) != 2 {
 		t.Fatal(len(cs))
+	}
+	// Claim ids are random within a millisecond, so c1 is chosen by its text: it is always the
+	// acknowledgement claim, which the contradiction tests correct.
+	if !strings.Contains(cs[0].Text, "acknowledges") {
+		cs[0], cs[1] = cs[1], cs[0]
 	}
 	run0, _ := r.Get(ctx, run.ID)
 	return &verifyRig{r: r, run: run, item: vb.Items[0], batch: vb.ID, c1: cs[0], c2: cs[1], run0: run0}
@@ -170,7 +181,7 @@ func TestConfirmedWithoutResolvableCodeEvidenceStaysUnverified(t *testing.T) {
 func TestContradictedYieldsTwoConflictingClaimsLinkedBothWays(t *testing.T) {
 	v := newVerifyRig(t)
 	rep, err := v.apply(t, Verdict{Claim: v.c1.ClaimID, Result: "contradicted", Evidence: codeLoc(),
-		Corrected: "The internal/queue package acknowledges before the handler runs."})
+		Corrected: "The internal/queue package acknowledges before the handler runs.", Quote: ackQuote})
 	if err != nil || rep.Contradicted != 1 {
 		t.Fatalf("%+v %v", rep, err)
 	}

@@ -41,6 +41,9 @@ type Verdict struct {
 	Result    string    `json:"result"`
 	Evidence  []Locator `json:"evidence"`
 	Corrected string    `json:"corrected"`
+	// Quote is required with a correction: text copied from inside one cited line range, so the
+	// correction is tied to committed code. It is checked, never stored or printed.
+	Quote string `json:"quote"`
 }
 
 // VerdictSet is a verifier's answer for one verify item.
@@ -405,7 +408,7 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 			rej("no-evidence", "at most five evidence locations per verdict")
 			continue
 		}
-		var paths []string
+		var paths, cited []string
 		var locs []Locator
 		okEv := true
 		for ei, l := range v.Evidence {
@@ -415,7 +418,7 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 				okEv = false
 				break
 			}
-			why, err := checkLines(in.Blob, src, l.Lines)
+			text, why, err := citeLines(in.Blob, src, l.Lines)
 			if err != nil {
 				// Reading the plan's blob failed. That says nothing about the verdict, so the item
 				// is left leased and untouched for a retry.
@@ -427,6 +430,7 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 				break
 			}
 			paths = append(paths, l.Path)
+			cited = append(cited, text)
 			locs = append(locs, l)
 		}
 		if !okEv {
@@ -440,6 +444,10 @@ func ApplyVerdicts(ctx context.Context, in VerifyInput) (VerifyReport, error) {
 		if v.Result == ResultContradicted {
 			if c, why := CheckText(v.Corrected); c != "" {
 				rej(c, "the corrected claim: "+why)
+				continue
+			}
+			if c, why := checkCorrection(cur.Text, v.Corrected, v.Quote, cited); c != "" {
+				rej(c, why)
 				continue
 			}
 			repl := claim.Claim{Kind: "current-impl", Status: "conflicting", Evidence: blobEvidence(paths), Deps: uniq(paths), Author: "agent", Contradicts: []string{cur.ClaimID}}
@@ -586,35 +594,36 @@ func writeChanges(ctx context.Context, tx *sql.Tx, checkoutID string, it Item, c
 	return nil
 }
 
-// checkLines holds a verdict's line range to the file it cites: it must look like L10-L20, run
-// forwards, and end inside the file the plan recorded. With no blob reader nothing can be
-// bounded, so nothing is accepted. The reason it returns never repeats the range it was given. A
-// failure to read the blob is an error, never a reason: it says nothing about the verdict.
-func checkLines(blob func(oid string, size int64) ([]byte, error), src Source, lines string) (string, error) {
+// citeLines holds a verdict's line range to the file it cites: it must look like L10-L20, run
+// forwards, and end inside the file the plan recorded. It returns the text of the cited lines in
+// canonical form (the form a quote is compared in). With no blob reader nothing can be bounded,
+// so nothing is accepted. The reason it returns never repeats the range it was given. A failure
+// to read the blob is an error, never a reason: it says nothing about the verdict.
+func citeLines(blob func(oid string, size int64) ([]byte, error), src Source, lines string) (text, why string, err error) {
 	m := locatorRe.FindStringSubmatch(lines)
 	if m == nil {
-		return "lines must look like L10-L20", nil
+		return "", "lines must look like L10-L20", nil
 	}
 	a, _ := strconv.Atoi(m[1])
 	b, _ := strconv.Atoi(m[2])
 	if a > b {
-		return "the line range runs backwards", nil
+		return "", "the line range runs backwards", nil
 	}
 	if blob == nil {
-		return "the file's length cannot be checked", nil
+		return "", "the file's length cannot be checked", nil
 	}
 	data, err := blob(src.OID, src.Size)
 	if err != nil {
-		return "", fmt.Errorf("bootstrap: reading the file %s to check a line range: %w", src.Path, err) // read error
+		return "", "", fmt.Errorf("bootstrap: reading the file %s to check a line range: %w", src.Path, err) // read error
 	}
 	n := strings.Count(string(data), "\n")
 	if len(data) > 0 && data[len(data)-1] != '\n' {
 		n++
 	}
 	if b > n {
-		return "the range ends beyond the end of the file", nil
+		return "", "the range ends beyond the end of the file", nil
 	}
-	return "", nil
+	return canonical(strings.Join(strings.Split(string(data), "\n")[a-1:b], "\n")), "", nil
 }
 
 // evidenceUnresolved says whether any blob evidence of a claim the validator rendered carries no

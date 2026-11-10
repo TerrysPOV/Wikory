@@ -184,7 +184,7 @@ func TestAFailedCompletionReportsNothingItDidNotWrite(t *testing.T) {
 	failClaimInserts(t, v.r)
 	rep, err := v.apply(t,
 		Verdict{Claim: v.c2.ClaimID, Result: "probably"},
-		Verdict{Claim: v.c1.ClaimID, Result: "contradicted", Evidence: codeLoc(), Corrected: "The internal/queue package acknowledges before the handler runs."})
+		Verdict{Claim: v.c1.ClaimID, Result: "contradicted", Evidence: codeLoc(), Corrected: "The internal/queue package acknowledges before the handler runs.", Quote: ackQuote})
 	if err == nil || !strings.Contains(err.Error(), "disk full") || errors.Is(err, errClaimMoved) {
 		t.Fatalf("the completion failure comes back unchanged: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestEvidenceInTheComponentsOwnDirectoryMustStillBeQueuedCode(t *testing.T) 
 func TestAContradictionWithUnresolvableEvidenceIsRefusedAndWritesNothing(t *testing.T) {
 	v := newVerifyRig(t)
 	rep, err := ApplyVerdicts(context.Background(), v.input(hookEnv{fakeEnv: envWith("docs/decisions/0001.md")}, blobOf40, // queue.go is not committed
-		Verdict{Claim: v.c1.ClaimID, Result: "contradicted", Evidence: codeLoc(), Corrected: "The internal/queue package acknowledges before the handler runs."},
+		Verdict{Claim: v.c1.ClaimID, Result: "contradicted", Evidence: codeLoc(), Corrected: "The internal/queue package acknowledges before the handler runs.", Quote: ackQuote},
 		Verdict{Claim: v.c2.ClaimID, Result: "not-determinable"}))
 	if err != nil {
 		t.Fatal(err)

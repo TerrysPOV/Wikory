@@ -24,7 +24,7 @@ func TestAContradictionChangesOnlyTheOriginalsStatusAndLink(t *testing.T) {
 	env.head["docs/decisions/0001.md"] = strings.Repeat("b", 40) // the doc moved on since extraction
 	rep, err := ApplyVerdicts(context.Background(), VerifyInput{Runs: v.r, Env: env, Mint: ids.NewULID, Blob: blobOf40, Batch: v.batch,
 		V: VerdictSet{Item: v.item.ID, Epoch: v.item.Epoch, Usage: Usage{InputTokens: 10, OutputTokens: 1},
-			Verdicts: []Verdict{{Claim: v.c1.ClaimID, Result: "contradicted", Evidence: codeLoc(), Corrected: "The internal/queue package acknowledges before the handler returns."}}}})
+			Verdicts: []Verdict{{Claim: v.c1.ClaimID, Result: "contradicted", Evidence: codeLoc(), Corrected: "The internal/queue package acknowledges before the handler returns.", Quote: ackQuote}}}})
 	if err != nil || rep.Contradicted != 1 {
 		t.Fatalf("%+v %v", rep, err)
 	}
