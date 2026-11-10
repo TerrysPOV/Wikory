@@ -62,6 +62,20 @@ Same procedure, plan only (`plan --sample 5`), with a scratch data directory and
 
 The hash differs from the earlier `84522dfb...` only because each throwaway clone makes its own `wikory init` commit, so HEAD differs; a second `plan` on each clone gave the same hash. No secret text appeared (`rg -c 'hunter|AKIA|BEGIN'` over stdout and stderr: no match).
 
+### Rerun after fix wave 3 (2026-11-10)
+
+Plan only, one throwaway clone of `main` at `b85a13d`, scratch data directories (the version 4 binary used a copy of the version 3 binary's, so both planned the same commit), all removed afterwards. Binaries: `628f65d` (hash version 3) and this branch after fix wave 3 (version 4).
+
+| Plan | Hash |
+|---|---|
+| v3, `--sample 5` | `fd419c0120b42652d190c44b7c55fdea35b9e06c7d28020735d0cb0666c3c9da` |
+| v3, `--sample 1` | the same as v3 `--sample 5`: the sample size was not hashed |
+| v4, `--sample 5` (twice) | `bfb4ce5632c7351c302df2b63c9d4429d876135b543792567f9433e6166bfcb0`, the same both times |
+| v4, `--sample 1` | `45ef48b00cb531c10452ed96a17c542e2f9dfaa3ee7957d41b64c18403f87647` |
+| v4, no sample | `d399ecd7f34597bef3ad032df632c836d6f35e1ec6914fc9dea8591b064292fd` |
+
+The v3 and v4 hashes differ because version 4 hashes the version number 4 and the sample size; nothing else changed. Every estimate is the same in both (extract 97 items, 201,929 in, 67,900 out; verify 12 items, 72,000 in, 9,600 out; sample of 5: extract 2,813 in, 3,500 out, verify 30,000 in, 4,000 out). `confirm --sample` on the v4 `--sample 5` run with the `--sample 1` hash exited 2 with "the plan hash given is not this plan's hash", and the run stayed `planned`. No secret text in stdout or stderr.
+
 ## Checks the brief names
 
 - `Components` includes `internal/store` (rank 4), `internal/app` (rank 2), `plugins` (rank 14, not inspected) and `scripts` (rank 8).

@@ -54,6 +54,8 @@ Copied from the specs. Every task's requirements include this section.
 
 Fix wave 2 (2026-11-10), Terry's rulings of 2026-11-10 ("Go ahead"): decision 15 is reversed and decision 14 extended. The sample runs the paid pipeline on its items, extraction and then verification of the claims they yield, and publishes nothing (design 4.5 as written). It settles to `awaiting-confirm` only when no sampled item, extract or verify, is open and the sample's verify stage has been prepared; its tokens, acceptance, per-stage split and verdict counts are frozen then. See Tasks 8, 11, 13 and 14.
 
+Fix wave 3 (2026-11-10), Terry's ruling: the sample size is in the plan hash (version 4). Decision 4's "The hash is of the full plan" now reads: the hash is of the full plan and its sample size, so a yes to a plan covers its sample; a hash shown for one sample size cannot start a sample of another.
+
 ## File structure
 
 | File | Responsibility |
@@ -4218,6 +4220,17 @@ Expected: each exits 0 (RED).
 
 Run: `scripts/inject.sh internal/bootstrap/sample_estimate.go 'verifyEstimate(min(ex.Items, verifyEstimateItems(res)))' 'verifyEstimate(ex.Items)' ./internal/bootstrap/ '^TestSampleEstimatesCoverTheSampledExtractItemsAndTheirVerification$' 'the plan's verification'`
 Run: `scripts/inject.sh internal/app/bootstrap_plan.go '		SampleEstimates: bootstrap.SampleEstimates(res, sample)}' '		SampleEstimates: nil}' ./internal/app/ '^TestPlanShowsTheSampleCostApartFromTheFullRun$' 'the sample's figure covers one extract item'`
+
+Expected: each exits 0 (RED).
+
+#### Fix wave 3 (2026-11-10)
+
+- `planHash` hashes `Sample` (the `--sample N` given) and its version is 4. The sample's own figure (`SampleEstimates`) is derived from the hashed plan and that size, so it is fixed by the hash without being hashed separately. `BuildPlan` and the `SampleEstimates` comments say so. Two plans of one commit that differ only in `--sample` now have different hashes; the same plan and sample size still hash the same.
+- Reversed (each pinned "the sample size is outside the plan hash"): `TestPlanHashIsStableAndSensitive` (now: same plan same hash, `--sample 5` changes it), `TestTheRunStoresTheSampleSizeAndFixesItsSampledItemsAtCreate` (precondition inverted; the run still stores the size), `TestSampleEstimatesCoverTheSampledExtractItemsAndTheirVerification` (hash differs for 0 and 3), `TestBootstrapPlanBindsTheSampleSizeToTheRun` (app; hashes differ).
+- Test: `TestThePlanHashCoversTheSampleSize` (sizes 0, 1, 2, 3 and 50, including two sizes that select every item, each distinct and stable).
+
+Run: `scripts/inject.sh internal/bootstrap/estimate.go 'Head: p.Head, Sample: p.Sample,' 'Head: p.Head, Sample: 0,' ./internal/bootstrap/ '^TestThePlanHashCoversTheSampleSize$' 'share a plan hash'`
+Run: `scripts/inject.sh internal/bootstrap/estimate.go 'Head: p.Head, Sample: p.Sample,' 'Head: p.Head, Sample: 0,' ./internal/app/ '^TestASampleStartsOnlyUnderTheHashOfItsOwnSampleSize$' 'must have different hashes'`
 
 Expected: each exits 0 (RED).
 
@@ -15718,6 +15731,16 @@ Run: `scripts/inject.sh internal/app/bootstrap_next.go '	if errors.Is(err, boots
 
 Expected: exits 0 (RED).
 
+#### Fix wave 3 (2026-11-10)
+
+- `confirm` rebuilds the hash with the run's stored sample size, now hashed, so `confirm --sample` (and the full confirm) needs the exact hash of the plan with that size: a hash shown for another `--sample N` is refused ("not this plan's hash"), and a run whose stored `bs_runs.sample` changed after the plan no longer rebuilds its hash and is refused ("no longer matches the plan that was shown"). The frozen sample figures are of that run's sampled items, fixed at `Create` from the hashed size, so they are consistent with the hash. `rebuiltPlanHash`'s comment says so.
+- Test: `TestASampleStartsOnlyUnderTheHashOfItsOwnSampleSize`; `TestConfirmSampleNeedsTheExactPlanHash` is unchanged.
+
+Run: `scripts/inject.sh internal/app/bootstrap_confirm.go 'run.Scope, run.Head, run.Sample).Hash' 'run.Scope, run.Head, 0).Hash' ./internal/app/ '^TestASampleStartsOnlyUnderTheHashOfItsOwnSampleSize$' 'a hash made with another sample size must be refused'`
+Run: `scripts/inject.sh internal/app/bootstrap_confirm.go '	if rebuilt != run.PlanHash {' '	if rebuilt != run.PlanHash && run.Sample == 0 {' ./internal/app/ '^TestASampleStartsOnlyUnderTheHashOfItsOwnSampleSize$' 'sample size changed after the plan must be refused'`
+
+Expected: each exits 0 (RED).
+
 ### Task 15: Plugin command, agents and the prompt-injection fixture
 
 **Files:**
@@ -17219,6 +17242,8 @@ Fix wave 2 (2026-11-10), after Terry's rulings:
 - Known limit 16 is closed: the progress notice asks `VerifyPrepDue`, which is `PrepareVerify`'s own test.
 - A corrected sentence that names the component's path is refused unless the cited lines contain it; the verifier is told to refer to it in plain words.
 - Unchanged by ruling: redact "token" false positives stay fail-closed (21), re-extraction stays known limit 10, A6 and A7 stay as they are.
+
+Fix wave 3 (2026-11-10): the sample size is in the plan hash (version 4), so the earlier note that the sample size and its figure are not hashed no longer holds; the hash version is 4, not 3. The correction name rule stays strict by Terry's ruling.
 
 ## Self-review
 

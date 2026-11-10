@@ -93,6 +93,8 @@ Fix `NewProgress` so TTY is detected from the `os.File` mode (no new dependency)
 6. **A verifier's correction is tied to the cited code.** A contradiction carries a `quote` found verbatim inside one cited range, the correction must be a bounded edit of the claim (at least half its words) and may name no path, URL or identifier the cited lines do not contain. The verifier is told to read only its work file and the component's files; the binary cannot enforce that, and checks the answer instead.
 7. **`memory/*.json` and `*.yaml` are the implementation tier.** Only prose under a memory directory is a note. An explicit `--source` pulls such a file in as a note.
 
+8. **The sample size is in the plan hash** (version 4). A yes to a plan covers its sample size; `confirm --sample` needs the hash of the plan with that size. The correction rule in item 6 stays strict: a corrected claim may name only paths and identifiers that appear in the cited lines.
+
 ## 6. Out of scope
 
 Session transcripts (`--include-transcripts` stays sampled-only and is not built in stage 2), the headless worker (8.6) as a driver, MCP, `wikory trust` (stage 1d), the Codex adapter, time-travel bootstrap for the benchmark, retention and backup.
